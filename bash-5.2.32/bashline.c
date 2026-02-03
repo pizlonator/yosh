@@ -69,6 +69,7 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <readline/rlmbutil.h>
+#include <readline/yo.h>
 
 #include <glob/glob.h>
 
@@ -645,6 +646,9 @@ initialize_readline ()
   if (posixly_correct)
     posix_readline_initialize (1);
 #endif
+
+  /* Enable LLM "yo" features for yosh */
+  rl_yo_enable ();
 
   bash_readline_initialized = 1;
 }

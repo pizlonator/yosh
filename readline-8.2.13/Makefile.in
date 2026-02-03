@@ -120,7 +120,7 @@ CSOURCES = $(srcdir)/readline.c $(srcdir)/funmap.c $(srcdir)/keymaps.c \
 	   $(srcdir)/histfile.c $(srcdir)/nls.c $(srcdir)/search.c \
 	   $(srcdir)/shell.c $(srcdir)/savestring.c $(srcdir)/tilde.c \
 	   $(srcdir)/text.c $(srcdir)/misc.c $(srcdir)/compat.c \
-	   $(srcdir)/mbutil.c
+	   $(srcdir)/mbutil.c $(srcdir)/yo.c $(srcdir)/cJSON.c
 
 # The header files for this library.
 HSOURCES = $(srcdir)/readline.h $(srcdir)/rldefs.h $(srcdir)/chardefs.h \
@@ -130,7 +130,8 @@ HSOURCES = $(srcdir)/readline.h $(srcdir)/rldefs.h $(srcdir)/chardefs.h \
 	   $(srcdir)/ansi_stdlib.h $(srcdir)/tcap.h $(srcdir)/rlstdc.h \
 	   $(srcdir)/xmalloc.h $(srcdir)/rlprivate.h $(srcdir)/rlshell.h \
 	   $(srcdir)/rltypedefs.h $(srcdir)/rlmbutil.h \
-	   $(srcdir)/colors.h $(srcdir)/parse-colors.h
+	   $(srcdir)/colors.h $(srcdir)/parse-colors.h \
+	   $(srcdir)/yo.h $(srcdir)/cJSON.h
 
 HISTOBJ = history.o histexpand.o histfile.o histsearch.o shell.o mbutil.o
 TILDEOBJ = tilde.o
@@ -139,7 +140,7 @@ OBJECTS = readline.o vi_mode.o funmap.o keymaps.o parens.o search.o \
 	  rltty.o complete.o bind.o isearch.o display.o signals.o \
 	  util.o kill.o undo.o macro.o input.o callback.o terminal.o \
 	  text.o nls.o misc.o $(HISTOBJ) $(TILDEOBJ) $(COLORSOBJ) \
-	  xmalloc.o xfree.o compat.o
+	  xmalloc.o xfree.o compat.o yo.o cJSON.o
 
 # The texinfo files which document this library.
 DOCSOURCE = doc/rlman.texinfo doc/rltech.texinfo doc/rluser.texinfo
@@ -153,7 +154,7 @@ CREATED_CONFIGURE = config.status config.h config.cache config.log \
 CREATED_TAGS = TAGS tags
 
 INSTALLED_HEADERS = readline.h chardefs.h keymaps.h history.h tilde.h \
-		    rlstdc.h rlconf.h rltypedefs.h
+		    rlstdc.h rlconf.h rltypedefs.h yo.h
 
 OTHER_DOCS = $(srcdir)/CHANGES $(srcdir)/INSTALL $(srcdir)/README
 OTHER_INSTALLED_DOCS = CHANGES INSTALL README
@@ -608,3 +609,14 @@ histexpand.o: histexpand.c
 histfile.o: histfile.c
 history.o: history.c
 histsearch.o: histsearch.c
+
+yo.o: yo.c
+yo.o: ${BUILD_DIR}/config.h
+yo.o: readline.h keymaps.h rltypedefs.h chardefs.h tilde.h rlstdc.h
+yo.o: rlprivate.h xmalloc.h cJSON.h yo.h
+yo.o: $(srcdir)/yo.c
+
+cJSON.o: cJSON.c
+cJSON.o: ${BUILD_DIR}/config.h
+cJSON.o: cJSON.h
+cJSON.o: $(srcdir)/cJSON.c

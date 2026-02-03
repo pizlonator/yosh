@@ -649,7 +649,7 @@ initialize_readline ()
 #endif
 
   /* Enable LLM "yo" features for yosh */
-  rl_yo_enable ();
+  rl_yo_enable ("You are a shell command assistant for yosh (a bash-compatible shell on Linux).");
 
   bash_readline_initialized = 1;
 }

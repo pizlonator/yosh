@@ -51,14 +51,6 @@
 #define YO_API_TIMEOUT 30L
 #define YO_MAX_TOKENS 1024
 
-static const char *YO_SYSTEM_PROMPT =
-    "You are a shell command assistant. Analyze the user's input:\n\n"
-    "1. If it describes a shell command or task, respond with ONLY:\n"
-    "   {\"type\":\"command\",\"command\":\"<shell command>\",\"explanation\":\"<brief explanation>\"}\n\n"
-    "2. If it's a general question, respond with ONLY:\n"
-    "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n\n"
-    "Respond with valid JSON only. Shell is bash on Linux.";
-
 /* **************************************************************** */
 /*                                                                  */
 /*                     Session Memory Types                         */
@@ -85,6 +77,7 @@ static int yo_history_capacity = 0;
 static int yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
 static int yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
 static char *yo_model = NULL;
+static char *yo_system_prompt = NULL;
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -145,12 +138,24 @@ static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, 
 /* **************************************************************** */
 
 void
-rl_yo_enable(void)
+rl_yo_enable(const char *system_prompt)
 {
     const char *env_val;
 
     if (yo_is_enabled)
         return;
+
+    /* Store system prompt from caller */
+    asprintf(
+        &yo_system_prompt,
+        "%s\n"
+        "Analyze the user's input:\n\n"
+        "1. If it describes a command or task, respond with ONLY:\n"
+        "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<brief explanation>\"}\n\n"
+        "2. If it's a general question, respond with ONLY:\n"
+        "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n\n"
+        "Respond with valid JSON only.",
+        system_prompt);
 
     /* Load configuration from environment */
     env_val = getenv("YO_MODEL");
@@ -204,6 +209,9 @@ rl_yo_disable(void)
         free(yo_model);
         yo_model = NULL;
     }
+
+    free(yo_system_prompt);
+    yo_system_prompt = NULL;
 
     yo_is_enabled = 0;
 }
@@ -506,7 +514,7 @@ yo_call_claude(const char *api_key, const char *query)
 
     cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_MODEL);
     cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
-    cJSON_AddStringToObject(request_json, "system", YO_SYSTEM_PROMPT);
+    cJSON_AddStringToObject(request_json, "system", yo_system_prompt);
 
     /* Build messages array with history */
     messages = yo_build_messages(query);

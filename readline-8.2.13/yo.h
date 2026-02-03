@@ -35,8 +35,10 @@ extern "C" {
 #endif
 
 /* Enable "yo" LLM features. Call this to opt-in (like using_history()).
-   Binds Enter key to yo-aware accept-line and loads config from env vars. */
-extern void rl_yo_enable (void);
+   Binds Enter key to yo-aware accept-line and loads config from env vars.
+   The system_prompt parameter is the prompt sent to the LLM - the shell
+   should provide this to give context about the environment. */
+extern void rl_yo_enable (const char *system_prompt);
 
 /* Disable "yo" features, restore normal Enter behavior. */
 extern void rl_yo_disable (void);

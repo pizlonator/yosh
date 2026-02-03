@@ -1,5 +1,6 @@
 ## -*- text -*- ##
 # Master Makefile for the GNU readline library.
+# Copyright (C) 2026 Epic Games, Inc.
 # Copyright (C) 1994-2018 Free Software Foundation, Inc.
 
 #   This program is free software: you can redistribute it and/or modify

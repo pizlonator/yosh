@@ -1,5 +1,6 @@
-# Makefile for bash-5.2, version 5.1
+# Makefile for Yosh (based on bash-5.2), version 5.1
 #
+# Copyright (C) 2026 Epic Games, Inc.
 # Copyright (C) 1996-2021 Free Software Foundation, Inc.
 
 #   This program is free software: you can redistribute it and/or modify
@@ -112,7 +113,7 @@ OBJEXT = @OBJEXT@
 VERSPROG = bashversion$(EXEEXT)
 VERSOBJ = bashversion.$(OBJEXT)
 
-Program = bash$(EXEEXT)
+Program = yosh$(EXEEXT)
 Version = @BASHVERS@
 PatchLevel = `$(BUILD_DIR)/$(VERSPROG) -p`
 RELSTATUS = @RELSTATUS@
@@ -640,7 +641,7 @@ profiling-tests:	${PROGRAM}
 	@${MAKE} ${MFLAGS} tests TESTSCRIPT=run-gprof
 
 version.h:  $(SOURCES) config.h Makefile patchlevel.h
-	$(SHELL) $(SUPPORT_SRC)mkversion.sh -b -S ${topdir} -s $(RELSTATUS) -d $(Version) -o newversion.h \
+	$(SHELL) $(SUPPORT_SRC)mkversion.sh -b -S ${topdir} -s $(RELSTATUS) -d 0.1-$(Version) -o newversion.h \
 		&& mv newversion.h version.h
 
 bashversion$(EXEEXT): buildversion.o $(SUPPORT_SRC)bashversion.c

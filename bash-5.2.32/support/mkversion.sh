@@ -5,6 +5,7 @@
 # in the makefile.  This creates a file named by the -o option,
 # otherwise everything is echoed to the standard output.
 
+# Copyright (C) 2026 Epic Games, Inc.
 # Copyright (C) 1996-2020 Free Software Foundation, Inc.
 #
 #   This program is free software: you can redistribute it and/or modify
@@ -98,28 +99,41 @@ echo "   \`make version.h' to the Makefile.  It is created by mkversion. */"
 # Output the distribution version.  Single numbers are converted to x.00.
 # Allow, as a special case, `[:digit:].[:digit:][:alpha:]' for
 # intermediate versions (e.g., `2.5a').
-# Any characters other than digits and `.' are invalid.
+# Also allow hyphens for yosh versioning (e.g., '0.1-5.2').
 case "$dist_version" in
 [0-9].[0-9][a-z])	;;	# special case
-*[!0-9.]*)	echo "mkversion.sh: ${dist_version}: bad distribution version" >&2
+*[!0-9.\-]*)	echo "mkversion.sh: ${dist_version}: bad distribution version" >&2
 		exit 1 ;;
 *.*)	;;
 *)	dist_version=${dist_version}.00 ;;
 esac
 
-dist_major=`echo $dist_version | sed 's:\..*$::'`
-[ -z "${dist_major}" ] && dist_major=0
+# Handle hyphenated versions (e.g., 0.1-5.2 for yosh)
+case "$dist_version" in
+*-*)
+	# Yosh-style version: use as-is for display, extract bash version for compat level
+	float_dist="$dist_version"
+	bash_version=`echo $dist_version | sed 's:^.*-::'`
+	compat_major=`echo $bash_version | sed 's:\..*$::'`
+	compat_minor=`echo $bash_version | sed 's:^.*\.::'`
+	;;
+*)
+	dist_major=`echo $dist_version | sed 's:\..*$::'`
+	[ -z "${dist_major}" ] && dist_major=0
 
-dist_minor=`echo $dist_version | sed 's:^.*\.::'`
-case "$dist_minor" in
-"")	dist_minor=0 ;;
-[a-z])	dist_minor=0${dist_minor} ;;
-?)	dist_minor=${dist_minor} ;;
-*)	;;
+	dist_minor=`echo $dist_version | sed 's:^.*\.::'`
+	case "$dist_minor" in
+	"")	dist_minor=0 ;;
+	[a-z])	dist_minor=0${dist_minor} ;;
+	?)	dist_minor=${dist_minor} ;;
+	*)	;;
+	esac
+
+	float_dist=${dist_major}.${dist_minor}
+	compat_major=$dist_major
+	compat_minor=$dist_minor
+	;;
 esac
-
-#float_dist=`echo $dist_version | awk '{printf "%.2f\n", $1}'`
-float_dist=${dist_major}.${dist_minor}
 
 echo
 echo "/* The distribution version number of this shell. */"
@@ -142,13 +156,13 @@ echo "#define RELSTATUS \"${rel_status}\""
 
 echo
 echo "/* The default shell compatibility-level (the current version) */"
-echo "#define DEFAULT_COMPAT_LEVEL ${dist_major}${dist_minor}"
+echo "#define DEFAULT_COMPAT_LEVEL ${compat_major}${compat_minor}"
 
 # Output the SCCS version string
-sccs_string="${float_dist}.${patch_level}(${build_ver}) ${rel_status} GNU"
+sccs_string="${float_dist}.${patch_level}(${build_ver}) ${rel_status}"
 echo
 echo "/* A version string for use by sccs and the what command. */"
-echo "#define SCCSVERSION \"@(#)Bash version ${sccs_string}\""
+echo "#define SCCSVERSION \"@(#)Yosh version ${sccs_string}\""
 
 # extern function declarations
 #echo

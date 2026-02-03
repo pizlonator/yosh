@@ -1,8 +1,9 @@
 /* version.c -- distribution and version numbers. */
 
-/* Copyright (C) 1989-2022 Free Software Foundation, Inc.
+/* Copyright (C) 2026 Epic Games, Inc.
+   Copyright (C) 1989-2022 Free Software Foundation, Inc.
 
-   This file is part of GNU Bash, the Bourne Again SHell.
+   This file is part of Yosh, based on GNU Bash, the Bourne Again SHell.
 
    Bash is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -43,6 +44,7 @@ const char * const release_status = (char *)0;
 #endif
 const char * const sccs_version = SCCSVERSION;
 
+const char * const yosh_copyright = N_("Copyright (C) 2026 Epic Games, Inc.");
 const char * const bash_copyright = N_("Copyright (C) 2022 Free Software Foundation, Inc.");
 const char * const bash_license = N_("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n");
 
@@ -83,9 +85,10 @@ void
 show_shell_version (extended)
      int extended;
 {
-  printf (_("GNU bash, version %s (%s)\n"), shell_version_string (), MACHTYPE);
+  printf ("Fil's yosh, version %s (%s)\n", shell_version_string (), MACHTYPE);
   if (extended)
     {
+      printf ("%s\n", _(yosh_copyright));
       printf ("%s\n", _(bash_copyright));
       printf ("%s\n", _(bash_license));
       printf ("%s\n", _("This is free software; you are free to change and redistribute it."));

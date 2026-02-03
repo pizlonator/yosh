@@ -1,8 +1,9 @@
 /* bashline.c -- Bash's interface to the readline library. */
 
-/* Copyright (C) 1987-2022 Free Software Foundation, Inc.
+/* Copyright (C) 2026 Epic Games, Inc.
+   Copyright (C) 1987-2022 Free Software Foundation, Inc.
 
-   This file is part of GNU Bash, the Bourne Again SHell.
+   This file is part of Yosh, based on GNU Bash, the Bourne Again SHell.
 
    Bash is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by

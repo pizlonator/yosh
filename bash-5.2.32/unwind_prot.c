@@ -56,7 +56,7 @@
 typedef struct {
   char *variable;
   int size;
-  char desired_setting[1]; /* actual size is `size' */
+  void *desired_setting[1]; /* actual size is `size' */
 } SAVED_VAR;
 
 /* If HEAD.CLEANUP is null, then ARG.V contains a tag to throw back to.

@@ -327,7 +327,6 @@ rl_yo_accept_line(int count, int key)
     if (strcmp(type, "command") == 0)
     {
         /* Command mode: replace input with generated command */
-        rl_crlf();
 
         /* Print explanation if present */
         if (explanation && *explanation)
@@ -694,7 +693,7 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
 static void
 yo_display_chat(const char *response)
 {
-    fprintf(rl_outstream, "\n\n%s\n\n", response);
+    fprintf(rl_outstream, "%s\n", response);
     fflush(rl_outstream);
 }
 

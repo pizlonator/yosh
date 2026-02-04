@@ -74,6 +74,7 @@ chat mode → prints response, returns to fresh prompt
 - **YO_MODEL**: Environment variable, defaults to `claude-sonnet-4-20250514`
 - **YO_HISTORY_LIMIT**: Max conversation exchanges to remember (default 10)
 - **YO_TOKEN_BUDGET**: Max tokens for history context (default 4096)
+- **Distro detection**: `rl_yo_enable()` reads `/etc/os-release` to detect the OS name/version and appends it to the system prompt so the LLM can tailor commands to the user's distro.
 
 ### Session Memory
 

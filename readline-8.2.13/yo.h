@@ -53,6 +53,13 @@ extern int rl_yo_accept_line (int, int);
 /* Clear yo session history. Can be called to reset conversation context. */
 extern void rl_yo_clear_history (void);
 
+/* Get recent terminal scrollback text.
+   Returns up to max_lines lines from the scrollback buffer.
+   ANSI escape sequences are stripped for readability.
+   Returns malloc'd string, caller must free.
+   Returns empty string if scrollback is not available. */
+extern char *rl_yo_get_scrollback (int max_lines);
+
 #ifdef __cplusplus
 }
 #endif

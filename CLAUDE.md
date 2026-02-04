@@ -34,10 +34,11 @@ The build uses specific flags:
 ```
 yosh/
 ├── readline-8.2.13/    # GNU Readline with "yo" LLM integration
-│   ├── yo.c            # LLM implementation (Claude API, session memory)
+│   ├── yo.c            # LLM implementation (API, session memory, PTY proxy, scrollback)
 │   ├── yo.h            # Public API for yo feature
 │   └── cJSON.[ch]      # Embedded JSON parser (MIT licensed)
 ├── bash-5.2.32/        # Yosh shell (bash fork)
+│   ├── shell.c         # Main init (readline before job control - critical!)
 │   ├── bashline.c      # Calls rl_yo_enable() with system prompt
 │   └── version.c       # "Fil's yosh" branding
 ├── prefix/             # Installation directory
@@ -95,14 +96,62 @@ Users can press Ctrl-C to immediately cancel an in-progress API request. Impleme
 - `curl_multi_poll()` watches both curl sockets and the signal pipe
 - Cancellation is near-instantaneous, not polling-based
 
+### Terminal Scrollback Capture
+
+The yo agent can access recent terminal output to understand command results, error messages, etc. This enables queries like "yo what was that error?" or "yo parse that output".
+
+**Architecture**: A transparent PTY proxy captures all terminal I/O:
+
+```
+Before yo_pty_init():
+  bash <---> real terminal
+
+After yo_pty_init():
+  bash <---> PTY slave
+                  |
+              PTY master <---> pump process <---> real terminal
+                                    |
+                              scrollback buffer
+                              (mmap shared memory)
+```
+
+**Fork-based design**: When `rl_yo_enable()` calls `yo_pty_init()`:
+1. Parent process becomes the I/O pump (never returns)
+2. Child process calls `setsid()` + `TIOCSCTTY` to establish PTY as controlling terminal
+3. Child continues as the shell with stdin/stdout/stderr on the PTY slave
+4. Pump forwards I/O bidirectionally and captures output to scrollback buffer
+5. Pump forwards signals (SIGINT, SIGWINCH, etc.) to child
+6. Pump exits when child exits, preserving exit status
+
+**Why fork-based?** Thread-based approaches fail because bash's job control uses `/dev/tty` directly. After `setsid()` + `TIOCSCTTY`, `/dev/tty` refers to the PTY slave, so job control works correctly. This requires being a session leader, which only works via fork.
+
+**Transparency**: Programs like vim, emacs, mg, tmux, and ssh work normally because:
+- The PTY slave is the actual controlling terminal
+- Terminal attributes, window size, and signals pass through correctly
+- The pump is invisible to the shell and its children
+
+**LLM access**: Claude can request scrollback via a tool response:
+```json
+{"type":"scrollback","lines":50}
+```
+yo.c detects this, fetches from the shared buffer, and makes a follow-up API call with the terminal output included.
+
+**Configuration**:
+- `YO_SCROLLBACK_ENABLED=0`: Disable scrollback capture entirely
+- `YO_SCROLLBACK_BYTES`: Max buffer size (default 1MB)
+- `YO_SCROLLBACK_LINES`: Max lines to return (default 1000)
+
+**Critical initialization order**: In `shell.c`, `initialize_readline()` must be called BEFORE `initialize_job_control()`. This ensures the PTY is set up before bash opens `/dev/tty` for job control. Swapping this order causes job control to use the wrong terminal.
+
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `readline-8.2.13/yo.c` | LLM implementation: API calls, session memory, response parsing |
-| `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_disable()`, `rl_yo_accept_line()` |
+| `readline-8.2.13/yo.c` | LLM implementation: API calls, session memory, PTY proxy, scrollback |
+| `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
 | `readline-8.2.13/funmap.c` | Registers `yo-accept-line` function |
 | `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt |
+| `bash-5.2.32/shell.c` | Main shell init; readline must init before job control |
 | `bash-5.2.32/version.c` | Version string and copyright display |
 
 ## Key Modifications

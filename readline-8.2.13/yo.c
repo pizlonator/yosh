@@ -32,7 +32,15 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <termios.h>
+#include <poll.h>
+#include <pthread.h>
+#include <pty.h>
 #include <pwd.h>
+#include <errno.h>
 #include <curl/curl.h>
 
 #include "readline.h"
@@ -40,6 +48,8 @@
 #include "xmalloc.h"
 #include "cJSON.h"
 #include "yo.h"
+
+#include <stdfil.h>
 
 /* **************************************************************** */
 /*                                                                  */
@@ -56,6 +66,10 @@
 /* Default color: red italics */
 #define YO_DEFAULT_CHAT_COLOR "\033[3;36m"
 #define YO_COLOR_RESET "\033[0m"
+
+/* Scrollback defaults */
+#define YO_DEFAULT_SCROLLBACK_LINES 1000
+#define YO_DEFAULT_SCROLLBACK_BYTES (1024 * 1024)  /* 1MB */
 
 /* **************************************************************** */
 /*                                                                  */
@@ -91,6 +105,45 @@ static int yo_last_command_executed = 0;
 
 /* **************************************************************** */
 /*                                                                  */
+/*                  PTY Proxy State Variables                       */
+/*                                                                  */
+/* **************************************************************** */
+
+/* PTY file descriptors */
+static int yo_pty_master = -1;
+static int yo_pty_slave = -1;
+static int yo_real_stdout = -1;      /* saved original stdout */
+static int yo_real_stdin = -1;       /* saved original stdin */
+static int yo_real_stderr = -1;      /* saved original stderr */
+
+/* Saved original terminal settings for restoration on cleanup */
+static struct termios yo_orig_termios;
+static int yo_orig_termios_saved = 0;
+
+/* Child shell PID (only valid in pump/parent process) */
+static pid_t yo_child_pid = -1;
+
+/* Scrollback buffer - allocated with mmap for sharing between pump and shell */
+typedef struct {
+    pthread_mutex_t lock;
+    size_t capacity;        /* max buffer size (from YO_SCROLLBACK_BYTES) */
+    size_t write_pos;       /* circular write position */
+    size_t data_size;       /* current amount of data (up to capacity) */
+    int max_lines;          /* max lines to track */
+    char data[];            /* flexible array - data follows struct in shared memory */
+} yo_scrollback_t;
+
+static yo_scrollback_t *yo_scrollback = NULL;  /* mmap'd shared memory */
+static size_t yo_scrollback_mmap_size = 0;
+
+/* Configuration for scrollback */
+static int yo_scrollback_enabled = 1;
+
+/* Are we the pump process or the shell process? */
+static int yo_is_pump = 0;
+
+/* **************************************************************** */
+/*                                                                  */
 /*                    Forward Declarations                          */
 /*                                                                  */
 /* **************************************************************** */
@@ -98,16 +151,27 @@ static int yo_last_command_executed = 0;
 static void yo_reload_config(void);
 static char *yo_load_api_key(void);
 static char *yo_call_claude(const char *api_key, const char *query);
+static char *yo_call_claude_with_scrollback(const char *api_key, const char *query,
+                                            const char *scrollback_request, const char *scrollback_data);
 static int yo_parse_response(const char *response, char **type, char **content, char **explanation);
 static void yo_display_chat(const char *response);
 static void yo_history_add(const char *query, const char *type, const char *response, int executed);
 static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
 static cJSON *yo_build_messages(const char *current_query);
+static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
+                                                 const char *scrollback_data);
 static void yo_print_error(const char *msg);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static const char *yo_get_chat_color(void);
+
+/* PTY proxy functions */
+static int yo_pty_init(void);
+static void yo_pty_cleanup(void);
+static void yo_pump_loop(void) __attribute__((noreturn));
+static void yo_scrollback_append(const char *data, size_t len);
+static void yo_forward_signal(int sig);
 
 /* **************************************************************** */
 /*                                                                  */
@@ -253,6 +317,493 @@ yo_reload_config(void)
 
 /* **************************************************************** */
 /*                                                                  */
+/*                   PTY Proxy Implementation                       */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Append data to the scrollback buffer (called from pump process) */
+static void
+yo_scrollback_append(const char *data, size_t len)
+{
+    if (!yo_scrollback || len == 0)
+        return;
+
+    pthread_mutex_lock(&yo_scrollback->lock);
+
+    /* Write data to circular buffer */
+    size_t capacity = yo_scrollback->capacity;
+    size_t write_pos = yo_scrollback->write_pos;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        yo_scrollback->data[write_pos] = data[i];
+        write_pos = (write_pos + 1) % capacity;
+    }
+
+    yo_scrollback->write_pos = write_pos;
+    yo_scrollback->data_size += len;
+    if (yo_scrollback->data_size > capacity)
+        yo_scrollback->data_size = capacity;
+
+    pthread_mutex_unlock(&yo_scrollback->lock);
+}
+
+/* Signal handler to forward signals to child shell process */
+static void
+yo_forward_signal(int sig)
+{
+    if (yo_child_pid > 0)
+        kill(yo_child_pid, sig);
+}
+
+/* SIGWINCH handler for pump - propagate window size to PTY and forward to child */
+static void
+yo_pump_sigwinch_handler(int sig)
+{
+    struct winsize ws;
+
+    if (yo_pty_master >= 0 && yo_real_stdout >= 0)
+    {
+        /* Get current terminal size from real terminal */
+        if (ioctl(yo_real_stdout, TIOCGWINSZ, &ws) == 0)
+        {
+            /* Propagate to PTY master */
+            (void)ioctl(yo_pty_master, TIOCSWINSZ, &ws);
+        }
+    }
+
+    /* Forward to child */
+    yo_forward_signal(sig);
+}
+
+/* The pump loop - runs in the parent process, forwards I/O and waits for child */
+static void
+yo_pump_loop(void)
+{
+    struct pollfd fds[2];
+    char buf[4096];
+    ssize_t n;
+    int status;
+    struct sigaction sa;
+
+    /* Set up signal forwarding for common signals */
+    sa.sa_handler = yo_forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+
+    /* SIGWINCH needs special handling - propagate window size too */
+    sa.sa_handler = yo_pump_sigwinch_handler;
+    sigaction(SIGWINCH, &sa, NULL);
+
+    /* Set up poll fds:
+       [0] = real stdin (read input from user)
+       [1] = PTY master (read output from shell)
+    */
+    fds[0].fd = yo_real_stdin;
+    fds[0].events = POLLIN;
+    fds[1].fd = yo_pty_master;
+    fds[1].events = POLLIN;
+
+    for (;;)
+    {
+        int ret;
+
+        /* Check if child is still alive */
+        if (waitpid(yo_child_pid, &status, WNOHANG) > 0)
+        {
+            /* Child exited - drain any remaining output and exit */
+            while ((n = read(yo_pty_master, buf, sizeof(buf))) > 0)
+            {
+                (void)write(yo_real_stdout, buf, n);
+                yo_scrollback_append(buf, n);
+            }
+
+            /* Restore terminal settings */
+            if (yo_orig_termios_saved)
+                tcsetattr(yo_real_stdin, TCSANOW, &yo_orig_termios);
+
+            /* Exit with child's exit status */
+            if (WIFEXITED(status))
+                _exit(WEXITSTATUS(status));
+            else if (WIFSIGNALED(status))
+                _exit(128 + WTERMSIG(status));
+            else
+                _exit(1);
+        }
+
+        ret = poll(fds, 2, 100);  /* 100ms timeout to check child status */
+
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;  /* Error */
+        }
+
+        if (ret == 0)
+            continue;  /* Timeout, check child status */
+
+        /* Forward input from real stdin to PTY master */
+        if (fds[0].revents & POLLIN)
+        {
+            n = read(yo_real_stdin, buf, sizeof(buf));
+            if (n > 0)
+            {
+                (void)write(yo_pty_master, buf, n);
+            }
+            else if (n == 0)
+            {
+                /* EOF on stdin - close PTY master write side to signal EOF to shell */
+                break;
+            }
+            /* Ignore errors on stdin - they're usually transient */
+        }
+
+        /* Forward output from PTY master to real stdout and scrollback */
+        if (fds[1].revents & POLLIN)
+        {
+            n = read(yo_pty_master, buf, sizeof(buf));
+            if (n > 0)
+            {
+                /* Write to real terminal */
+                (void)write(yo_real_stdout, buf, n);
+
+                /* Append to scrollback buffer */
+                yo_scrollback_append(buf, n);
+            }
+            else if (n == 0)
+            {
+                /* PTY closed - shell exited */
+                break;
+            }
+        }
+
+        /* Check for hangup/error on PTY */
+        if ((fds[1].revents & (POLLHUP | POLLERR)) && !(fds[1].revents & POLLIN))
+            break;
+    }
+
+    /* Wait for child to fully exit */
+    waitpid(yo_child_pid, &status, 0);
+
+    /* Restore terminal settings */
+    if (yo_orig_termios_saved)
+        tcsetattr(yo_real_stdin, TCSANOW, &yo_orig_termios);
+
+    /* Exit with child's exit status */
+    if (WIFEXITED(status))
+        _exit(WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        _exit(128 + WTERMSIG(status));
+    else
+        _exit(1);
+}
+
+/* Initialize PTY proxy - called from rl_yo_enable()
+   This function forks: parent becomes the I/O pump, child becomes the shell.
+   Returns 0 on success (in the child/shell process).
+   The parent never returns - it runs the pump loop and exits. */
+static int
+yo_pty_init(void)
+{
+    struct winsize ws;
+    struct termios term;
+    const char *env_val;
+    size_t scrollback_bytes = YO_DEFAULT_SCROLLBACK_BYTES;
+    int scrollback_lines = YO_DEFAULT_SCROLLBACK_LINES;
+    pthread_mutexattr_t mutex_attr;
+    pid_t pid;
+
+    /* Check if scrollback is disabled */
+    env_val = getenv("YO_SCROLLBACK_ENABLED");
+    if (env_val && *env_val == '0')
+    {
+        yo_scrollback_enabled = 0;
+        return 0;  /* Not an error, just disabled */
+    }
+
+    /* Check if stdin is a terminal */
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+    {
+        yo_scrollback_enabled = 0;
+        return 0;  /* Not a terminal, can't use PTY */
+    }
+
+    /* Read scrollback configuration */
+    env_val = getenv("YO_SCROLLBACK_BYTES");
+    if (env_val && *env_val)
+    {
+        long val = atol(env_val);
+        if (val > 0)
+            scrollback_bytes = (size_t)val;
+    }
+
+    env_val = getenv("YO_SCROLLBACK_LINES");
+    if (env_val && *env_val)
+    {
+        int val = atoi(env_val);
+        if (val > 0)
+            scrollback_lines = val;
+    }
+
+    /* Save original terminal settings */
+    if (tcgetattr(STDIN_FILENO, &yo_orig_termios) == 0)
+        yo_orig_termios_saved = 1;
+
+    /* Get current terminal size */
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0)
+    {
+        ws.ws_row = 24;
+        ws.ws_col = 80;
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+    }
+
+    /* Get current terminal settings for PTY */
+    if (tcgetattr(STDIN_FILENO, &term) < 0)
+        goto fail;
+
+    /* Create PTY pair */
+    if (openpty(&yo_pty_master, &yo_pty_slave, NULL, &term, &ws) < 0)
+        goto fail;
+
+    /* Allocate scrollback buffer in shared memory (accessible by both pump and shell) */
+    yo_scrollback_mmap_size = sizeof(yo_scrollback_t) + scrollback_bytes;
+    yo_scrollback = mmap(NULL, yo_scrollback_mmap_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (yo_scrollback == MAP_FAILED)
+    {
+        yo_scrollback = NULL;
+        goto fail_pty;
+    }
+
+    /* Initialize scrollback structure */
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&yo_scrollback->lock, &mutex_attr);
+    pthread_mutexattr_destroy(&mutex_attr);
+
+    yo_scrollback->capacity = scrollback_bytes;
+    yo_scrollback->max_lines = scrollback_lines;
+    yo_scrollback->write_pos = 0;
+    yo_scrollback->data_size = 0;
+
+    /* Fork: parent becomes pump, child becomes shell */
+    pid = fork();
+    if (pid < 0)
+        goto fail_scrollback;
+
+    if (pid > 0)
+    {
+        /* Parent process - becomes the I/O pump */
+        yo_is_pump = 1;
+        yo_child_pid = pid;
+
+        /* Save original FDs for pump to use */
+        yo_real_stdin = dup(STDIN_FILENO);
+        yo_real_stdout = dup(STDOUT_FILENO);
+        yo_real_stderr = dup(STDERR_FILENO);
+
+        /* Close PTY slave in parent - only child uses it */
+        close(yo_pty_slave);
+        yo_pty_slave = -1;
+
+        /* Put the real terminal into raw mode for the pump */
+        {
+            struct termios raw_term = yo_orig_termios;
+            cfmakeraw(&raw_term);
+            tcsetattr(yo_real_stdin, TCSANOW, &raw_term);
+        }
+
+        /* Run the pump loop - this never returns */
+        yo_pump_loop();
+        /* NOTREACHED */
+    }
+
+    /* Child process - becomes the shell */
+    yo_is_pump = 0;
+    yo_child_pid = -1;
+
+    /* Close PTY master in child - only pump uses it */
+    close(yo_pty_master);
+    yo_pty_master = -1;
+
+    /* Create new session so we can set controlling terminal */
+    if (setsid() < 0)
+        goto fail_scrollback;
+
+    /* Redirect stdin/stdout/stderr to PTY slave */
+    if (dup2(yo_pty_slave, STDIN_FILENO) < 0 ||
+        dup2(yo_pty_slave, STDOUT_FILENO) < 0 ||
+        dup2(yo_pty_slave, STDERR_FILENO) < 0)
+        goto fail_scrollback;
+
+    /* Close the extra slave FD - we have it on stdin/stdout/stderr now */
+    close(yo_pty_slave);
+    yo_pty_slave = -1;
+
+    /* Make the PTY slave our controlling terminal */
+    if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0)
+        goto fail;
+
+    yo_scrollback_enabled = 1;
+    return 0;
+
+fail_scrollback:
+    if (yo_scrollback)
+    {
+        munmap(yo_scrollback, yo_scrollback_mmap_size);
+        yo_scrollback = NULL;
+    }
+
+fail_pty:
+    if (yo_pty_master >= 0)
+        close(yo_pty_master);
+    if (yo_pty_slave >= 0)
+        close(yo_pty_slave);
+    yo_pty_master = yo_pty_slave = -1;
+
+fail:
+    yo_scrollback_enabled = 0;
+    return -1;
+}
+
+/* Cleanup PTY proxy - called from rl_yo_disable() in the shell process */
+static void
+yo_pty_cleanup(void)
+{
+    /* Only the shell process should call this, not the pump */
+    if (yo_is_pump)
+        return;
+
+    /* Unmap scrollback buffer */
+    if (yo_scrollback)
+    {
+        munmap(yo_scrollback, yo_scrollback_mmap_size);
+        yo_scrollback = NULL;
+    }
+
+    yo_scrollback_enabled = 0;
+}
+
+/* Get scrollback text - returns malloc'd string, caller must free.
+   Returns up to max_lines lines from the end of the scrollback buffer.
+   ANSI escape sequences are stripped for LLM readability. */
+char *
+rl_yo_get_scrollback(int max_lines)
+{
+    char *result = NULL;
+    char *raw_data = NULL;
+    size_t raw_size;
+    int line_count;
+    char *p, *start, *out;
+    size_t out_size;
+
+    if (!yo_scrollback_enabled || !yo_scrollback || yo_is_pump)
+        return strdup("");
+
+    if (max_lines <= 0)
+        max_lines = yo_scrollback->max_lines;
+
+    pthread_mutex_lock(&yo_scrollback->lock);
+
+    if (yo_scrollback->data_size == 0)
+    {
+        pthread_mutex_unlock(&yo_scrollback->lock);
+        return strdup("");
+    }
+
+    /* Extract data from circular buffer into linear buffer */
+    raw_size = yo_scrollback->data_size;
+    raw_data = malloc(raw_size + 1);
+    if (!raw_data)
+    {
+        pthread_mutex_unlock(&yo_scrollback->lock);
+        return strdup("");
+    }
+
+    if (yo_scrollback->data_size < yo_scrollback->capacity)
+    {
+        /* Buffer hasn't wrapped yet - data starts at 0 */
+        memcpy(raw_data, yo_scrollback->data, raw_size);
+    }
+    else
+    {
+        /* Buffer has wrapped - data starts at write_pos */
+        size_t first_part = yo_scrollback->capacity - yo_scrollback->write_pos;
+        memcpy(raw_data, yo_scrollback->data + yo_scrollback->write_pos, first_part);
+        memcpy(raw_data + first_part, yo_scrollback->data, yo_scrollback->write_pos);
+    }
+    raw_data[raw_size] = '\0';
+
+    pthread_mutex_unlock(&yo_scrollback->lock);
+
+    /* Count lines from end and find start position */
+    line_count = 0;
+    start = raw_data + raw_size;
+    for (p = raw_data + raw_size - 1; p >= raw_data && line_count < max_lines; p--)
+    {
+        if (*p == '\n')
+        {
+            line_count++;
+            if (line_count < max_lines)
+                start = p + 1;
+            else
+                start = p + 1;  /* Don't include the newline before our start */
+        }
+    }
+    if (line_count < max_lines && p < raw_data)
+        start = raw_data;
+
+    /* Allocate output buffer (same size is safe upper bound after stripping) */
+    out_size = raw_size - (start - raw_data);
+    result = malloc(out_size + 1);
+    if (!result)
+    {
+        free(raw_data);
+        return strdup("");
+    }
+
+    /* Copy while stripping ANSI escape sequences */
+    out = result;
+    for (p = start; *p; p++)
+    {
+        if (*p == '\033')
+        {
+            /* Skip ESC [ ... (letter) sequences */
+            if (*(p + 1) == '[')
+            {
+                p += 2;
+                while (*p && !(*p >= 'A' && *p <= 'Z') && !(*p >= 'a' && *p <= 'z'))
+                    p++;
+                if (!*p)
+                    break;
+                continue;  /* Skip the final letter */
+            }
+            /* Skip other ESC sequences (ESC followed by one char) */
+            if (*(p + 1))
+            {
+                p++;
+                continue;
+            }
+        }
+        *out++ = *p;
+    }
+    *out = '\0';
+
+    free(raw_data);
+    return result;
+}
+
+/* **************************************************************** */
+/*                                                                  */
 /*                    Public API Functions                          */
 /*                                                                  */
 /* **************************************************************** */
@@ -263,7 +814,10 @@ rl_yo_enable(const char *system_prompt)
     if (yo_is_enabled)
         return;
 
-    /* Store system prompt from caller */
+    /* Initialize PTY proxy for scrollback capture (optional - may fail silently) */
+    yo_pty_init();
+
+    /* Store system prompt from caller, including scrollback tool description */
     asprintf(
         &yo_system_prompt,
         "%s\n"
@@ -272,6 +826,11 @@ rl_yo_enable(const char *system_prompt)
         "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<brief explanation>\"}\n\n"
         "2. If it's a general question, respond with ONLY:\n"
         "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n\n"
+        "3. If you need to see recent terminal output (e.g., to understand what command "
+        "was run, see error messages, or view results), respond with ONLY:\n"
+        "   {\"type\":\"scrollback\",\"lines\":N}\n"
+        "   where N is the number of recent lines you need (max 1000). "
+        "After receiving the scrollback, you'll get another turn to respond.\n\n"
         "Respond with valid JSON only.",
         system_prompt);
 
@@ -316,6 +875,9 @@ rl_yo_disable(void)
         yo_sigint_pipe[1] = -1;
     }
 
+    /* Cleanup PTY proxy */
+    yo_pty_cleanup();
+
     yo_is_enabled = 0;
 }
 
@@ -359,11 +921,15 @@ rl_yo_clear_history(void)
 int
 rl_yo_accept_line(int count, int key)
 {
-    char *api_key;
-    char *response;
+    char *api_key = NULL;
+    char *response = NULL;
     char *type = NULL;
     char *content = NULL;
     char *explanation = NULL;
+    char *saved_query = NULL;
+    char *scrollback_request = NULL;
+    char *scrollback_data = NULL;
+    int max_scrollback_turns = 3;  /* Limit follow-up turns */
 
     /* Track if previous yo command was executed */
     if (yo_last_was_command)
@@ -392,6 +958,14 @@ rl_yo_accept_line(int count, int key)
     /* Reload config from environment (allows mid-session changes) */
     yo_reload_config();
 
+    /* Save the query for potential follow-up calls */
+    saved_query = strdup(rl_line_buffer);
+    if (!saved_query)
+    {
+        yo_print_error("Memory allocation failed");
+        return 0;
+    }
+
     /* Load API key fresh each time */
     api_key = yo_load_api_key();
     if (!api_key)
@@ -401,6 +975,7 @@ rl_yo_accept_line(int count, int key)
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
+        free(saved_query);
         return 0;
     }
 
@@ -408,8 +983,7 @@ rl_yo_accept_line(int count, int key)
     yo_print_thinking();
 
     /* Call Claude API - handles its own error/cancellation messages */
-    response = yo_call_claude(api_key, rl_line_buffer);
-    free(api_key);
+    response = yo_call_claude(api_key, saved_query);
 
     if (!response)
     {
@@ -417,21 +991,98 @@ rl_yo_accept_line(int count, int key)
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
+        free(api_key);
+        free(saved_query);
         return 0;
     }
-
-    /* Clear thinking indicator on success */
-    yo_clear_thinking();
 
     /* Parse the response */
     if (!yo_parse_response(response, &type, &content, &explanation))
     {
+        yo_clear_thinking();
         yo_print_error("Failed to parse response from Claude");
         free(response);
+        free(api_key);
+        free(saved_query);
         return 0;
     }
 
+    /* Handle scrollback requests with follow-up calls */
+    while (strcmp(type, "scrollback") == 0 && max_scrollback_turns > 0)
+    {
+        int lines_requested;
+
+        /* Save the scrollback request JSON for the follow-up */
+        scrollback_request = response;
+        response = NULL;
+
+        /* Parse number of lines requested */
+        lines_requested = atoi(content);
+        if (lines_requested <= 0)
+            lines_requested = 50;
+        if (lines_requested > 1000)
+            lines_requested = 1000;
+
+        /* Get scrollback data */
+        scrollback_data = rl_yo_get_scrollback(lines_requested);
+        if (!scrollback_data || strlen(scrollback_data) == 0)
+        {
+            if (scrollback_data)
+                free(scrollback_data);
+            scrollback_data = strdup("(No terminal output available)");
+        }
+
+        /* Free the parsed fields from previous response */
+        free(type);
+        type = NULL;
+        free(content);
+        content = NULL;
+        if (explanation)
+        {
+            free(explanation);
+            explanation = NULL;
+        }
+
+        /* Make follow-up API call with scrollback data */
+        response = yo_call_claude_with_scrollback(api_key, saved_query,
+                                                   scrollback_request, scrollback_data);
+
+        /* Clean up scrollback data */
+        free(scrollback_request);
+        scrollback_request = NULL;
+        free(scrollback_data);
+        scrollback_data = NULL;
+
+        if (!response)
+        {
+            /* Error already printed */
+            rl_replace_line("", 0);
+            rl_on_new_line();
+            rl_redisplay();
+            free(api_key);
+            free(saved_query);
+            return 0;
+        }
+
+        /* Parse the new response */
+        if (!yo_parse_response(response, &type, &content, &explanation))
+        {
+            yo_clear_thinking();
+            yo_print_error("Failed to parse response from Claude");
+            free(response);
+            free(api_key);
+            free(saved_query);
+            return 0;
+        }
+
+        max_scrollback_turns--;
+    }
+
     free(response);
+    free(api_key);
+
+    /* Clear thinking indicator on success */
+    yo_clear_thinking();
 
     if (strcmp(type, "command") == 0)
     {
@@ -444,7 +1095,7 @@ rl_yo_accept_line(int count, int key)
         }
 
         /* Add to session history (not executed yet) */
-        yo_history_add(rl_line_buffer, type, content, 0);
+        yo_history_add(saved_query, type, content, 0);
 
         /* Replace line with the command */
         rl_replace_line(content, 0);
@@ -463,9 +1114,17 @@ rl_yo_accept_line(int count, int key)
         yo_display_chat(content);
 
         /* Add to session history */
-        yo_history_add(rl_line_buffer, type, content, 1);
+        yo_history_add(saved_query, type, content, 1);
 
         /* Clear the line and show fresh prompt */
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+    }
+    else if (strcmp(type, "scrollback") == 0)
+    {
+        /* Exceeded max scrollback turns */
+        yo_print_error("Too many scrollback requests");
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
@@ -475,6 +1134,7 @@ rl_yo_accept_line(int count, int key)
         yo_print_error("Unknown response type from Claude");
     }
 
+    free(saved_query);
     if (type)
         free(type);
     if (content)
@@ -589,15 +1249,16 @@ yo_load_api_key(void)
 /*                                                                  */
 /* **************************************************************** */
 
+/* Internal function to call Claude API with pre-built messages array.
+   The messages array is consumed (added to request JSON and freed). */
 static char *
-yo_call_claude(const char *api_key, const char *query)
+yo_call_claude_with_messages(const char *api_key, cJSON *messages)
 {
     CURL *curl;
     CURLM *multi;
     struct curl_slist *headers = NULL;
     yo_response_buffer_t response_buf = {0};
     cJSON *request_json = NULL;
-    cJSON *messages = NULL;
     char *request_body = NULL;
     char auth_header[300];
     char *result = NULL;
@@ -614,6 +1275,7 @@ yo_call_claude(const char *api_key, const char *query)
     {
         yo_clear_thinking();
         yo_print_error("Failed to initialize signal handling");
+        cJSON_Delete(messages);
         return NULL;
     }
 
@@ -625,6 +1287,7 @@ yo_call_claude(const char *api_key, const char *query)
     {
         yo_clear_thinking();
         yo_print_error("Failed to initialize HTTP client");
+        cJSON_Delete(messages);
         return NULL;
     }
 
@@ -634,6 +1297,7 @@ yo_call_claude(const char *api_key, const char *query)
         curl_easy_cleanup(curl);
         yo_clear_thinking();
         yo_print_error("Failed to initialize HTTP client");
+        cJSON_Delete(messages);
         return NULL;
     }
 
@@ -645,6 +1309,7 @@ yo_call_claude(const char *api_key, const char *query)
         curl_easy_cleanup(curl);
         yo_clear_thinking();
         yo_print_error("Failed to build request");
+        cJSON_Delete(messages);
         return NULL;
     }
 
@@ -652,17 +1317,7 @@ yo_call_claude(const char *api_key, const char *query)
     cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
     cJSON_AddStringToObject(request_json, "system", yo_system_prompt);
 
-    /* Build messages array with history */
-    messages = yo_build_messages(query);
-    if (!messages)
-    {
-        cJSON_Delete(request_json);
-        curl_multi_cleanup(multi);
-        curl_easy_cleanup(curl);
-        yo_clear_thinking();
-        yo_print_error("Failed to build request");
-        return NULL;
-    }
+    /* Add messages array to request (takes ownership) */
     cJSON_AddItemToObject(request_json, "messages", messages);
 
     request_body = cJSON_PrintUnformatted(request_json);
@@ -832,6 +1487,35 @@ yo_call_claude(const char *api_key, const char *query)
     return result;
 }
 
+/* Main API call function - builds messages from query and calls API */
+static char *
+yo_call_claude(const char *api_key, const char *query)
+{
+    cJSON *messages = yo_build_messages(query);
+    if (!messages)
+    {
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
+        return NULL;
+    }
+    return yo_call_claude_with_messages(api_key, messages);
+}
+
+/* API call with scrollback context - for follow-up after scrollback request */
+static char *
+yo_call_claude_with_scrollback(const char *api_key, const char *query,
+                                const char *scrollback_request, const char *scrollback_data)
+{
+    cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request, scrollback_data);
+    if (!messages)
+    {
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
+        return NULL;
+    }
+    return yo_call_claude_with_messages(api_key, messages);
+}
+
 /* **************************************************************** */
 /*                                                                  */
 /*                    Response Parsing                              */
@@ -845,6 +1529,7 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
     cJSON *type_item;
     cJSON *content_item;
     cJSON *explanation_item;
+    cJSON *lines_item;
 
     *type = NULL;
     *content = NULL;
@@ -885,6 +1570,22 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
         if (content_item && cJSON_IsString(content_item))
         {
             *content = strdup(content_item->valuestring);
+        }
+    }
+    else if (strcmp(*type, "scrollback") == 0)
+    {
+        /* For scrollback requests, "lines" is an integer - convert to string */
+        lines_item = cJSON_GetObjectItem(json, "lines");
+        if (lines_item && cJSON_IsNumber(lines_item))
+        {
+            char lines_str[32];
+            snprintf(lines_str, sizeof(lines_str), "%d", (int)lines_item->valuedouble);
+            *content = strdup(lines_str);
+        }
+        else
+        {
+            /* Default to 50 lines if not specified */
+            *content = strdup("50");
         }
     }
 
@@ -1108,6 +1809,121 @@ yo_build_messages(const char *current_query)
     {
         cJSON_AddStringToObject(msg, "content", current_query);
     }
+    cJSON_AddItemToArray(messages, msg);
+
+    return messages;
+}
+
+/* Build messages array for a follow-up call after a scrollback request.
+   This adds the assistant's scrollback request, user's scrollback data reply,
+   and then expects assistant to give final response. */
+static cJSON *
+yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
+                                   const char *scrollback_data)
+{
+    cJSON *messages;
+    cJSON *msg;
+    int i;
+    char user_content[4096];
+    char *scrollback_msg;
+
+    messages = cJSON_CreateArray();
+    if (!messages)
+        return NULL;
+
+    /* Add history entries (same as yo_build_messages) */
+    for (i = 0; i < yo_history_count; i++)
+    {
+        /* User message */
+        msg = cJSON_CreateObject();
+        if (!msg)
+        {
+            cJSON_Delete(messages);
+            return NULL;
+        }
+        cJSON_AddStringToObject(msg, "role", "user");
+        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
+        cJSON_AddItemToArray(messages, msg);
+
+        /* Assistant response */
+        msg = cJSON_CreateObject();
+        if (!msg)
+        {
+            cJSON_Delete(messages);
+            return NULL;
+        }
+        cJSON_AddStringToObject(msg, "role", "assistant");
+
+        if (strcmp(yo_history[i].response_type, "command") == 0)
+        {
+            cJSON *resp_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp_obj, "type", "command");
+            cJSON_AddStringToObject(resp_obj, "command", yo_history[i].response);
+            char *resp_str = cJSON_PrintUnformatted(resp_obj);
+            cJSON_AddStringToObject(msg, "content", resp_str);
+            free(resp_str);
+            cJSON_Delete(resp_obj);
+        }
+        else
+        {
+            cJSON *resp_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp_obj, "type", "chat");
+            cJSON_AddStringToObject(resp_obj, "response", yo_history[i].response);
+            char *resp_str = cJSON_PrintUnformatted(resp_obj);
+            cJSON_AddStringToObject(msg, "content", resp_str);
+            free(resp_str);
+            cJSON_Delete(resp_obj);
+        }
+        cJSON_AddItemToArray(messages, msg);
+    }
+
+    /* Add current query with execution status of previous if applicable */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "user");
+
+    if (yo_history_count > 0 && strcmp(yo_history[yo_history_count-1].response_type, "command") == 0)
+    {
+        snprintf(user_content, sizeof(user_content), "[%s]\n%s",
+                 yo_history[yo_history_count-1].executed ? "executed" : "not executed",
+                 current_query);
+        cJSON_AddStringToObject(msg, "content", user_content);
+    }
+    else
+    {
+        cJSON_AddStringToObject(msg, "content", current_query);
+    }
+    cJSON_AddItemToArray(messages, msg);
+
+    /* Add assistant's scrollback request */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    cJSON_AddStringToObject(msg, "content", scrollback_request);
+    cJSON_AddItemToArray(messages, msg);
+
+    /* Add user's scrollback data */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "user");
+
+    /* Format scrollback in a clear way */
+    asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
+             scrollback_data);
+    cJSON_AddStringToObject(msg, "content", scrollback_msg);
+    free(scrollback_msg);
     cJSON_AddItemToArray(messages, msg);
 
     return messages;

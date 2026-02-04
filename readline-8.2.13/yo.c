@@ -51,6 +51,10 @@
 #define YO_API_TIMEOUT 30L
 #define YO_MAX_TOKENS 1024
 
+/* Default color: red italics */
+#define YO_DEFAULT_CHAT_COLOR "\033[3;31m"
+#define YO_COLOR_RESET "\033[0m"
+
 /* **************************************************************** */
 /*                                                                  */
 /*                     Session Memory Types                         */
@@ -83,6 +87,9 @@ static char *yo_system_prompt = NULL;
 static int yo_last_was_command = 0;
 static int yo_last_command_executed = 0;
 
+/* Color for chat/error/thinking output (cached from YO_CHAT_COLOR or default) */
+static const char *yo_chat_color = NULL;
+
 /* **************************************************************** */
 /*                                                                  */
 /*                    Forward Declarations                          */
@@ -100,6 +107,7 @@ static cJSON *yo_build_messages(const char *current_query);
 static void yo_print_error(const char *msg);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
+static const char *yo_get_chat_color(void);
 
 /* **************************************************************** */
 /*                                                                  */
@@ -331,7 +339,7 @@ rl_yo_accept_line(int count, int key)
         /* Print explanation if present */
         if (explanation && *explanation)
         {
-            fprintf(rl_outstream, "[yo] %s\n", explanation);
+            yo_display_chat(explanation);
         }
 
         /* Add to session history (not executed yet) */
@@ -690,24 +698,38 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
 /*                                                                  */
 /* **************************************************************** */
 
+static const char *
+yo_get_chat_color(void)
+{
+    if (!yo_chat_color)
+    {
+        const char *env_val = getenv("YO_CHAT_COLOR");
+        if (env_val && *env_val)
+            yo_chat_color = env_val;
+        else
+            yo_chat_color = YO_DEFAULT_CHAT_COLOR;
+    }
+    return yo_chat_color;
+}
+
 static void
 yo_display_chat(const char *response)
 {
-    fprintf(rl_outstream, "%s\n", response);
+    fprintf(rl_outstream, "%s%s%s\n", yo_get_chat_color(), response, YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 
 static void
 yo_print_error(const char *msg)
 {
-    fprintf(rl_outstream, "\n[yo] Error: %s\n", msg);
+    fprintf(rl_outstream, "\n%s[yo] Error: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 
 static void
 yo_print_thinking(void)
 {
-    fprintf(rl_outstream, "\n[yo] Thinking...");
+    fprintf(rl_outstream, "\n%s[yo] Thinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 

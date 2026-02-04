@@ -376,6 +376,26 @@ yo_pump_sigwinch_handler(int sig)
     yo_forward_signal(sig);
 }
 
+/* Helper to write all bytes, handling EINTR and partial writes.
+   Returns 0 on success, -1 on error. */
+static int
+yo_write_all(int fd, const char *buf, size_t len)
+{
+    size_t written = 0;
+    while (written < len)
+    {
+        ssize_t n = write(fd, buf + written, len - written);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        written += n;
+    }
+    return 0;
+}
+
 /* The pump loop - runs in the parent process, forwards I/O and waits for child */
 static void
 yo_pump_loop(void)
@@ -383,8 +403,10 @@ yo_pump_loop(void)
     struct pollfd fds[2];
     char buf[4096];
     ssize_t n;
-    int status;
+    int status = 0;
+    int error_exit = 0;  /* If set, exit with 1 regardless of child status */
     struct sigaction sa;
+    pid_t wpid;
 
     /* Set up signal forwarding for common signals */
     sa.sa_handler = yo_forward_signal;
@@ -415,26 +437,35 @@ yo_pump_loop(void)
         int ret;
 
         /* Check if child is still alive */
-        if (waitpid(yo_child_pid, &status, WNOHANG) > 0)
+        wpid = waitpid(yo_child_pid, &status, WNOHANG);
+        if (wpid < 0)
         {
-            /* Child exited - drain any remaining output and exit */
-            while ((n = read(yo_pty_master, buf, sizeof(buf))) > 0)
+            if (errno == EINTR)
+                continue;
+            goto error;
+        }
+        if (wpid > 0)
+        {
+            /* Child exited - drain any remaining output */
+            for (;;)
             {
-                (void)write(yo_real_stdout, buf, n);
-                yo_scrollback_append(buf, n);
+                n = read(yo_pty_master, buf, sizeof(buf));
+                if (n > 0)
+                {
+                    if (yo_write_all(yo_real_stdout, buf, n) < 0)
+                        break;  /* Write error during drain, stop draining */
+                    yo_scrollback_append(buf, n);
+                }
+                else if (n == 0)
+                {
+                    break;  /* EOF */
+                }
+                else if (errno != EINTR)
+                {
+                    break;  /* Read error during drain */
+                }
             }
-
-            /* Restore terminal settings */
-            if (yo_orig_termios_saved)
-                tcsetattr(yo_real_stdin, TCSANOW, &yo_orig_termios);
-
-            /* Exit with child's exit status */
-            if (WIFEXITED(status))
-                _exit(WEXITSTATUS(status));
-            else if (WIFSIGNALED(status))
-                _exit(128 + WTERMSIG(status));
-            else
-                _exit(1);
+            goto cleanup;
         }
 
         ret = poll(fds, 2, 100);  /* 100ms timeout to check child status */
@@ -443,7 +474,7 @@ yo_pump_loop(void)
         {
             if (errno == EINTR)
                 continue;
-            break;  /* Error */
+            goto error;
         }
 
         if (ret == 0)
@@ -455,14 +486,18 @@ yo_pump_loop(void)
             n = read(yo_real_stdin, buf, sizeof(buf));
             if (n > 0)
             {
-                (void)write(yo_pty_master, buf, n);
+                if (yo_write_all(yo_pty_master, buf, n) < 0)
+                    goto error;
             }
             else if (n == 0)
             {
-                /* EOF on stdin - close PTY master write side to signal EOF to shell */
-                break;
+                /* EOF on stdin */
+                goto wait_child;
             }
-            /* Ignore errors on stdin - they're usually transient */
+            else if (errno != EINTR)
+            {
+                goto error;
+            }
         }
 
         /* Forward output from PTY master to real stdout and scrollback */
@@ -471,33 +506,47 @@ yo_pump_loop(void)
             n = read(yo_pty_master, buf, sizeof(buf));
             if (n > 0)
             {
-                /* Write to real terminal */
-                (void)write(yo_real_stdout, buf, n);
-
-                /* Append to scrollback buffer */
+                if (yo_write_all(yo_real_stdout, buf, n) < 0)
+                    goto error;
                 yo_scrollback_append(buf, n);
             }
             else if (n == 0)
             {
                 /* PTY closed - shell exited */
-                break;
+                goto wait_child;
+            }
+            else if (errno != EINTR)
+            {
+                goto error;
             }
         }
 
         /* Check for hangup/error on PTY */
         if ((fds[1].revents & (POLLHUP | POLLERR)) && !(fds[1].revents & POLLIN))
-            break;
+            goto wait_child;
     }
 
-    /* Wait for child to fully exit */
-    waitpid(yo_child_pid, &status, 0);
+error:
+    /* Fatal error - kill child and wait for it */
+    error_exit = 1;
+    kill(yo_child_pid, SIGTERM);
+    /* Fall through to wait_child */
 
+wait_child:
+    /* Wait for child to fully exit, handling EINTR */
+    while (waitpid(yo_child_pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    /* Fall through to cleanup */
+
+cleanup:
     /* Restore terminal settings */
     if (yo_orig_termios_saved)
         tcsetattr(yo_real_stdin, TCSANOW, &yo_orig_termios);
 
-    /* Exit with child's exit status */
-    if (WIFEXITED(status))
+    /* Exit with appropriate status */
+    if (error_exit)
+        _exit(1);
+    else if (WIFEXITED(status))
         _exit(WEXITSTATUS(status));
     else if (WIFSIGNALED(status))
         _exit(128 + WTERMSIG(status));

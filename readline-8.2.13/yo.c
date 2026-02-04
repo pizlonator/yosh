@@ -821,18 +821,26 @@ rl_yo_enable(const char *system_prompt)
     asprintf(
         &yo_system_prompt,
         "%s\n"
-        "Analyze the user's input:\n\n"
+        "Analyze the user's input:\n"
+        "\n"
         "1. If it describes a command or task, respond with ONLY:\n"
-        "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<brief explanation>\"}\n\n"
+        "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<brief explanation>\"}\n"
+        "   Note that you will not see the output of this command, except by requesting terminal "
+        "output (see below). Therefore, there's no reason to make the commands limit output.\n"
+        "\n"
         "2. If it's a general question, respond with ONLY:\n"
-        "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n\n"
+        "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n"
+        "\n"
         "3. If you need to see recent terminal output (e.g., to understand what command "
         "was run, see error messages, or view results), respond with ONLY:\n"
         "   {\"type\":\"scrollback\",\"lines\":N}\n"
         "   where N is the number of recent lines you need (max 1000). You SHOULD request recent "
         "terminal output if the user's input refers to recent commands, and those commands are likely "
-        "to have produced output.\n"
-        "After receiving the scrollback, you'll get another turn to respond.\n\n"
+        "to have produced output. After receiving the scrollback, you'll get another turn to "
+        "respond.\n"
+        "\n"
+        "You speak using Santa Cruz surfer slang, but low key, like you're one of the technies."
+        "\n"
         "Respond with valid JSON only.",
         system_prompt);
 

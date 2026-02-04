@@ -168,7 +168,6 @@ static const char *yo_get_chat_color(void);
 
 /* PTY proxy functions */
 static int yo_pty_init(void);
-static void yo_pty_cleanup(void);
 static void yo_pump_loop(void) __attribute__((noreturn));
 static void yo_scrollback_append(const char *data, size_t len);
 static void yo_forward_signal(int sig);
@@ -724,24 +723,6 @@ fail:
     return -1;
 }
 
-/* Cleanup PTY proxy - called from rl_yo_disable() in the shell process */
-static void
-yo_pty_cleanup(void)
-{
-    /* Only the shell process should call this, not the pump */
-    if (yo_is_pump)
-        return;
-
-    /* Unmap scrollback buffer */
-    if (yo_scrollback)
-    {
-        munmap(yo_scrollback, yo_scrollback_mmap_size);
-        yo_scrollback = NULL;
-    }
-
-    yo_scrollback_enabled = 0;
-}
-
 /* Get scrollback text - returns malloc'd string, caller must free.
    Returns up to max_lines lines from the end of the scrollback buffer.
    ANSI escape sequences are stripped for LLM readability. */
@@ -898,46 +879,6 @@ rl_yo_enable(const char *system_prompt)
     rl_bind_key('\r', rl_yo_accept_line);
 
     yo_is_enabled = 1;
-}
-
-void
-rl_yo_disable(void)
-{
-    if (!yo_is_enabled)
-        return;
-
-    /* Restore normal Enter behavior */
-    rl_bind_key('\n', rl_newline);
-    rl_bind_key('\r', rl_newline);
-
-    /* Clean up */
-    rl_yo_clear_history();
-
-    if (yo_model)
-    {
-        free(yo_model);
-        yo_model = NULL;
-    }
-
-    free(yo_system_prompt);
-    yo_system_prompt = NULL;
-
-    /* Close signal pipe */
-    if (yo_sigint_pipe[0] >= 0)
-    {
-        close(yo_sigint_pipe[0]);
-        yo_sigint_pipe[0] = -1;
-    }
-    if (yo_sigint_pipe[1] >= 0)
-    {
-        close(yo_sigint_pipe[1]);
-        yo_sigint_pipe[1] = -1;
-    }
-
-    /* Cleanup PTY proxy */
-    yo_pty_cleanup();
-
-    yo_is_enabled = 0;
 }
 
 int

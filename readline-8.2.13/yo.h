@@ -40,9 +40,6 @@ extern "C" {
    should provide this to give context about the environment. */
 extern void rl_yo_enable (const char *system_prompt);
 
-/* Disable "yo" features, restore normal Enter behavior. */
-extern void rl_yo_disable (void);
-
 /* Check if yo is currently enabled. Returns non-zero if enabled. */
 extern int rl_yo_enabled (void);
 

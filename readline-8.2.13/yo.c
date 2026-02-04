@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <pwd.h>
 #include <curl/curl.h>
@@ -117,6 +119,64 @@ typedef struct {
     char *data;
     size_t size;
 } yo_response_buffer_t;
+
+/* Self-pipe for immediate Ctrl-C response during API calls.
+   When SIGINT arrives, the signal handler writes to the pipe.
+   The curl multi loop select()s on both curl sockets and this pipe,
+   allowing immediate cancellation. */
+static int yo_sigint_pipe[2] = {-1, -1};  /* [0]=read, [1]=write */
+
+/* Flag to track if request was cancelled by Ctrl-C */
+static volatile sig_atomic_t yo_cancelled = 0;
+
+/* SIGINT handler during API calls - writes to pipe for immediate wakeup */
+static void
+yo_sigint_handler(int sig)
+{
+    char c = 1;
+    yo_cancelled = 1;
+    /* Non-blocking write; if pipe full, that's fine - one byte is enough */
+    (void)write(yo_sigint_pipe[1], &c, 1);
+    (void)sig;
+}
+
+/* Initialize the self-pipe (called lazily on first use) */
+static int
+yo_init_sigint_pipe(void)
+{
+    int flags;
+
+    if (yo_sigint_pipe[0] >= 0)
+        return 0;  /* Already initialized */
+
+    if (pipe(yo_sigint_pipe) < 0)
+        return -1;
+
+    /* Make write end non-blocking so signal handler never blocks */
+    flags = fcntl(yo_sigint_pipe[1], F_GETFL);
+    if (flags >= 0)
+        fcntl(yo_sigint_pipe[1], F_SETFL, flags | O_NONBLOCK);
+
+    /* Also make read end non-blocking for drain operation */
+    flags = fcntl(yo_sigint_pipe[0], F_GETFL);
+    if (flags >= 0)
+        fcntl(yo_sigint_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    return 0;
+}
+
+/* Drain any stale bytes from the pipe before starting a request */
+static void
+yo_drain_sigint_pipe(void)
+{
+    char buf[16];
+    if (yo_sigint_pipe[0] >= 0)
+    {
+        while (read(yo_sigint_pipe[0], buf, sizeof(buf)) > 0)
+            ;
+    }
+    yo_cancelled = 0;
+}
 
 static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, void *userp)
 {
@@ -244,6 +304,18 @@ rl_yo_disable(void)
     free(yo_system_prompt);
     yo_system_prompt = NULL;
 
+    /* Close signal pipe */
+    if (yo_sigint_pipe[0] >= 0)
+    {
+        close(yo_sigint_pipe[0]);
+        yo_sigint_pipe[0] = -1;
+    }
+    if (yo_sigint_pipe[1] >= 0)
+    {
+        close(yo_sigint_pipe[1]);
+        yo_sigint_pipe[1] = -1;
+    }
+
     yo_is_enabled = 0;
 }
 
@@ -335,18 +407,21 @@ rl_yo_accept_line(int count, int key)
     /* Show thinking indicator */
     yo_print_thinking();
 
-    /* Call Claude API */
+    /* Call Claude API - handles its own error/cancellation messages */
     response = yo_call_claude(api_key, rl_line_buffer);
     free(api_key);
 
-    /* Clear thinking indicator */
-    yo_clear_thinking();
-
     if (!response)
     {
-        yo_print_error("Failed to connect to Claude API");
+        /* Error already printed by yo_call_claude */
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
         return 0;
     }
+
+    /* Clear thinking indicator on success */
+    yo_clear_thinking();
 
     /* Parse the response */
     if (!yo_parse_response(response, &type, &content, &explanation))
@@ -518,7 +593,7 @@ static char *
 yo_call_claude(const char *api_key, const char *query)
 {
     CURL *curl;
-    CURLcode res;
+    CURLM *multi;
     struct curl_slist *headers = NULL;
     yo_response_buffer_t response_buf = {0};
     cJSON *request_json = NULL;
@@ -530,10 +605,35 @@ yo_call_claude(const char *api_key, const char *query)
     cJSON *content_array = NULL;
     cJSON *first_content = NULL;
     cJSON *text_item = NULL;
+    struct sigaction sa, old_sa;
+    int still_running = 1;
+    int cancelled = 0;
+
+    /* Initialize self-pipe for Ctrl-C handling */
+    if (yo_init_sigint_pipe() < 0)
+    {
+        yo_clear_thinking();
+        yo_print_error("Failed to initialize signal handling");
+        return NULL;
+    }
+
+    /* Drain any stale signals and reset cancelled flag */
+    yo_drain_sigint_pipe();
 
     curl = curl_easy_init();
     if (!curl)
     {
+        yo_clear_thinking();
+        yo_print_error("Failed to initialize HTTP client");
+        return NULL;
+    }
+
+    multi = curl_multi_init();
+    if (!multi)
+    {
+        curl_easy_cleanup(curl);
+        yo_clear_thinking();
+        yo_print_error("Failed to initialize HTTP client");
         return NULL;
     }
 
@@ -541,7 +641,10 @@ yo_call_claude(const char *api_key, const char *query)
     request_json = cJSON_CreateObject();
     if (!request_json)
     {
+        curl_multi_cleanup(multi);
         curl_easy_cleanup(curl);
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
         return NULL;
     }
 
@@ -554,7 +657,10 @@ yo_call_claude(const char *api_key, const char *query)
     if (!messages)
     {
         cJSON_Delete(request_json);
+        curl_multi_cleanup(multi);
         curl_easy_cleanup(curl);
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
         return NULL;
     }
     cJSON_AddItemToObject(request_json, "messages", messages);
@@ -564,7 +670,10 @@ yo_call_claude(const char *api_key, const char *query)
 
     if (!request_body)
     {
+        curl_multi_cleanup(multi);
         curl_easy_cleanup(curl);
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
         return NULL;
     }
 
@@ -574,7 +683,7 @@ yo_call_claude(const char *api_key, const char *query)
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
 
-    /* Configure CURL */
+    /* Configure CURL easy handle */
     curl_easy_setopt(curl, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
@@ -582,23 +691,80 @@ yo_call_claude(const char *api_key, const char *query)
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, YO_API_TIMEOUT);
 
-    /* Make the request */
-    res = curl_easy_perform(curl);
+    /* Add easy handle to multi handle */
+    curl_multi_add_handle(multi, curl);
 
-    /* Clean up request resources */
+    /* Install our SIGINT handler for the duration of the request */
+    sa.sa_handler = yo_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, &old_sa);
+
+    /* Multi interface loop with curl_multi_poll() */
+    while (still_running && !cancelled)
+    {
+        CURLMcode mc;
+        int numfds;
+        struct curl_waitfd extra_fd;
+
+        /* Let curl do any immediate work */
+        mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK)
+            break;
+
+        if (!still_running)
+            break;
+
+        /* Set up our signal pipe as an extra fd to poll */
+        extra_fd.fd = yo_sigint_pipe[0];
+        extra_fd.events = CURL_WAIT_POLLIN;
+        extra_fd.revents = 0;
+
+        /* Wait for activity on curl sockets or our signal pipe */
+        mc = curl_multi_poll(multi, &extra_fd, 1, 1000, &numfds);
+        if (mc != CURLM_OK)
+            break;
+
+        /* Check if signal pipe has data (SIGINT was received) */
+        if (extra_fd.revents & CURL_WAIT_POLLIN)
+        {
+            cancelled = 1;
+            break;
+        }
+
+        /* Also check the flag in case signal arrived but poll didn't catch it */
+        if (yo_cancelled)
+        {
+            cancelled = 1;
+            break;
+        }
+    }
+
+    /* Restore original SIGINT handler */
+    sigaction(SIGINT, &old_sa, NULL);
+
+    /* Clean up curl handles */
+    curl_multi_remove_handle(multi, curl);
+    curl_multi_cleanup(multi);
     curl_slist_free_all(headers);
     free(request_body);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK)
+    /* Handle cancellation */
+    if (cancelled)
     {
         if (response_buf.data)
             free(response_buf.data);
+        yo_clear_thinking();
+        fprintf(rl_outstream, "%s[yo] Cancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fflush(rl_outstream);
         return NULL;
     }
 
     if (!response_buf.data)
     {
+        yo_clear_thinking();
+        yo_print_error("No response from API");
         return NULL;
     }
 
@@ -608,6 +774,8 @@ yo_call_claude(const char *api_key, const char *query)
 
     if (!response_json)
     {
+        yo_clear_thinking();
+        yo_print_error("Failed to parse API response");
         return NULL;
     }
 
@@ -617,13 +785,24 @@ yo_call_claude(const char *api_key, const char *query)
     {
         /* Check for error response */
         cJSON *error = cJSON_GetObjectItem(response_json, "error");
+        yo_clear_thinking();
         if (error)
         {
             cJSON *msg = cJSON_GetObjectItem(error, "message");
             if (msg && cJSON_IsString(msg))
             {
-                fprintf(rl_outstream, "\n[yo] API error: %s\n", msg->valuestring);
+                fprintf(rl_outstream, "%s[yo] API error: %s%s\n",
+                        yo_get_chat_color(), msg->valuestring, YO_COLOR_RESET);
+                fflush(rl_outstream);
             }
+            else
+            {
+                yo_print_error("API returned an error");
+            }
+        }
+        else
+        {
+            yo_print_error("Unexpected API response format");
         }
         cJSON_Delete(response_json);
         return NULL;
@@ -633,6 +812,8 @@ yo_call_claude(const char *api_key, const char *query)
     if (!first_content)
     {
         cJSON_Delete(response_json);
+        yo_clear_thinking();
+        yo_print_error("Empty response from API");
         return NULL;
     }
 
@@ -640,6 +821,8 @@ yo_call_claude(const char *api_key, const char *query)
     if (!text_item || !cJSON_IsString(text_item))
     {
         cJSON_Delete(response_json);
+        yo_clear_thinking();
+        yo_print_error("Unexpected API response format");
         return NULL;
     }
 

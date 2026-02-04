@@ -88,6 +88,13 @@ find . -name "*.py" -mtime 0 | wc -l
 
 Each exchange stores: query, response type, response content, whether executed.
 
+### Ctrl-C Cancellation
+
+Users can press Ctrl-C to immediately cancel an in-progress API request. Implementation uses:
+- Self-pipe trick: signal handler writes to a pipe for immediate wakeup
+- `curl_multi_poll()` watches both curl sockets and the signal pipe
+- Cancellation is near-instantaneous, not polling-based
+
 ### Key Files
 
 | File | Purpose |

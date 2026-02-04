@@ -829,7 +829,9 @@ rl_yo_enable(const char *system_prompt)
         "3. If you need to see recent terminal output (e.g., to understand what command "
         "was run, see error messages, or view results), respond with ONLY:\n"
         "   {\"type\":\"scrollback\",\"lines\":N}\n"
-        "   where N is the number of recent lines you need (max 1000). "
+        "   where N is the number of recent lines you need (max 1000). You SHOULD request recent "
+        "terminal output if the user's input refers to recent commands, and those commands are likely "
+        "to have produced output.\n"
         "After receiving the scrollback, you'll get another turn to respond.\n\n"
         "Respond with valid JSON only.",
         system_prompt);

@@ -52,7 +52,7 @@
 #define YO_MAX_TOKENS 1024
 
 /* Default color: red italics */
-#define YO_DEFAULT_CHAT_COLOR "\033[3;31m"
+#define YO_DEFAULT_CHAT_COLOR "\033[3;36m"
 #define YO_COLOR_RESET "\033[0m"
 
 /* **************************************************************** */
@@ -86,9 +86,6 @@ static char *yo_system_prompt = NULL;
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
 static int yo_last_command_executed = 0;
-
-/* Color for chat/error/thinking output (cached from YO_CHAT_COLOR or default) */
-static const char *yo_chat_color = NULL;
 
 /* **************************************************************** */
 /*                                                                  */
@@ -701,15 +698,10 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
 static const char *
 yo_get_chat_color(void)
 {
-    if (!yo_chat_color)
-    {
-        const char *env_val = getenv("YO_CHAT_COLOR");
-        if (env_val && *env_val)
-            yo_chat_color = env_val;
-        else
-            yo_chat_color = YO_DEFAULT_CHAT_COLOR;
-    }
-    return yo_chat_color;
+    const char *env_val = getenv("YO_CHAT_COLOR");
+    if (env_val && *env_val)
+        return env_val;
+    return YO_DEFAULT_CHAT_COLOR;
 }
 
 static void

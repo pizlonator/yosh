@@ -93,6 +93,7 @@ static int yo_last_command_executed = 0;
 /*                                                                  */
 /* **************************************************************** */
 
+static void yo_reload_config(void);
 static char *yo_load_api_key(void);
 static char *yo_call_claude(const char *api_key, const char *query);
 static int yo_parse_response(const char *response, char **type, char **content, char **explanation);
@@ -138,6 +139,60 @@ static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, 
 
 /* **************************************************************** */
 /*                                                                  */
+/*                   Configuration Reload                           */
+/*                                                                  */
+/* **************************************************************** */
+
+static void
+yo_reload_config(void)
+{
+    const char *env_val;
+
+    /* Reload model setting */
+    if (yo_model)
+    {
+        free(yo_model);
+        yo_model = NULL;
+    }
+    env_val = getenv("YO_MODEL");
+    if (env_val && *env_val)
+    {
+        yo_model = strdup(env_val);
+    }
+    else
+    {
+        yo_model = strdup(YO_DEFAULT_MODEL);
+    }
+
+    /* Reload history limit */
+    env_val = getenv("YO_HISTORY_LIMIT");
+    if (env_val && *env_val)
+    {
+        yo_history_limit = atoi(env_val);
+        if (yo_history_limit < 1)
+            yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+    }
+    else
+    {
+        yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+    }
+
+    /* Reload token budget */
+    env_val = getenv("YO_TOKEN_BUDGET");
+    if (env_val && *env_val)
+    {
+        yo_token_budget = atoi(env_val);
+        if (yo_token_budget < 100)
+            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    }
+    else
+    {
+        yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    }
+}
+
+/* **************************************************************** */
+/*                                                                  */
 /*                    Public API Functions                          */
 /*                                                                  */
 /* **************************************************************** */
@@ -145,8 +200,6 @@ static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, 
 void
 rl_yo_enable(const char *system_prompt)
 {
-    const char *env_val;
-
     if (yo_is_enabled)
         return;
 
@@ -161,33 +214,6 @@ rl_yo_enable(const char *system_prompt)
         "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n\n"
         "Respond with valid JSON only.",
         system_prompt);
-
-    /* Load configuration from environment */
-    env_val = getenv("YO_MODEL");
-    if (env_val && *env_val)
-    {
-        yo_model = strdup(env_val);
-    }
-    else
-    {
-        yo_model = strdup(YO_DEFAULT_MODEL);
-    }
-
-    env_val = getenv("YO_HISTORY_LIMIT");
-    if (env_val && *env_val)
-    {
-        yo_history_limit = atoi(env_val);
-        if (yo_history_limit < 1)
-            yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
-    }
-
-    env_val = getenv("YO_TOKEN_BUDGET");
-    if (env_val && *env_val)
-    {
-        yo_token_budget = atoi(env_val);
-        if (yo_token_budget < 100)
-            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
-    }
 
     /* Bind Enter key to our yo-aware accept-line */
     rl_bind_key('\n', rl_yo_accept_line);
@@ -290,6 +316,9 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* It's a yo command - process it */
+
+    /* Reload config from environment (allows mid-session changes) */
+    yo_reload_config();
 
     /* Load API key fresh each time */
     api_key = yo_load_api_key();

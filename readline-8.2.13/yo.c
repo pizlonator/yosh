@@ -172,6 +172,9 @@ static void yo_pump_loop(void) __attribute__((noreturn));
 static void yo_scrollback_append(const char *data, size_t len);
 static void yo_forward_signal(int sig);
 
+/* Distro detection */
+static char *yo_detect_distro(void);
+
 /* **************************************************************** */
 /*                                                                  */
 /*                      CURL Response Buffer                        */
@@ -838,6 +841,90 @@ rl_yo_get_scrollback(int max_lines)
 /*                                                                  */
 /* **************************************************************** */
 
+/* Detect Linux distribution name and version by reading /etc/os-release.
+   Returns a malloc'd string like "Ubuntu 22.04.3 LTS" or NULL if unknown.
+   Caller may leak the result (Fil-C style). */
+static char *
+yo_detect_distro(void)
+{
+    FILE *fp;
+    char line[512];
+    char *pretty_name = NULL;
+    char *name = NULL;
+    char *version = NULL;
+    char *result;
+
+    fp = fopen("/etc/os-release", "r");
+    if (!fp)
+        return NULL;
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n')
+            line[len - 1] = '\0';
+
+        if (strncmp(line, "PRETTY_NAME=", 12) == 0)
+        {
+            char *val = line + 12;
+            /* Strip surrounding quotes */
+            if (*val == '"')
+            {
+                val++;
+                char *end = strrchr(val, '"');
+                if (end)
+                    *end = '\0';
+            }
+            pretty_name = strdup(val);
+        }
+        else if (strncmp(line, "NAME=", 5) == 0)
+        {
+            char *val = line + 5;
+            if (*val == '"')
+            {
+                val++;
+                char *end = strrchr(val, '"');
+                if (end)
+                    *end = '\0';
+            }
+            name = strdup(val);
+        }
+        else if (strncmp(line, "VERSION=", 8) == 0)
+        {
+            char *val = line + 8;
+            if (*val == '"')
+            {
+                val++;
+                char *end = strrchr(val, '"');
+                if (end)
+                    *end = '\0';
+            }
+            version = strdup(val);
+        }
+    }
+
+    fclose(fp);
+
+    if (pretty_name && *pretty_name)
+    {
+        result = pretty_name;
+    }
+    else if (name && *name)
+    {
+        if (version && *version)
+            asprintf(&result, "%s %s", name, version);
+        else
+            result = name;
+    }
+    else
+    {
+        result = NULL;
+    }
+
+    return result;
+}
+
 void
 rl_yo_enable(const char *system_prompt)
 {
@@ -873,6 +960,13 @@ rl_yo_enable(const char *system_prompt)
         "\n"
         "Respond with valid JSON only.",
         system_prompt);
+
+    /* Detect distro and append to system prompt if available */
+    {
+        char *distro = yo_detect_distro();
+        if (distro && *distro)
+            asprintf(&yo_system_prompt, "%s\nThe user is running %s.", yo_system_prompt, distro);
+    }
 
     /* Bind Enter key to our yo-aware accept-line */
     rl_bind_key('\n', rl_yo_accept_line);

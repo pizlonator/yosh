@@ -100,6 +100,7 @@ static int yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
 static int yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
 static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
+static const char *yo_documentation = NULL;
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -160,6 +161,8 @@ static char *yo_load_api_key(void);
 static char *yo_call_claude(const char *api_key, const char *query);
 static char *yo_call_claude_with_scrollback(const char *api_key, const char *query,
                                             const char *scrollback_request, const char *scrollback_data);
+static char *yo_call_claude_with_docs(const char *api_key, const char *query,
+                                      const char *docs_request);
 static int yo_parse_response(const char *response, char **type, char **content, char **explanation, int *pending);
 static void yo_display_chat(const char *response);
 static void yo_history_add(const char *query, const char *type, const char *response, int executed, int pending);
@@ -168,6 +171,7 @@ static int yo_estimate_tokens(void);
 static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
                                                  const char *scrollback_data);
+static cJSON *yo_build_messages_with_docs(const char *current_query, const char *docs_request);
 static void yo_print_error(const char *msg);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
@@ -180,10 +184,10 @@ static void yo_continuation_sigcleanup(int, void *);
 /* Explanation retry - re-prompts LLM when command response is missing explanation */
 static char *yo_retry_for_explanation(const char *api_key, const char *query, const char *original_response);
 
-/* Scrollback and explanation-retry helpers (shared by continuation hook and accept line) */
-static int yo_handle_scrollback_requests(const char *api_key, const char *query,
-                                         char **response, char **type, char **content,
-                                         char **explanation, int *pending, int max_turns);
+/* Request handling helpers (shared by continuation hook and accept line) */
+static int yo_handle_requests(const char *api_key, const char *query,
+                              char **response, char **type, char **content,
+                              char **explanation, int *pending, int max_turns);
 static int yo_handle_explanation_retry(const char *api_key, const char *query,
                                        char **response, char **type, char **content,
                                        char **explanation, int *pending);
@@ -962,7 +966,7 @@ yo_detect_distro(void)
 }
 
 void
-rl_yo_enable(const char *system_prompt)
+rl_yo_enable(const char *system_prompt, const char *documentation)
 {
     if (yo_is_enabled)
         return;
@@ -970,7 +974,10 @@ rl_yo_enable(const char *system_prompt)
     /* Initialize PTY proxy for scrollback capture (optional - may fail silently) */
     yo_pty_init();
 
-    /* Store system prompt from caller, including scrollback tool description */
+    /* Store documentation from caller */
+    yo_documentation = documentation;
+
+    /* Store system prompt from caller, including scrollback and docs tool descriptions */
     asprintf(
         &yo_system_prompt,
         "%s\n"
@@ -1003,6 +1010,9 @@ rl_yo_enable(const char *system_prompt)
         "\n"
         "4. If it's a general question, respond with ONLY:\n"
         "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n"
+        "   If the answer to your question is a shell command or the suggestion to do a sequence of "
+        "shell commands, then STRONGLY CONSIDER sending a command message or starting a multi-step "
+        "task instead.\n"
         "\n"
         "5. If you need to see recent terminal output (e.g., to understand what command "
         "was run, see error messages, or view results), respond with ONLY:\n"
@@ -1011,6 +1021,12 @@ rl_yo_enable(const char *system_prompt)
         "terminal output if the user's input refers to recent commands, and those commands are likely "
         "to have produced output. After receiving the scrollback, you'll get another turn to "
         "respond.\n"
+        "\n"
+        "6. If the user asks about yosh itself (how to use it, configure it, what features it has, "
+        "environment variables, API key setup, troubleshooting, etc.), respond with ONLY:\n"
+        "   {\"type\":\"docs\"}\n"
+        "   You will receive comprehensive documentation and can then answer the user's question.\n"
+        "   Use this for ANY question about yosh's features, configuration, or behavior.\n"
         "\n"
         "Respond with valid JSON only.",
         system_prompt);
@@ -1091,64 +1107,97 @@ yo_install_continuation_sigcleanup(void)
 
 /* **************************************************************** */
 /*                                                                  */
-/*            Scrollback & Explanation-Retry Helpers                */
+/*            Request Handling & Explanation-Retry Helpers          */
 /*                                                                  */
 /* **************************************************************** */
 
-/* Process scrollback requests in a loop until a non-scrollback response is
+/* Process scrollback and docs requests in a loop until a final response is
    received or max_turns is exhausted.  Updates response/type/content/explanation/
    pending in place.  Returns 1 on success, 0 on failure (error already printed,
    *response set to NULL). */
 static int
-yo_handle_scrollback_requests(const char *api_key, const char *query,
-                              char **response, char **type, char **content,
-                              char **explanation, int *pending, int max_turns)
+yo_handle_requests(const char *api_key, const char *query,
+                   char **response, char **type, char **content,
+                   char **explanation, int *pending, int max_turns)
 {
-    char *scrollback_request = NULL;
-    char *scrollback_data = NULL;
-
-    while (strcmp(*type, "scrollback") == 0 && max_turns > 0)
+    while (max_turns > 0)
     {
-        int lines_requested;
-
-        scrollback_request = *response;
-        *response = NULL;
-
-        lines_requested = atoi(*content);
-        if (lines_requested <= 0) lines_requested = 50;
-        if (lines_requested > 1000) lines_requested = 1000;
-
-        scrollback_data = rl_yo_get_scrollback(lines_requested);
-        if (!scrollback_data || !*scrollback_data)
+        if (strcmp(*type, "scrollback") == 0)
         {
-            if (scrollback_data) free(scrollback_data);
-            scrollback_data = strdup("(No terminal output available)");
-        }
+            char *scrollback_request = NULL;
+            char *scrollback_data = NULL;
+            int lines_requested;
 
-        free(*type); *type = NULL;
-        free(*content); *content = NULL;
-        if (*explanation) { free(*explanation); *explanation = NULL; }
-
-        *response = yo_call_claude_with_scrollback(api_key, query,
-                                                    scrollback_request, scrollback_data);
-        free(scrollback_request);
-        scrollback_request = NULL;
-        free(scrollback_data);
-        scrollback_data = NULL;
-
-        if (!*response)
-            return 0;
-
-        if (!yo_parse_response(*response, type, content, explanation, pending))
-        {
-            yo_clear_thinking();
-            yo_print_error("Failed to parse response from Claude");
-            free(*response);
+            scrollback_request = *response;
             *response = NULL;
-            return 0;
-        }
 
-        max_turns--;
+            lines_requested = atoi(*content);
+            if (lines_requested <= 0) lines_requested = 50;
+            if (lines_requested > 1000) lines_requested = 1000;
+
+            scrollback_data = rl_yo_get_scrollback(lines_requested);
+            if (!scrollback_data || !*scrollback_data)
+            {
+                if (scrollback_data) free(scrollback_data);
+                scrollback_data = strdup("(No terminal output available)");
+            }
+
+            free(*type); *type = NULL;
+            free(*content); *content = NULL;
+            if (*explanation) { free(*explanation); *explanation = NULL; }
+
+            *response = yo_call_claude_with_scrollback(api_key, query,
+                                                        scrollback_request, scrollback_data);
+            free(scrollback_request);
+            free(scrollback_data);
+
+            if (!*response)
+                return 0;
+
+            if (!yo_parse_response(*response, type, content, explanation, pending))
+            {
+                yo_clear_thinking();
+                yo_print_error("Failed to parse response from Claude");
+                free(*response);
+                *response = NULL;
+                return 0;
+            }
+
+            max_turns--;
+        }
+        else if (strcmp(*type, "docs") == 0)
+        {
+            char *docs_request = NULL;
+
+            docs_request = *response;
+            *response = NULL;
+
+            free(*type); *type = NULL;
+            free(*content); *content = NULL;
+            if (*explanation) { free(*explanation); *explanation = NULL; }
+
+            *response = yo_call_claude_with_docs(api_key, query, docs_request);
+            free(docs_request);
+
+            if (!*response)
+                return 0;
+
+            if (!yo_parse_response(*response, type, content, explanation, pending))
+            {
+                yo_clear_thinking();
+                yo_print_error("Failed to parse response from Claude");
+                free(*response);
+                *response = NULL;
+                return 0;
+            }
+
+            max_turns--;
+        }
+        else
+        {
+            /* Not a request type - we're done */
+            break;
+        }
     }
 
     return 1;
@@ -1302,7 +1351,7 @@ yo_continuation_hook(void)
     }
 
     /* Handle scrollback requests */
-    if (!yo_handle_scrollback_requests(api_key, cont_query, &response, &type, &content,
+    if (!yo_handle_requests(api_key, cont_query, &response, &type, &content,
                                        &explanation, &pending, 3))
     {
         yo_continuation_active = 0;
@@ -1508,7 +1557,7 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Handle scrollback requests with follow-up calls */
-    if (!yo_handle_scrollback_requests(api_key, saved_query, &response, &type, &content,
+    if (!yo_handle_requests(api_key, saved_query, &response, &type, &content,
                                        &explanation, &pending, 3))
     {
         rl_replace_line("", 0);
@@ -2110,6 +2159,11 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
             *content = strdup("50");
         }
     }
+    else if (strcmp(*type, "docs") == 0)
+    {
+        /* For docs requests, content is empty - we'll provide the docs */
+        *content = strdup("");
+    }
 
     cJSON_Delete(json);
 
@@ -2454,4 +2508,135 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     cJSON_AddItemToArray(messages, msg);
 
     return messages;
+}
+
+/* Build messages array for a follow-up call after a docs request.
+   This adds the assistant's docs request and the documentation, then expects
+   assistant to give final response. */
+static cJSON *
+yo_build_messages_with_docs(const char *current_query, const char *docs_request)
+{
+    cJSON *messages;
+    cJSON *msg;
+    int i;
+    char user_content[4096];
+    char *docs_msg;
+
+    messages = cJSON_CreateArray();
+    if (!messages)
+        return NULL;
+
+    /* Add history entries (same as yo_build_messages) */
+    for (i = 0; i < yo_history_count; i++)
+    {
+        /* User message */
+        msg = cJSON_CreateObject();
+        if (!msg)
+        {
+            cJSON_Delete(messages);
+            return NULL;
+        }
+        cJSON_AddStringToObject(msg, "role", "user");
+        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
+        cJSON_AddItemToArray(messages, msg);
+
+        /* Assistant response */
+        msg = cJSON_CreateObject();
+        if (!msg)
+        {
+            cJSON_Delete(messages);
+            return NULL;
+        }
+        cJSON_AddStringToObject(msg, "role", "assistant");
+
+        if (strcmp(yo_history[i].response_type, "command") == 0)
+        {
+            cJSON *resp_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp_obj, "type", "command");
+            cJSON_AddStringToObject(resp_obj, "command", yo_history[i].response);
+            if (yo_history[i].pending)
+                cJSON_AddTrueToObject(resp_obj, "pending");
+            char *resp_str = cJSON_PrintUnformatted(resp_obj);
+            cJSON_AddStringToObject(msg, "content", resp_str);
+            free(resp_str);
+            cJSON_Delete(resp_obj);
+        }
+        else
+        {
+            cJSON *resp_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp_obj, "type", "chat");
+            cJSON_AddStringToObject(resp_obj, "response", yo_history[i].response);
+            char *resp_str = cJSON_PrintUnformatted(resp_obj);
+            cJSON_AddStringToObject(msg, "content", resp_str);
+            free(resp_str);
+            cJSON_Delete(resp_obj);
+        }
+        cJSON_AddItemToArray(messages, msg);
+    }
+
+    /* Add current query with execution status of previous if applicable */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "user");
+
+    if (yo_history_count > 0 && strcmp(yo_history[yo_history_count-1].response_type, "command") == 0)
+    {
+        snprintf(user_content, sizeof(user_content), "[%s]\n%s",
+                 yo_history[yo_history_count-1].executed ? "executed" : "not executed",
+                 current_query);
+        cJSON_AddStringToObject(msg, "content", user_content);
+    }
+    else
+    {
+        cJSON_AddStringToObject(msg, "content", current_query);
+    }
+    cJSON_AddItemToArray(messages, msg);
+
+    /* Add assistant's docs request */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    cJSON_AddStringToObject(msg, "content", docs_request);
+    cJSON_AddItemToArray(messages, msg);
+
+    /* Add user's documentation */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "user");
+
+    /* Format documentation clearly */
+    asprintf(&docs_msg, "Here is the yosh documentation:\n\n%s\n\n"
+             "Now please answer the user's original question based on this documentation.",
+             yo_documentation);
+    cJSON_AddStringToObject(msg, "content", docs_msg);
+    free(docs_msg);
+    cJSON_AddItemToArray(messages, msg);
+
+    return messages;
+}
+
+/* API call with docs context - for follow-up after docs request */
+static char *
+yo_call_claude_with_docs(const char *api_key, const char *query, const char *docs_request)
+{
+    cJSON *messages = yo_build_messages_with_docs(query, docs_request);
+    if (!messages)
+    {
+        yo_clear_thinking();
+        yo_print_error("Failed to build request");
+        return NULL;
+    }
+    return yo_call_claude_with_messages(api_key, messages);
 }

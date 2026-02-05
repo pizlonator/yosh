@@ -37,8 +37,10 @@ extern "C" {
 /* Enable "yo" LLM features. Call this to opt-in (like using_history()).
    Binds Enter key to yo-aware accept-line and loads config from env vars.
    The system_prompt parameter is the prompt sent to the LLM - the shell
-   should provide this to give context about the environment. */
-extern void rl_yo_enable (const char *system_prompt);
+   should provide this to give context about the environment.
+   The documentation parameter is comprehensive docs about the shell that
+   the LLM can request when users ask about how to use the shell. */
+extern void rl_yo_enable (const char *system_prompt, const char *documentation);
 
 /* Check if yo is currently enabled. Returns non-zero if enabled. */
 extern int rl_yo_enabled (void);

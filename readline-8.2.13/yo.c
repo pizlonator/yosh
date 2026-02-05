@@ -1697,7 +1697,7 @@ yo_load_api_key(void)
     /* Check if file exists */
     if (stat(path, &st) != 0)
     {
-        yo_print_error("Create ~/.yoshkey with your API key (mode 0600)");
+        yo_print_error("Create ~/.yoshkey with your Anthropic API key (mode 0600)");
         return NULL;
     }
 

@@ -177,6 +177,9 @@ static const char *yo_get_chat_color(void);
 static int yo_continuation_hook(void);
 static void yo_continuation_sigcleanup(int, void *);
 
+/* Explanation retry - re-prompts LLM when command response is missing explanation */
+static char *yo_retry_for_explanation(const char *api_key, const char *query, const char *original_response);
+
 /* PTY proxy functions */
 static int yo_pty_init(void);
 static void yo_pump_loop(void) __attribute__((noreturn));
@@ -1220,6 +1223,49 @@ yo_continuation_hook(void)
         max_scrollback_turns--;
     }
 
+    /* If command response is missing explanation, retry once asking for it */
+    if (strcmp(type, "command") == 0 && (!explanation || !*explanation))
+    {
+        char *retry_resp = yo_retry_for_explanation(api_key, cont_query, response);
+        if (retry_resp)
+        {
+            char *r_type = NULL, *r_content = NULL, *r_explanation = NULL;
+            int r_pending = 0;
+            if (yo_parse_response(retry_resp, &r_type, &r_content, &r_explanation, &r_pending)
+                && r_type && strcmp(r_type, "command") == 0
+                && r_explanation && *r_explanation)
+            {
+                /* Retry succeeded — use the new response */
+                free(type); type = r_type;
+                free(content); content = r_content;
+                if (explanation) free(explanation);
+                explanation = r_explanation;
+                pending = r_pending;
+                free(response); response = retry_resp;
+            }
+            else
+            {
+                /* Retry didn't produce a valid command with explanation — use original */
+                if (r_type) free(r_type);
+                if (r_content) free(r_content);
+                if (r_explanation) free(r_explanation);
+                free(retry_resp);
+            }
+        }
+        else if (yo_cancelled)
+        {
+            /* User cancelled during retry — abort entirely */
+            yo_continuation_active = 0;
+            free(response);
+            free(api_key);
+            free(cont_query);
+            if (type) free(type);
+            if (content) free(content);
+            if (explanation) free(explanation);
+            return 0;
+        }
+    }
+
     /* Clear thinking indicator */
     yo_clear_thinking();
 
@@ -1455,6 +1501,51 @@ rl_yo_accept_line(int count, int key)
         }
 
         max_scrollback_turns--;
+    }
+
+    /* If command response is missing explanation, retry once asking for it */
+    if (strcmp(type, "command") == 0 && (!explanation || !*explanation))
+    {
+        char *retry_resp = yo_retry_for_explanation(api_key, saved_query, response);
+        if (retry_resp)
+        {
+            char *r_type = NULL, *r_content = NULL, *r_explanation = NULL;
+            int r_pending = 0;
+            if (yo_parse_response(retry_resp, &r_type, &r_content, &r_explanation, &r_pending)
+                && r_type && strcmp(r_type, "command") == 0
+                && r_explanation && *r_explanation)
+            {
+                /* Retry succeeded — use the new response */
+                free(type); type = r_type;
+                free(content); content = r_content;
+                if (explanation) free(explanation);
+                explanation = r_explanation;
+                pending = r_pending;
+                free(response); response = retry_resp;
+            }
+            else
+            {
+                /* Retry didn't produce a valid command with explanation — use original */
+                if (r_type) free(r_type);
+                if (r_content) free(r_content);
+                if (r_explanation) free(r_explanation);
+                free(retry_resp);
+            }
+        }
+        else if (yo_cancelled)
+        {
+            /* User cancelled during retry — abort entirely */
+            free(response);
+            free(api_key);
+            free(saved_query);
+            free(type);
+            free(content);
+            if (explanation) free(explanation);
+            rl_replace_line("", 0);
+            rl_on_new_line();
+            rl_redisplay();
+            return 0;
+        }
     }
 
     free(response);
@@ -1900,6 +1991,56 @@ yo_call_claude_with_scrollback(const char *api_key, const char *query,
         yo_print_error("Failed to build request");
         return NULL;
     }
+    return yo_call_claude_with_messages(api_key, messages);
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*                  Explanation Retry Logic                         */
+/*                                                                  */
+/* **************************************************************** */
+
+/* When the LLM returns a command response without the required explanation
+   field, re-prompt it once with the original response as context and a
+   request to include the explanation.  Returns the new raw response text
+   (caller must free), or NULL on failure/cancellation. */
+static char *
+yo_retry_for_explanation(const char *api_key, const char *query, const char *original_response)
+{
+    cJSON *messages;
+    cJSON *msg;
+
+    /* Build the normal message history including the current query */
+    messages = yo_build_messages(query);
+    if (!messages)
+        return NULL;
+
+    /* Append the assistant's original response (the one missing explanation) */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    cJSON_AddStringToObject(msg, "content", original_response);
+    cJSON_AddItemToArray(messages, msg);
+
+    /* Append a user message requesting the explanation */
+    msg = cJSON_CreateObject();
+    if (!msg)
+    {
+        cJSON_Delete(messages);
+        return NULL;
+    }
+    cJSON_AddStringToObject(msg, "role", "user");
+    cJSON_AddStringToObject(msg, "content",
+        "Your command response is missing the required \"explanation\" field. "
+        "Please respond again with the same command but include a brief explanation. "
+        "The explanation is shown to the user before the command and is essential "
+        "for them to understand what the command does.");
+    cJSON_AddItemToArray(messages, msg);
+
     return yo_call_claude_with_messages(api_key, messages);
 }
 

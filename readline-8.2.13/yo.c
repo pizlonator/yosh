@@ -1461,8 +1461,10 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    /* Add the yo command itself to shell history */
+    /* Add the yo command itself to shell history, then reset history state
+       so UP arrow finds this entry and any saved line state is cleared. */
     add_history(saved_query);
+    _rl_start_using_history();
 
     /* Load API key fresh each time */
     api_key = yo_load_api_key();

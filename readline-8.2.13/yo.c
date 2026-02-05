@@ -1226,9 +1226,7 @@ yo_continuation_hook(void)
     if (!yo_continuation_active)
         return 0;
 
-    /* Show thinking indicator (no leading newline — we're at a fresh prompt) */
-    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
-    fflush(rl_outstream);
+    yo_print_thinking();
 
     /* Load API key */
     api_key = yo_load_api_key();
@@ -1479,7 +1477,8 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    /* Show thinking indicator */
+    /* Show thinking indicator after a newline */
+    fprintf(rl_outstream, "\n");
     yo_print_thinking();
 
     /* Call Claude API - handles its own error/cancellation messages */
@@ -2158,7 +2157,7 @@ yo_print_error(const char *msg)
 static void
 yo_print_thinking(void)
 {
-    fprintf(rl_outstream, "\n%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
+    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 

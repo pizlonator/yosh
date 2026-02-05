@@ -1092,7 +1092,7 @@ yo_continuation_hook(void)
         return 0;
 
     /* Show thinking indicator (no leading newline — we're at a fresh prompt) */
-    fprintf(rl_outstream, "%s[yo] Thinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
+    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
     fflush(rl_outstream);
 
     /* Load API key */
@@ -1569,14 +1569,14 @@ yo_load_api_key(void)
     /* Check if file exists */
     if (stat(path, &st) != 0)
     {
-        fprintf(rl_outstream, "\n[yo] Create ~/.yoshkey with your API key (mode 0600)\n");
+        fprintf(rl_outstream, "\nCreate ~/.yoshkey with your API key (mode 0600)\n");
         return NULL;
     }
 
     /* Check permissions - must be 0600 */
     if ((st.st_mode & 0777) != 0600)
     {
-        fprintf(rl_outstream, "\n[yo] ~/.yoshkey must have mode 0600 (current: %04o)\n", st.st_mode & 0777);
+        fprintf(rl_outstream, "\n~/.yoshkey must have mode 0600 (current: %04o)\n", st.st_mode & 0777);
         return NULL;
     }
 
@@ -1798,7 +1798,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
         if (response_buf.data)
             free(response_buf.data);
         yo_clear_thinking();
-        fprintf(rl_outstream, "%s[yo] Cancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
         fflush(rl_outstream);
         return NULL;
     }
@@ -1833,7 +1833,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
             cJSON *msg = cJSON_GetObjectItem(error, "message");
             if (msg && cJSON_IsString(msg))
             {
-                fprintf(rl_outstream, "%s[yo] API error: %s%s\n",
+                fprintf(rl_outstream, "%sAPI error: %s%s\n",
                         yo_get_chat_color(), msg->valuestring, YO_COLOR_RESET);
                 fflush(rl_outstream);
             }
@@ -2022,14 +2022,14 @@ yo_display_chat(const char *response)
 static void
 yo_print_error(const char *msg)
 {
-    fprintf(rl_outstream, "\n%s[yo] Error: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
+    fprintf(rl_outstream, "\n%sError: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 
 static void
 yo_print_thinking(void)
 {
-    fprintf(rl_outstream, "\n%s[yo] Thinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
+    fprintf(rl_outstream, "\n%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 

@@ -26,7 +26,7 @@ rm -rf zstd-1.5.6
 cd ../projects/ncurses-6.5-20240720
 extract_source
 PATH=$PWD/../../../pizfix/bin:$PATH CC="$PWD/../../../build/bin/clang -O -g" CXX="$PWD/../../../build/bin/clang++ -O -g" ./configure \
-    --prefix="$PWD/../../../pizfix" --disable-lib-suffixes --without-shared --without-ada --enable-pc-files
+    --prefix="$PWD/../../../pizfix" --disable-lib-suffixes --without-shared --without-ada --enable-pc-files --disable-db-install --with-terminfo-dirs=/usr/share/terminfo:/lib/terminfo:/usr/lib/terminfo:/etc/terminfo
 make -j $NCPU
 make -j $NCPU install
 ln -fs ncurses6-config ../../../pizfix/bin/ncursesw6-config

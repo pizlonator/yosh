@@ -192,6 +192,7 @@ static int yo_handle_explanation_retry(const char *api_key, const char *query,
 static int yo_pty_init(void);
 static void yo_pump_loop(void) __attribute__((noreturn));
 static void yo_scrollback_append(const char *data, size_t len);
+static void yo_scrollback_clear(void);
 static void yo_forward_signal(int sig);
 
 /* Distro detection */
@@ -369,6 +370,19 @@ yo_scrollback_append(const char *data, size_t len)
     if (yo_scrollback->data_size > capacity)
         yo_scrollback->data_size = capacity;
 
+    pthread_mutex_unlock(&yo_scrollback->lock);
+}
+
+/* Clear the scrollback buffer */
+static void
+yo_scrollback_clear(void)
+{
+    if (!yo_scrollback)
+        return;
+
+    pthread_mutex_lock(&yo_scrollback->lock);
+    yo_scrollback->write_pos = 0;
+    yo_scrollback->data_size = 0;
     pthread_mutex_unlock(&yo_scrollback->lock);
 }
 
@@ -1421,6 +1435,22 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* It's a yo command - process it */
+
+    /* Handle "yo reset" — clear LLM context without calling the API */
+    if (strcmp(rl_line_buffer, "yo reset") == 0)
+    {
+        rl_crlf();
+        rl_yo_clear_history();
+        yo_scrollback_clear();
+        yo_continuation_active = 0;
+        yo_last_was_command = 0;
+        fprintf(rl_outstream, "%sContext reset%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fflush(rl_outstream);
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+        return 0;
+    }
 
     /* Reload config from environment (allows mid-session changes) */
     yo_reload_config();

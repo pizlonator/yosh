@@ -107,6 +107,7 @@ static int yo_last_command_executed = 0;
 /* Continuation state for multi-step command sequences */
 static int yo_continuation_active = 0;     /* 1 if mid-plan (LLM returned pending:true) */
 static rl_hook_func_t *yo_saved_startup_hook = NULL;  /* for chaining with bash's hook */
+static char *yo_last_executed_command = NULL;  /* what the user actually ran (may differ from suggestion) */
 
 /* **************************************************************** */
 /*                                                                  */
@@ -171,8 +172,9 @@ static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static const char *yo_get_chat_color(void);
 
-/* Continuation hook */
+/* Continuation hook and signal cleanup */
 static int yo_continuation_hook(void);
+static void yo_continuation_sigcleanup(int, void *);
 
 /* PTY proxy functions */
 static int yo_pty_init(void);
@@ -952,6 +954,9 @@ rl_yo_enable(const char *system_prompt)
         "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<brief explanation>\"}\n"
         "   Note that you will not see the output of this command, except by requesting terminal "
         "output (see below). Therefore, there's no reason to make the commands limit output.\n"
+        "   Prefer short, focused commands. If you'd need a long command (over ~100 characters) "
+        "with && to chain multiple steps, break it into a multi-step sequence using pending:true "
+        "instead — it's easier for the user to review and edit each step individually.\n"
         "\n"
         "2. For multi-step tasks that require checking the environment or gathering information "
         "before giving the final command, add \"pending\":true:\n"
@@ -963,8 +968,12 @@ rl_yo_enable(const char *system_prompt)
         "3. When you receive a [continuation] message, it means the user executed your previous "
         "pending command and you're seeing the terminal output. Respond with the next command "
         "(with or without pending:true) or a chat response if the task is done or you need to "
-        "explain something. ALWAYS include an explanation for every command in a multi-step "
-        "sequence so the user knows why each step is needed.\n"
+        "explain something. The explanation field is REQUIRED on every command response in a "
+        "multi-step sequence — never omit it. The user sees the explanation before the command "
+        "and needs it to understand what's happening. If the continuation message shows "
+        "the user edited the command to something substantially different from what you suggested, "
+        "they've taken the task in a different direction — respond with a chat message that "
+        "acknowledges you're done (do NOT say you'll continue or offer next steps, just wrap up).\n"
         "\n"
         "4. If it's a general question, respond with ONLY:\n"
         "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n"
@@ -1031,6 +1040,29 @@ rl_yo_clear_history(void)
 /*                                                                  */
 /* **************************************************************** */
 
+/* Signal cleanup: called by readline's signal handler when Ctrl-C is
+   pressed during line editing.  Clears continuation state so the user
+   isn't surprised by a hook firing on the next prompt. */
+static void
+yo_continuation_sigcleanup(int sig, void *arg)
+{
+    if (sig == SIGINT)
+    {
+        yo_continuation_active = 0;
+        yo_last_was_command = 0;
+    }
+}
+
+/* Install the sigcleanup hook.  Called whenever we set up continuation
+   state (pending command prefilled in the prompt).  The hook is one-shot:
+   readline clears _rl_sigcleanup after it fires. */
+static void
+yo_install_continuation_sigcleanup(void)
+{
+    _rl_sigcleanup = yo_continuation_sigcleanup;
+    _rl_sigcleanarg = NULL;
+}
+
 /* One-shot rl_startup_hook that fires on the next readline() call after
    the user executes a pending command.  Grabs scrollback, calls Claude
    with a synthetic [continuation] query, and prefills the next command
@@ -1079,12 +1111,30 @@ yo_continuation_hook(void)
         scrollback = strdup("(no output)");
     }
 
-    /* Build continuation query */
-    asprintf(&cont_query,
-             "[continuation] The user executed the previous command. "
-             "Here is the terminal output:\n```\n%s\n```",
-             scrollback);
+    /* Build continuation query, noting if the user edited the command */
+    {
+        const char *suggested = (yo_history_count > 0) ? yo_history[yo_history_count - 1].response : NULL;
+        int edited = (suggested && yo_last_executed_command &&
+                      strcmp(suggested, yo_last_executed_command) != 0);
+
+        if (edited)
+            asprintf(&cont_query,
+                     "[continuation] You suggested: %s\n"
+                     "The user edited and executed: %s\n"
+                     "Here is the terminal output:\n```\n%s\n```",
+                     suggested, yo_last_executed_command, scrollback);
+        else
+            asprintf(&cont_query,
+                     "[continuation] The user executed the previous command. "
+                     "Here is the terminal output:\n```\n%s\n```",
+                     scrollback);
+    }
     free(scrollback);
+    if (yo_last_executed_command)
+    {
+        free(yo_last_executed_command);
+        yo_last_executed_command = NULL;
+    }
 
     if (!cont_query)
     {
@@ -1188,6 +1238,8 @@ yo_continuation_hook(void)
 
         /* Continue or finish? */
         yo_continuation_active = pending;
+        if (pending)
+            yo_install_continuation_sigcleanup();
     }
     else if (strcmp(type, "chat") == 0)
     {
@@ -1247,6 +1299,11 @@ rl_yo_accept_line(int count, int key)
             /* If continuation is active, install startup hook for next prompt */
             if (yo_continuation_active && rl_line_buffer[0] != '\0')
             {
+                /* Save what the user actually executed (may differ from suggestion) */
+                if (yo_last_executed_command)
+                    free(yo_last_executed_command);
+                yo_last_executed_command = strdup(rl_line_buffer);
+
                 yo_saved_startup_hook = rl_startup_hook;
                 rl_startup_hook = yo_continuation_hook;
             }
@@ -1424,6 +1481,8 @@ rl_yo_accept_line(int count, int key)
 
         /* Set continuation state if response is pending */
         yo_continuation_active = pending;
+        if (pending)
+            yo_install_continuation_sigcleanup();
 
         /* Redisplay with new content */
         rl_on_new_line();

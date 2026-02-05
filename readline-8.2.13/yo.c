@@ -1469,7 +1469,6 @@ rl_yo_accept_line(int count, int key)
     if (!api_key)
     {
         /* Error already printed by yo_load_api_key */
-        rl_crlf();
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
@@ -1647,14 +1646,17 @@ yo_load_api_key(void)
     /* Check if file exists */
     if (stat(path, &st) != 0)
     {
-        fprintf(rl_outstream, "\nCreate ~/.yoshkey with your API key (mode 0600)\n");
+        yo_print_error("Create ~/.yoshkey with your API key (mode 0600)");
         return NULL;
     }
 
     /* Check permissions - must be 0600 */
     if ((st.st_mode & 0777) != 0600)
     {
-        fprintf(rl_outstream, "\n~/.yoshkey must have mode 0600 (current: %04o)\n", st.st_mode & 0777);
+        char* string;
+        asprintf(&string, "~/.yoshkey must have mode 0600 (current: %04o)\n", st.st_mode & 0777);
+        yo_print_error(string);
+        free(string);
         return NULL;
     }
 
@@ -1667,11 +1669,6 @@ yo_load_api_key(void)
     }
 
     key = malloc(256);
-    if (!key)
-    {
-        fclose(fp);
-        return NULL;
-    }
 
     if (!fgets(key, 256, fp))
     {

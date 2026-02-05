@@ -180,6 +180,14 @@ static void yo_continuation_sigcleanup(int, void *);
 /* Explanation retry - re-prompts LLM when command response is missing explanation */
 static char *yo_retry_for_explanation(const char *api_key, const char *query, const char *original_response);
 
+/* Scrollback and explanation-retry helpers (shared by continuation hook and accept line) */
+static int yo_handle_scrollback_requests(const char *api_key, const char *query,
+                                         char **response, char **type, char **content,
+                                         char **explanation, int *pending, int max_turns);
+static int yo_handle_explanation_retry(const char *api_key, const char *query,
+                                       char **response, char **type, char **content,
+                                       char **explanation, int *pending);
+
 /* PTY proxy functions */
 static int yo_pty_init(void);
 static void yo_pump_loop(void) __attribute__((noreturn));
@@ -1067,6 +1075,119 @@ yo_install_continuation_sigcleanup(void)
     _rl_sigcleanarg = NULL;
 }
 
+/* **************************************************************** */
+/*                                                                  */
+/*            Scrollback & Explanation-Retry Helpers                */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Process scrollback requests in a loop until a non-scrollback response is
+   received or max_turns is exhausted.  Updates response/type/content/explanation/
+   pending in place.  Returns 1 on success, 0 on failure (error already printed,
+   *response set to NULL). */
+static int
+yo_handle_scrollback_requests(const char *api_key, const char *query,
+                              char **response, char **type, char **content,
+                              char **explanation, int *pending, int max_turns)
+{
+    char *scrollback_request = NULL;
+    char *scrollback_data = NULL;
+
+    while (strcmp(*type, "scrollback") == 0 && max_turns > 0)
+    {
+        int lines_requested;
+
+        scrollback_request = *response;
+        *response = NULL;
+
+        lines_requested = atoi(*content);
+        if (lines_requested <= 0) lines_requested = 50;
+        if (lines_requested > 1000) lines_requested = 1000;
+
+        scrollback_data = rl_yo_get_scrollback(lines_requested);
+        if (!scrollback_data || !*scrollback_data)
+        {
+            if (scrollback_data) free(scrollback_data);
+            scrollback_data = strdup("(No terminal output available)");
+        }
+
+        free(*type); *type = NULL;
+        free(*content); *content = NULL;
+        if (*explanation) { free(*explanation); *explanation = NULL; }
+
+        *response = yo_call_claude_with_scrollback(api_key, query,
+                                                    scrollback_request, scrollback_data);
+        free(scrollback_request);
+        scrollback_request = NULL;
+        free(scrollback_data);
+        scrollback_data = NULL;
+
+        if (!*response)
+            return 0;
+
+        if (!yo_parse_response(*response, type, content, explanation, pending))
+        {
+            yo_clear_thinking();
+            yo_print_error("Failed to parse response from Claude");
+            free(*response);
+            *response = NULL;
+            return 0;
+        }
+
+        max_turns--;
+    }
+
+    return 1;
+}
+
+/* When a command response is missing the explanation field, retry once asking
+   the LLM to include it.  Updates response/type/content/explanation/pending
+   in place if the retry succeeds.
+   Returns 1 to continue normally, 0 if the user cancelled (caller should abort). */
+static int
+yo_handle_explanation_retry(const char *api_key, const char *query,
+                            char **response, char **type, char **content,
+                            char **explanation, int *pending)
+{
+    char *retry_resp;
+
+    if (strcmp(*type, "command") != 0 || (*explanation && **explanation))
+        return 1;  /* No retry needed */
+
+    retry_resp = yo_retry_for_explanation(api_key, query, *response);
+    if (retry_resp)
+    {
+        char *r_type = NULL, *r_content = NULL, *r_explanation = NULL;
+        int r_pending = 0;
+        if (yo_parse_response(retry_resp, &r_type, &r_content, &r_explanation, &r_pending)
+            && r_type && strcmp(r_type, "command") == 0
+            && r_explanation && *r_explanation)
+        {
+            /* Retry succeeded — use the new response */
+            free(*type); *type = r_type;
+            free(*content); *content = r_content;
+            if (*explanation) free(*explanation);
+            *explanation = r_explanation;
+            *pending = r_pending;
+            free(*response); *response = retry_resp;
+        }
+        else
+        {
+            /* Retry didn't produce a valid command with explanation — use original */
+            if (r_type) free(r_type);
+            if (r_content) free(r_content);
+            if (r_explanation) free(r_explanation);
+            free(retry_resp);
+        }
+    }
+    else if (yo_cancelled)
+    {
+        return 0;  /* Cancelled */
+    }
+
+    return 1;
+}
+
 /* One-shot rl_startup_hook that fires on the next readline() call after
    the user executes a pending command.  Grabs scrollback, calls Claude
    with a synthetic [continuation] query, and prefills the next command
@@ -1081,10 +1202,7 @@ yo_continuation_hook(void)
     char *type = NULL;
     char *content = NULL;
     char *explanation = NULL;
-    char *scrollback_request = NULL;
-    char *scrollback_data = NULL;
     int pending = 0;
-    int max_scrollback_turns = 3;
 
     /* One-shot: uninstall ourselves immediately, restore previous hook */
     rl_startup_hook = yo_saved_startup_hook;
@@ -1171,99 +1289,29 @@ yo_continuation_hook(void)
         return 0;
     }
 
-    /* Handle scrollback requests (same loop as rl_yo_accept_line) */
-    while (strcmp(type, "scrollback") == 0 && max_scrollback_turns > 0)
+    /* Handle scrollback requests */
+    if (!yo_handle_scrollback_requests(api_key, cont_query, &response, &type, &content,
+                                       &explanation, &pending, 3))
     {
-        int lines_requested;
-
-        scrollback_request = response;
-        response = NULL;
-
-        lines_requested = atoi(content);
-        if (lines_requested <= 0) lines_requested = 50;
-        if (lines_requested > 1000) lines_requested = 1000;
-
-        scrollback_data = rl_yo_get_scrollback(lines_requested);
-        if (!scrollback_data || !*scrollback_data)
-        {
-            if (scrollback_data) free(scrollback_data);
-            scrollback_data = strdup("(No terminal output available)");
-        }
-
-        free(type); type = NULL;
-        free(content); content = NULL;
-        if (explanation) { free(explanation); explanation = NULL; }
-
-        response = yo_call_claude_with_scrollback(api_key, cont_query,
-                                                   scrollback_request, scrollback_data);
-        free(scrollback_request);
-        scrollback_request = NULL;
-        free(scrollback_data);
-        scrollback_data = NULL;
-
-        if (!response)
-        {
-            yo_continuation_active = 0;
-            free(api_key);
-            free(cont_query);
-            return 0;
-        }
-
-        if (!yo_parse_response(response, &type, &content, &explanation, &pending))
-        {
-            yo_clear_thinking();
-            yo_print_error("Failed to parse continuation response");
-            yo_continuation_active = 0;
-            free(response);
-            free(api_key);
-            free(cont_query);
-            return 0;
-        }
-
-        max_scrollback_turns--;
+        yo_continuation_active = 0;
+        free(api_key);
+        free(cont_query);
+        return 0;
     }
 
     /* If command response is missing explanation, retry once asking for it */
-    if (strcmp(type, "command") == 0 && (!explanation || !*explanation))
+    if (!yo_handle_explanation_retry(api_key, cont_query, &response, &type, &content,
+                                     &explanation, &pending))
     {
-        char *retry_resp = yo_retry_for_explanation(api_key, cont_query, response);
-        if (retry_resp)
-        {
-            char *r_type = NULL, *r_content = NULL, *r_explanation = NULL;
-            int r_pending = 0;
-            if (yo_parse_response(retry_resp, &r_type, &r_content, &r_explanation, &r_pending)
-                && r_type && strcmp(r_type, "command") == 0
-                && r_explanation && *r_explanation)
-            {
-                /* Retry succeeded — use the new response */
-                free(type); type = r_type;
-                free(content); content = r_content;
-                if (explanation) free(explanation);
-                explanation = r_explanation;
-                pending = r_pending;
-                free(response); response = retry_resp;
-            }
-            else
-            {
-                /* Retry didn't produce a valid command with explanation — use original */
-                if (r_type) free(r_type);
-                if (r_content) free(r_content);
-                if (r_explanation) free(r_explanation);
-                free(retry_resp);
-            }
-        }
-        else if (yo_cancelled)
-        {
-            /* User cancelled during retry — abort entirely */
-            yo_continuation_active = 0;
-            free(response);
-            free(api_key);
-            free(cont_query);
-            if (type) free(type);
-            if (content) free(content);
-            if (explanation) free(explanation);
-            return 0;
-        }
+        /* User cancelled during retry */
+        yo_continuation_active = 0;
+        free(response);
+        free(api_key);
+        free(cont_query);
+        if (type) free(type);
+        if (content) free(content);
+        if (explanation) free(explanation);
+        return 0;
     }
 
     /* Clear thinking indicator */
@@ -1328,9 +1376,6 @@ rl_yo_accept_line(int count, int key)
     char *content = NULL;
     char *explanation = NULL;
     char *saved_query = NULL;
-    char *scrollback_request = NULL;
-    char *scrollback_data = NULL;
-    int max_scrollback_turns = 3;  /* Limit follow-up turns */
     int pending = 0;
 
     /* Track if previous yo command was executed */
@@ -1433,119 +1478,32 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Handle scrollback requests with follow-up calls */
-    while (strcmp(type, "scrollback") == 0 && max_scrollback_turns > 0)
+    if (!yo_handle_scrollback_requests(api_key, saved_query, &response, &type, &content,
+                                       &explanation, &pending, 3))
     {
-        int lines_requested;
-
-        /* Save the scrollback request JSON for the follow-up */
-        scrollback_request = response;
-        response = NULL;
-
-        /* Parse number of lines requested */
-        lines_requested = atoi(content);
-        if (lines_requested <= 0)
-            lines_requested = 50;
-        if (lines_requested > 1000)
-            lines_requested = 1000;
-
-        /* Get scrollback data */
-        scrollback_data = rl_yo_get_scrollback(lines_requested);
-        if (!scrollback_data || strlen(scrollback_data) == 0)
-        {
-            if (scrollback_data)
-                free(scrollback_data);
-            scrollback_data = strdup("(No terminal output available)");
-        }
-
-        /* Free the parsed fields from previous response */
-        free(type);
-        type = NULL;
-        free(content);
-        content = NULL;
-        if (explanation)
-        {
-            free(explanation);
-            explanation = NULL;
-        }
-
-        /* Make follow-up API call with scrollback data */
-        response = yo_call_claude_with_scrollback(api_key, saved_query,
-                                                   scrollback_request, scrollback_data);
-
-        /* Clean up scrollback data */
-        free(scrollback_request);
-        scrollback_request = NULL;
-        free(scrollback_data);
-        scrollback_data = NULL;
-
-        if (!response)
-        {
-            /* Error already printed */
-            rl_replace_line("", 0);
-            rl_on_new_line();
-            rl_redisplay();
-            free(api_key);
-            free(saved_query);
-            return 0;
-        }
-
-        /* Parse the new response */
-        if (!yo_parse_response(response, &type, &content, &explanation, &pending))
-        {
-            yo_clear_thinking();
-            yo_print_error("Failed to parse response from Claude");
-            free(response);
-            free(api_key);
-            free(saved_query);
-            return 0;
-        }
-
-        max_scrollback_turns--;
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+        free(api_key);
+        free(saved_query);
+        return 0;
     }
 
     /* If command response is missing explanation, retry once asking for it */
-    if (strcmp(type, "command") == 0 && (!explanation || !*explanation))
+    if (pending && !yo_handle_explanation_retry(api_key, saved_query, &response, &type, &content,
+                                                &explanation, &pending))
     {
-        char *retry_resp = yo_retry_for_explanation(api_key, saved_query, response);
-        if (retry_resp)
-        {
-            char *r_type = NULL, *r_content = NULL, *r_explanation = NULL;
-            int r_pending = 0;
-            if (yo_parse_response(retry_resp, &r_type, &r_content, &r_explanation, &r_pending)
-                && r_type && strcmp(r_type, "command") == 0
-                && r_explanation && *r_explanation)
-            {
-                /* Retry succeeded — use the new response */
-                free(type); type = r_type;
-                free(content); content = r_content;
-                if (explanation) free(explanation);
-                explanation = r_explanation;
-                pending = r_pending;
-                free(response); response = retry_resp;
-            }
-            else
-            {
-                /* Retry didn't produce a valid command with explanation — use original */
-                if (r_type) free(r_type);
-                if (r_content) free(r_content);
-                if (r_explanation) free(r_explanation);
-                free(retry_resp);
-            }
-        }
-        else if (yo_cancelled)
-        {
-            /* User cancelled during retry — abort entirely */
-            free(response);
-            free(api_key);
-            free(saved_query);
-            free(type);
-            free(content);
-            if (explanation) free(explanation);
-            rl_replace_line("", 0);
-            rl_on_new_line();
-            rl_redisplay();
-            return 0;
-        }
+        /* User cancelled during retry */
+        free(response);
+        free(api_key);
+        free(saved_query);
+        free(type);
+        free(content);
+        if (explanation) free(explanation);
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+        return 0;
     }
 
     free(response);

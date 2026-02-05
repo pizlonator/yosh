@@ -44,6 +44,7 @@
 #include <curl/curl.h>
 
 #include "readline.h"
+#include "history.h"
 #include "rlprivate.h"
 #include "xmalloc.h"
 #include "cJSON.h"
@@ -1340,6 +1341,9 @@ rl_yo_accept_line(int count, int key)
         yo_print_error("Memory allocation failed");
         return 0;
     }
+
+    /* Add the yo command itself to shell history */
+    add_history(saved_query);
 
     /* Load API key fresh each time */
     api_key = yo_load_api_key();

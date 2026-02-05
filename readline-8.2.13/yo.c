@@ -82,6 +82,7 @@ typedef struct {
     char *response_type;   /* "command" or "chat" */
     char *response;        /* the command or chat text */
     int executed;          /* 1 if user ran it, 0 if not */
+    int pending;           /* 1 if response had "pending":true (multi-step) */
 } yo_exchange_t;
 
 /* **************************************************************** */
@@ -102,6 +103,10 @@ static char *yo_system_prompt = NULL;
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
 static int yo_last_command_executed = 0;
+
+/* Continuation state for multi-step command sequences */
+static int yo_continuation_active = 0;     /* 1 if mid-plan (LLM returned pending:true) */
+static rl_hook_func_t *yo_saved_startup_hook = NULL;  /* for chaining with bash's hook */
 
 /* **************************************************************** */
 /*                                                                  */
@@ -153,9 +158,9 @@ static char *yo_load_api_key(void);
 static char *yo_call_claude(const char *api_key, const char *query);
 static char *yo_call_claude_with_scrollback(const char *api_key, const char *query,
                                             const char *scrollback_request, const char *scrollback_data);
-static int yo_parse_response(const char *response, char **type, char **content, char **explanation);
+static int yo_parse_response(const char *response, char **type, char **content, char **explanation, int *pending);
 static void yo_display_chat(const char *response);
-static void yo_history_add(const char *query, const char *type, const char *response, int executed);
+static void yo_history_add(const char *query, const char *type, const char *response, int executed, int pending);
 static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
 static cJSON *yo_build_messages(const char *current_query);
@@ -165,6 +170,9 @@ static void yo_print_error(const char *msg);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static const char *yo_get_chat_color(void);
+
+/* Continuation hook */
+static int yo_continuation_hook(void);
 
 /* PTY proxy functions */
 static int yo_pty_init(void);
@@ -945,18 +953,29 @@ rl_yo_enable(const char *system_prompt)
         "   Note that you will not see the output of this command, except by requesting terminal "
         "output (see below). Therefore, there's no reason to make the commands limit output.\n"
         "\n"
-        "2. If it's a general question, respond with ONLY:\n"
+        "2. For multi-step tasks that require checking the environment or gathering information "
+        "before giving the final command, add \"pending\":true:\n"
+        "   {\"type\":\"command\",\"command\":\"<command>\",\"explanation\":\"<what this step checks>\",\"pending\":true}\n"
+        "   After the user executes this command, you will automatically receive the terminal output "
+        "and can continue with the next step. Only set pending:true when you genuinely need to see "
+        "the output to decide what to do next. The last command in a sequence should NOT have pending:true.\n"
+        "\n"
+        "3. When you receive a [continuation] message, it means the user executed your previous "
+        "pending command and you're seeing the terminal output. Respond with the next command "
+        "(with or without pending:true) or a chat response if the task is done or you need to "
+        "explain something. ALWAYS include an explanation for every command in a multi-step "
+        "sequence so the user knows why each step is needed.\n"
+        "\n"
+        "4. If it's a general question, respond with ONLY:\n"
         "   {\"type\":\"chat\",\"response\":\"<your response>\"}\n"
         "\n"
-        "3. If you need to see recent terminal output (e.g., to understand what command "
+        "5. If you need to see recent terminal output (e.g., to understand what command "
         "was run, see error messages, or view results), respond with ONLY:\n"
         "   {\"type\":\"scrollback\",\"lines\":N}\n"
         "   where N is the number of recent lines you need (max 1000). You SHOULD request recent "
         "terminal output if the user's input refers to recent commands, and those commands are likely "
         "to have produced output. After receiving the scrollback, you'll get another turn to "
         "respond.\n"
-        "\n"
-        "You speak using Santa Cruz surfer slang, but low key, like you're one of the technies."
         "\n"
         "Respond with valid JSON only.",
         system_prompt);
@@ -1008,6 +1027,195 @@ rl_yo_clear_history(void)
 
 /* **************************************************************** */
 /*                                                                  */
+/*                  Continuation Hook (Multi-Step)                  */
+/*                                                                  */
+/* **************************************************************** */
+
+/* One-shot rl_startup_hook that fires on the next readline() call after
+   the user executes a pending command.  Grabs scrollback, calls Claude
+   with a synthetic [continuation] query, and prefills the next command
+   (or displays a chat response). */
+static int
+yo_continuation_hook(void)
+{
+    char *api_key = NULL;
+    char *scrollback = NULL;
+    char *cont_query = NULL;
+    char *response = NULL;
+    char *type = NULL;
+    char *content = NULL;
+    char *explanation = NULL;
+    char *scrollback_request = NULL;
+    char *scrollback_data = NULL;
+    int pending = 0;
+    int max_scrollback_turns = 3;
+
+    /* One-shot: uninstall ourselves immediately, restore previous hook */
+    rl_startup_hook = yo_saved_startup_hook;
+    yo_saved_startup_hook = NULL;
+
+    /* Safety check */
+    if (!yo_continuation_active)
+        return 0;
+
+    /* Show thinking indicator (no leading newline — we're at a fresh prompt) */
+    fprintf(rl_outstream, "%s[yo] Thinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
+    fflush(rl_outstream);
+
+    /* Load API key */
+    api_key = yo_load_api_key();
+    if (!api_key)
+    {
+        yo_clear_thinking();
+        yo_continuation_active = 0;
+        return 0;
+    }
+
+    /* Grab scrollback (limit to 200 lines for continuation) */
+    scrollback = rl_yo_get_scrollback(200);
+    if (!scrollback || !*scrollback)
+    {
+        if (scrollback) free(scrollback);
+        scrollback = strdup("(no output)");
+    }
+
+    /* Build continuation query */
+    asprintf(&cont_query,
+             "[continuation] The user executed the previous command. "
+             "Here is the terminal output:\n```\n%s\n```",
+             scrollback);
+    free(scrollback);
+
+    if (!cont_query)
+    {
+        yo_clear_thinking();
+        yo_continuation_active = 0;
+        free(api_key);
+        return 0;
+    }
+
+    /* Call Claude API */
+    response = yo_call_claude(api_key, cont_query);
+    if (!response)
+    {
+        /* Error/cancellation — already printed by yo_call_claude */
+        yo_continuation_active = 0;
+        free(api_key);
+        free(cont_query);
+        return 0;
+    }
+
+    /* Parse response */
+    if (!yo_parse_response(response, &type, &content, &explanation, &pending))
+    {
+        yo_clear_thinking();
+        yo_print_error("Failed to parse continuation response");
+        yo_continuation_active = 0;
+        free(response);
+        free(api_key);
+        free(cont_query);
+        return 0;
+    }
+
+    /* Handle scrollback requests (same loop as rl_yo_accept_line) */
+    while (strcmp(type, "scrollback") == 0 && max_scrollback_turns > 0)
+    {
+        int lines_requested;
+
+        scrollback_request = response;
+        response = NULL;
+
+        lines_requested = atoi(content);
+        if (lines_requested <= 0) lines_requested = 50;
+        if (lines_requested > 1000) lines_requested = 1000;
+
+        scrollback_data = rl_yo_get_scrollback(lines_requested);
+        if (!scrollback_data || !*scrollback_data)
+        {
+            if (scrollback_data) free(scrollback_data);
+            scrollback_data = strdup("(No terminal output available)");
+        }
+
+        free(type); type = NULL;
+        free(content); content = NULL;
+        if (explanation) { free(explanation); explanation = NULL; }
+
+        response = yo_call_claude_with_scrollback(api_key, cont_query,
+                                                   scrollback_request, scrollback_data);
+        free(scrollback_request);
+        scrollback_request = NULL;
+        free(scrollback_data);
+        scrollback_data = NULL;
+
+        if (!response)
+        {
+            yo_continuation_active = 0;
+            free(api_key);
+            free(cont_query);
+            return 0;
+        }
+
+        if (!yo_parse_response(response, &type, &content, &explanation, &pending))
+        {
+            yo_clear_thinking();
+            yo_print_error("Failed to parse continuation response");
+            yo_continuation_active = 0;
+            free(response);
+            free(api_key);
+            free(cont_query);
+            return 0;
+        }
+
+        max_scrollback_turns--;
+    }
+
+    /* Clear thinking indicator */
+    yo_clear_thinking();
+
+    /* Handle the response */
+    if (strcmp(type, "command") == 0)
+    {
+        if (explanation && *explanation)
+            yo_display_chat(explanation);
+
+        /* Add continuation exchange to session history */
+        yo_history_add(cont_query, type, content, 0, pending);
+
+        /* Prefill the command */
+        rl_replace_line(content, 0);
+        rl_point = rl_end;
+        yo_last_was_command = 1;
+
+        /* Continue or finish? */
+        yo_continuation_active = pending;
+    }
+    else if (strcmp(type, "chat") == 0)
+    {
+        yo_display_chat(content);
+        yo_history_add(cont_query, type, content, 1, 0);
+        rl_replace_line("", 0);
+        yo_continuation_active = 0;
+    }
+    else
+    {
+        /* Unknown type or exceeded scrollback turns */
+        rl_replace_line("", 0);
+        yo_continuation_active = 0;
+    }
+
+    /* Cleanup */
+    free(response);
+    free(api_key);
+    free(cont_query);
+    if (type) free(type);
+    if (content) free(content);
+    if (explanation) free(explanation);
+
+    return 0;
+}
+
+/* **************************************************************** */
+/*                                                                  */
 /*                   Main Accept Line Handler                       */
 /*                                                                  */
 /* **************************************************************** */
@@ -1024,6 +1232,7 @@ rl_yo_accept_line(int count, int key)
     char *scrollback_request = NULL;
     char *scrollback_data = NULL;
     int max_scrollback_turns = 3;  /* Limit follow-up turns */
+    int pending = 0;
 
     /* Track if previous yo command was executed */
     if (yo_last_was_command)
@@ -1031,11 +1240,26 @@ rl_yo_accept_line(int count, int key)
         /* Check if we're executing the command (line wasn't modified to start with "yo ") */
         if (rl_line_buffer && strncmp(rl_line_buffer, "yo ", 3) != 0)
         {
-            /* User is executing the command or something else */
+            /* User is executing the command (or something else) */
             if (yo_history_count > 0)
-            {
                 yo_history[yo_history_count - 1].executed = 1;
+
+            /* If continuation is active, install startup hook for next prompt */
+            if (yo_continuation_active && rl_line_buffer[0] != '\0')
+            {
+                yo_saved_startup_hook = rl_startup_hook;
+                rl_startup_hook = yo_continuation_hook;
             }
+            else
+            {
+                /* Empty line = user cancelled continuation */
+                yo_continuation_active = 0;
+            }
+        }
+        else
+        {
+            /* User typed a new "yo " query — cancel any continuation */
+            yo_continuation_active = 0;
         }
         yo_last_was_command = 0;
     }
@@ -1091,7 +1315,7 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Parse the response */
-    if (!yo_parse_response(response, &type, &content, &explanation))
+    if (!yo_parse_response(response, &type, &content, &explanation, &pending))
     {
         yo_clear_thinking();
         yo_print_error("Failed to parse response from Claude");
@@ -1159,7 +1383,7 @@ rl_yo_accept_line(int count, int key)
         }
 
         /* Parse the new response */
-        if (!yo_parse_response(response, &type, &content, &explanation))
+        if (!yo_parse_response(response, &type, &content, &explanation, &pending))
         {
             yo_clear_thinking();
             yo_print_error("Failed to parse response from Claude");
@@ -1189,7 +1413,7 @@ rl_yo_accept_line(int count, int key)
         }
 
         /* Add to session history (not executed yet) */
-        yo_history_add(saved_query, type, content, 0);
+        yo_history_add(saved_query, type, content, 0, pending);
 
         /* Replace line with the command */
         rl_replace_line(content, 0);
@@ -1197,6 +1421,9 @@ rl_yo_accept_line(int count, int key)
 
         /* Mark that we just generated a command */
         yo_last_was_command = 1;
+
+        /* Set continuation state if response is pending */
+        yo_continuation_active = pending;
 
         /* Redisplay with new content */
         rl_on_new_line();
@@ -1208,7 +1435,10 @@ rl_yo_accept_line(int count, int key)
         yo_display_chat(content);
 
         /* Add to session history */
-        yo_history_add(saved_query, type, content, 1);
+        yo_history_add(saved_query, type, content, 1, 0);
+
+        /* Clear any active continuation */
+        yo_continuation_active = 0;
 
         /* Clear the line and show fresh prompt */
         rl_replace_line("", 0);
@@ -1617,7 +1847,7 @@ yo_call_claude_with_scrollback(const char *api_key, const char *query,
 /* **************************************************************** */
 
 static int
-yo_parse_response(const char *response, char **type, char **content, char **explanation)
+yo_parse_response(const char *response, char **type, char **content, char **explanation, int *pending)
 {
     cJSON *json;
     cJSON *type_item;
@@ -1628,6 +1858,7 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
     *type = NULL;
     *content = NULL;
     *explanation = NULL;
+    *pending = 0;
 
     json = cJSON_Parse(response);
     if (!json)
@@ -1656,6 +1887,13 @@ yo_parse_response(const char *response, char **type, char **content, char **expl
         if (explanation_item && cJSON_IsString(explanation_item))
         {
             *explanation = strdup(explanation_item->valuestring);
+        }
+
+        /* Check for pending flag (multi-step continuation) */
+        {
+            cJSON *pending_item = cJSON_GetObjectItem(json, "pending");
+            if (pending_item && cJSON_IsTrue(pending_item))
+                *pending = 1;
         }
     }
     else if (strcmp(*type, "chat") == 0)
@@ -1747,7 +1985,7 @@ yo_clear_thinking(void)
 /* **************************************************************** */
 
 static void
-yo_history_add(const char *query, const char *type, const char *response, int executed)
+yo_history_add(const char *query, const char *type, const char *response, int executed, int pending)
 {
     /* Prune if necessary */
     yo_history_prune();
@@ -1768,6 +2006,7 @@ yo_history_add(const char *query, const char *type, const char *response, int ex
     yo_history[yo_history_count].response_type = strdup(type);
     yo_history[yo_history_count].response = strdup(response);
     yo_history[yo_history_count].executed = executed;
+    yo_history[yo_history_count].pending = pending;
     yo_history_count++;
 }
 
@@ -1864,6 +2103,8 @@ yo_build_messages(const char *current_query)
             cJSON *resp_obj = cJSON_CreateObject();
             cJSON_AddStringToObject(resp_obj, "type", "command");
             cJSON_AddStringToObject(resp_obj, "command", yo_history[i].response);
+            if (yo_history[i].pending)
+                cJSON_AddTrueToObject(resp_obj, "pending");
             char *resp_str = cJSON_PrintUnformatted(resp_obj);
             cJSON_AddStringToObject(msg, "content", resp_str);
             free(resp_str);
@@ -1953,6 +2194,8 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
             cJSON *resp_obj = cJSON_CreateObject();
             cJSON_AddStringToObject(resp_obj, "type", "command");
             cJSON_AddStringToObject(resp_obj, "command", yo_history[i].response);
+            if (yo_history[i].pending)
+                cJSON_AddTrueToObject(resp_obj, "pending");
             char *resp_str = cJSON_PrintUnformatted(resp_obj);
             cJSON_AddStringToObject(msg, "content", resp_str);
             free(resp_str);

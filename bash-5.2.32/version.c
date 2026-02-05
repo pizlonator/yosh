@@ -85,7 +85,7 @@ void
 show_shell_version (extended)
      int extended;
 {
-  printf ("Fil's yosh, version %s (%s)\n", shell_version_string (), MACHTYPE);
+  printf ("Fil's yosh 0.1 (bash %s) (%s)\n", shell_version_string (), MACHTYPE);
   if (extended)
     {
       printf ("%s\n", _(yosh_copyright));

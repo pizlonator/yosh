@@ -162,7 +162,7 @@ echo "#define DEFAULT_COMPAT_LEVEL ${compat_major}${compat_minor}"
 sccs_string="${float_dist}.${patch_level}(${build_ver}) ${rel_status}"
 echo
 echo "/* A version string for use by sccs and the what command. */"
-echo "#define SCCSVERSION \"@(#)Yosh version ${sccs_string}\""
+echo "#define SCCSVERSION \"@(#)Yosh version 0.1 (bash ${sccs_string})\""
 
 # extern function declarations
 #echo

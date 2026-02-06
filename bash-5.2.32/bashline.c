@@ -690,7 +690,7 @@ initialize_readline ()
       "\n"
       "### Model and API Settings\n"
       "\n"
-      "- `YO_MODEL` - The Claude model to use. Default: `claude-sonnet-4-20250514`.\n"
+      "- `YO_MODEL` - The Claude model to use. Default: `claude-sonnet-4-5-20250929`.\n"
       "  Examples: `claude-opus-4-6`, `claude-opus-4-5-20251101`, `claude-sonnet-4-5-20250929`\n"
       "  Can be changed mid-session; takes effect on next yo command.\n"
       "\n"

@@ -172,9 +172,11 @@ static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
                                                  const char *scrollback_data);
 static cJSON *yo_build_messages_with_docs(const char *current_query, const char *docs_request);
+static void yo_print_error_no_newline(const char *msg);
 static void yo_print_error(const char *msg);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
+static void yo_report_parse_error(char* response);
 static const char *yo_get_chat_color(void);
 
 /* Continuation hook and signal cleanup */
@@ -1156,8 +1158,7 @@ yo_handle_requests(const char *api_key, const char *query,
 
             if (!yo_parse_response(*response, type, content, explanation, pending))
             {
-                yo_clear_thinking();
-                yo_print_error("Failed to parse response from Claude");
+                yo_report_parse_error(*response);
                 free(*response);
                 *response = NULL;
                 return 0;
@@ -1184,8 +1185,7 @@ yo_handle_requests(const char *api_key, const char *query,
 
             if (!yo_parse_response(*response, type, content, explanation, pending))
             {
-                yo_clear_thinking();
-                yo_print_error("Failed to parse response from Claude");
+                yo_report_parse_error(*response);
                 free(*response);
                 *response = NULL;
                 return 0;
@@ -1341,8 +1341,7 @@ yo_continuation_hook(void)
     /* Parse response */
     if (!yo_parse_response(response, &type, &content, &explanation, &pending))
     {
-        yo_clear_thinking();
-        yo_print_error("Failed to parse continuation response");
+        yo_report_parse_error(response);
         yo_continuation_active = 0;
         free(response);
         free(api_key);
@@ -1352,7 +1351,7 @@ yo_continuation_hook(void)
 
     /* Handle scrollback requests */
     if (!yo_handle_requests(api_key, cont_query, &response, &type, &content,
-                                       &explanation, &pending, 3))
+                            &explanation, &pending, 3))
     {
         yo_continuation_active = 0;
         free(api_key);
@@ -1548,8 +1547,10 @@ rl_yo_accept_line(int count, int key)
     /* Parse the response */
     if (!yo_parse_response(response, &type, &content, &explanation, &pending))
     {
-        yo_clear_thinking();
-        yo_print_error("Failed to parse response from Claude");
+        yo_report_parse_error(response);
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
         free(response);
         free(api_key);
         free(saved_query);
@@ -1787,7 +1788,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     if (yo_init_sigint_pipe() < 0)
     {
         yo_clear_thinking();
-        yo_print_error("Failed to initialize signal handling");
+        yo_print_error_no_newline("Failed to initialize signal handling");
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1799,7 +1800,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     if (!curl)
     {
         yo_clear_thinking();
-        yo_print_error("Failed to initialize HTTP client");
+        yo_print_error_no_newline("Failed to initialize HTTP client");
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1809,7 +1810,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     {
         curl_easy_cleanup(curl);
         yo_clear_thinking();
-        yo_print_error("Failed to initialize HTTP client");
+        yo_print_error_no_newline("Failed to initialize HTTP client");
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1821,7 +1822,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
         curl_multi_cleanup(multi);
         curl_easy_cleanup(curl);
         yo_clear_thinking();
-        yo_print_error("Failed to build request");
+        yo_print_error_no_newline("Failed to build request");
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1841,7 +1842,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
         curl_multi_cleanup(multi);
         curl_easy_cleanup(curl);
         yo_clear_thinking();
-        yo_print_error("Failed to build request");
+        yo_print_error_no_newline("Failed to build request");
         return NULL;
     }
 
@@ -1932,7 +1933,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     if (!response_buf.data)
     {
         yo_clear_thinking();
-        yo_print_error("No response from API");
+        yo_print_error_no_newline("No response from API");
         return NULL;
     }
 
@@ -1943,7 +1944,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     if (!response_json)
     {
         yo_clear_thinking();
-        yo_print_error("Failed to parse API response");
+        yo_print_error_no_newline("Failed to parse API response");
         return NULL;
     }
 
@@ -1965,12 +1966,12 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
             }
             else
             {
-                yo_print_error("API returned an error");
+                yo_print_error_no_newline("API returned an error");
             }
         }
         else
         {
-            yo_print_error("Unexpected API response format");
+            yo_print_error_no_newline("Unexpected API response format");
         }
         cJSON_Delete(response_json);
         return NULL;
@@ -1981,7 +1982,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     {
         cJSON_Delete(response_json);
         yo_clear_thinking();
-        yo_print_error("Empty response from API");
+        yo_print_error_no_newline("Empty response from API");
         return NULL;
     }
 
@@ -1990,7 +1991,7 @@ yo_call_claude_with_messages(const char *api_key, cJSON *messages)
     {
         cJSON_Delete(response_json);
         yo_clear_thinking();
-        yo_print_error("Unexpected API response format");
+        yo_print_error_no_newline("Unexpected API response format");
         return NULL;
     }
 
@@ -2201,10 +2202,17 @@ yo_display_chat(const char *response)
 }
 
 static void
+yo_print_error_no_newline(const char *msg)
+{
+    fprintf(rl_outstream, "%sError: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
+    fflush(rl_outstream);
+}
+
+static void
 yo_print_error(const char *msg)
 {
-    fprintf(rl_outstream, "\n%sError: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
-    fflush(rl_outstream);
+    fprintf(rl_outstream, "\n");
+    yo_print_error_no_newline(msg);
 }
 
 static void
@@ -2220,6 +2228,16 @@ yo_clear_thinking(void)
     /* Move cursor back and clear the line */
     fprintf(rl_outstream, "\r\033[K");
     fflush(rl_outstream);
+}
+
+static void
+yo_report_parse_error(char* response)
+{
+    yo_clear_thinking();
+    char* message;
+    asprintf(&message, "Failed to parse response from Claude: %s", response);
+    yo_print_error_no_newline(message);
+    free(message);
 }
 
 /* **************************************************************** */

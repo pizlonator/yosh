@@ -65,9 +65,11 @@ rm -rf nghttp2-1.62.1
 
 cd ../projects/curl-8.9.1
 extract_source
-CC=$PWD/../../../build/bin/clang ./configure --with-openssl --with-nghttp2 \
-                                 --prefix=$PWD/../../../pizfix --disable-shared \
-                                 --with-ca-path=/etc/ssl/certs
+CC=$PWD/../../../build/bin/clang LIBS="-lidn2 -lunistring" \
+    ./configure --with-openssl --with-nghttp2 \
+                --prefix=$PWD/../../../pizfix --disable-shared \
+                --with-ca-path=/etc/ssl/certs --sysconfdir=/etc \
+                --enable-threaded-resolver
 $MAKE -j $NCPU
 $MAKE -j $NCPU install
 cd ../../../

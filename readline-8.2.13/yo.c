@@ -26,6 +26,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -42,6 +43,7 @@
 #include <pwd.h>
 #include <errno.h>
 #include <curl/curl.h>
+#include <stdarg.h>
 
 #include "readline.h"
 #include "history.h"
@@ -176,8 +178,9 @@ static cJSON *yo_build_messages_with_scrollback(const char *current_query, const
                                                  const char *scrollback_data, const char *scrollback_tool_id);
 static cJSON *yo_build_messages_with_docs(const char *current_query, const char *docs_request,
                                           const char *docs_tool_id);
-static void yo_print_error_no_newline(const char *msg);
-static void yo_print_error(const char *msg);
+static void yo_print_error_no_newlinev(const char *msg, va_list args);
+static void yo_print_error_no_newline(const char *msg, ...);
+static void yo_print_error(const char *msg, ...);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static void yo_report_parse_error(cJSON *tool_use);
@@ -253,15 +256,24 @@ yo_init_sigint_pipe(void)
 
     /* Make write end non-blocking so signal handler never blocks */
     flags = fcntl(yo_sigint_pipe[1], F_GETFL);
-    if (flags >= 0)
-        fcntl(yo_sigint_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0)
+        goto error;
+    if (fcntl(yo_sigint_pipe[1], F_SETFL, flags | O_NONBLOCK) < 0)
+        goto error;
 
     /* Also make read end non-blocking for drain operation */
     flags = fcntl(yo_sigint_pipe[0], F_GETFL);
-    if (flags >= 0)
-        fcntl(yo_sigint_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0)
+        goto error;
+    if (fcntl(yo_sigint_pipe[0], F_SETFL, flags | O_NONBLOCK) < 0)
+        goto error;
 
     return 0;
+
+error:
+    close(yo_sigint_pipe[0]);
+    close(yo_sigint_pipe[1]);
+    return -1;
 }
 
 /* Drain any stale bytes from the pipe before starting a request */
@@ -283,10 +295,6 @@ static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, 
     yo_response_buffer_t *mem = (yo_response_buffer_t *)userp;
 
     char *ptr = realloc(mem->data, mem->size + realsize + 1);
-    if (!ptr)
-    {
-        return 0;
-    }
 
     mem->data = ptr;
     memcpy(&(mem->data[mem->size]), contents, realsize);
@@ -1498,11 +1506,6 @@ rl_yo_accept_line(int count, int key)
 
     /* Save the query for potential follow-up calls */
     saved_query = strdup(rl_line_buffer);
-    if (!saved_query)
-    {
-        yo_print_error("Memory allocation failed");
-        return 0;
-    }
 
     /* Add the yo command itself to shell history, then reset history state
        so UP arrow finds this entry and any saved line state is cleared. */
@@ -1643,7 +1646,8 @@ rl_yo_accept_line(int count, int key)
     }
     else
     {
-        yo_print_error("Unknown response type from Claude");
+        yo_print_error("Unknown response type from Claude (full tool use response: %s)",
+                       cJSON_PrintUnformatted(tool_use));
     }
 
     free(saved_query);
@@ -1703,10 +1707,7 @@ yo_load_api_key(void)
     /* Check permissions - must be 0600 */
     if ((st.st_mode & 0777) != 0600)
     {
-        char* string;
-        asprintf(&string, "~/.yoshkey must have mode 0600 (current: %04o)\n", st.st_mode & 0777);
-        yo_print_error(string);
-        free(string);
+        yo_print_error("~/.yoshkey must have mode 0600 (current: %04o)", st.st_mode & 0777);
         return NULL;
     }
 
@@ -1714,7 +1715,7 @@ yo_load_api_key(void)
     fp = fopen(path, "r");
     if (!fp)
     {
-        yo_print_error("Cannot read ~/.yoshkey");
+        yo_print_error("Cannot read ~/.yoshkey: %s", strerror(errno));
         return NULL;
     }
 
@@ -1767,9 +1768,6 @@ yo_build_tools(void)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *schema, *props, *prop, *required;
-
-    if (!tools)
-        return NULL;
 
     /* Tool: command - execute a shell command */
     tool = cJSON_CreateObject();
@@ -1897,7 +1895,7 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     if (yo_init_sigint_pipe() < 0)
     {
         yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize signal handling");
+        yo_print_error_no_newline("Failed to initialize signal handling: %s", strerror(errno));
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1909,7 +1907,7 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     if (!curl)
     {
         yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize HTTP client");
+        yo_print_error_no_newline("Failed to initialize HTTP client (curl_easy_init returned NULL)");
         cJSON_Delete(messages);
         return NULL;
     }
@@ -1919,35 +1917,16 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     {
         curl_easy_cleanup(curl);
         yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize HTTP client");
+        yo_print_error_no_newline("Failed to initialize HTTP client (curl_multi_init returned NULL)");
         cJSON_Delete(messages);
         return NULL;
     }
 
     /* Build tools array */
     tools = yo_build_tools();
-    if (!tools)
-    {
-        curl_multi_cleanup(multi);
-        curl_easy_cleanup(curl);
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to build tools");
-        cJSON_Delete(messages);
-        return NULL;
-    }
 
     /* Build request JSON */
     request_json = cJSON_CreateObject();
-    if (!request_json)
-    {
-        curl_multi_cleanup(multi);
-        curl_easy_cleanup(curl);
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to build request");
-        cJSON_Delete(messages);
-        cJSON_Delete(tools);
-        return NULL;
-    }
 
     cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_MODEL);
     cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
@@ -1966,15 +1945,6 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
 
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
-
-    if (!request_body)
-    {
-        curl_multi_cleanup(multi);
-        curl_easy_cleanup(curl);
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to build request");
-        return NULL;
-    }
 
     /* Set up headers */
     snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
@@ -2000,16 +1970,20 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     sigaction(SIGINT, &sa, &old_sa);
 
     /* Multi interface loop with curl_multi_poll() */
+    CURLMcode mc;
+    bool had_curl_error = false;
     while (still_running && !cancelled)
     {
-        CURLMcode mc;
         int numfds;
         struct curl_waitfd extra_fd;
 
         /* Let curl do any immediate work */
         mc = curl_multi_perform(multi, &still_running);
         if (mc != CURLM_OK)
+        {
+            had_curl_error = true;
             break;
+        }
 
         if (!still_running)
             break;
@@ -2022,7 +1996,10 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
         /* Wait for activity on curl sockets or our signal pipe */
         mc = curl_multi_poll(multi, &extra_fd, 1, 1000, &numfds);
         if (mc != CURLM_OK)
+        {
+            had_curl_error = true;
             break;
+        }
 
         /* Check if signal pipe has data (SIGINT was received) */
         if (extra_fd.revents & CURL_WAIT_POLLIN)
@@ -2042,23 +2019,54 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     /* Restore original SIGINT handler */
     sigaction(SIGINT, &old_sa, NULL);
 
+    if (had_curl_error)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
+        goto curl_error;
+    }
+
+    /* Handle cancellation */
+    if (cancelled)
+    {
+        yo_clear_thinking();
+        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fflush(rl_outstream);
+        goto curl_error;
+    }
+
+    CURLMsg *msg;
+    int msgs_left;
+    while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            CURL *easy = msg->easy_handle;
+            ZASSERT(easy == curl);
+            CURLcode result = msg->data.result;
+            
+            if (result != CURLE_OK) {
+                yo_clear_thinking();
+                yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
+                goto curl_error;
+            }
+            
+            // Even if result == CURLE_OK, check the HTTP status code
+            long http_code = 0;
+            curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+            if (http_code == 200)
+                break;
+
+            yo_clear_thinking();
+            yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
+            goto curl_error;
+        }
+    }
+
     /* Clean up curl handles */
     curl_multi_remove_handle(multi, curl);
     curl_multi_cleanup(multi);
     curl_slist_free_all(headers);
     free(request_body);
     curl_easy_cleanup(curl);
-
-    /* Handle cancellation */
-    if (cancelled)
-    {
-        if (response_buf.data)
-            free(response_buf.data);
-        yo_clear_thinking();
-        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
-        fflush(rl_outstream);
-        return NULL;
-    }
 
     if (!response_buf.data)
     {
@@ -2074,7 +2082,7 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     if (!response_json)
     {
         yo_clear_thinking();
-        yo_print_error_no_newline("Failed to parse API response");
+        yo_print_error_no_newline("Failed to parse API response: %s", response_buf.data);
         return NULL;
     }
 
@@ -2101,7 +2109,8 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
         }
         else
         {
-            yo_print_error_no_newline("Unexpected API response format");
+            yo_print_error_no_newline("Unexpected API response format: %s",
+                                      cJSON_PrintUnformatted(response_json));
         }
         cJSON_Delete(response_json);
         return NULL;
@@ -2202,6 +2211,16 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
             return yo_call_claude_with_messages_internal(api_key, retry_messages, 1);
         }
     }
+
+curl_error:
+    if (response_buf.data)
+        free(response_buf.data);
+    curl_multi_remove_handle(multi, curl);
+    curl_multi_cleanup(multi);
+    curl_slist_free_all(headers);
+    free(request_body);
+    curl_easy_cleanup(curl);
+    return NULL;
 }
 
 /* Main API call function - builds messages from query and calls API */
@@ -2209,12 +2228,6 @@ static cJSON *
 yo_call_claude(const char *api_key, const char *query)
 {
     cJSON *messages = yo_build_messages(query);
-    if (!messages)
-    {
-        yo_clear_thinking();
-        yo_print_error("Failed to build request");
-        return NULL;
-    }
     return yo_call_claude_with_messages(api_key, messages);
 }
 
@@ -2226,12 +2239,6 @@ yo_call_claude_with_scrollback(const char *api_key, const char *query,
 {
     cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request,
                                                         scrollback_data, scrollback_tool_id);
-    if (!messages)
-    {
-        yo_clear_thinking();
-        yo_print_error("Failed to build request");
-        return NULL;
-    }
     return yo_call_claude_with_messages(api_key, messages);
 }
 
@@ -2264,16 +2271,9 @@ yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original
 
     /* Build the normal message history including the current query */
     messages = yo_build_messages(query);
-    if (!messages)
-        return NULL;
 
     /* Append the assistant's original tool_use (the one missing explanation) */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "assistant");
     content_array = cJSON_CreateArray();
     tool_use_copy = cJSON_Duplicate(original_tool_use, 1);
@@ -2283,11 +2283,6 @@ yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original
 
     /* Append a user message with tool_result requesting the explanation */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     content_array = cJSON_CreateArray();
     tool_result = cJSON_CreateObject();
@@ -2436,17 +2431,31 @@ yo_display_chat(const char *response)
 }
 
 static void
-yo_print_error_no_newline(const char *msg)
+yo_print_error_no_newlinev(const char *msg, va_list args)
 {
-    fprintf(rl_outstream, "%sError: %s%s\n", yo_get_chat_color(), msg, YO_COLOR_RESET);
+    fprintf(rl_outstream, "%sError: ", yo_get_chat_color());
+    vfprintf(rl_outstream, msg, args);
+    fprintf(rl_outstream, "%s\n", YO_COLOR_RESET);
     fflush(rl_outstream);
 }
 
 static void
-yo_print_error(const char *msg)
+yo_print_error_no_newline(const char *msg, ...)
+{
+    va_list args;
+    va_start(args, msg);
+    yo_print_error_no_newlinev(msg, args);
+    va_end(args);
+}
+
+static void
+yo_print_error(const char *msg, ...)
 {
     fprintf(rl_outstream, "\n");
-    yo_print_error_no_newline(msg);
+    va_list args;
+    va_start(args, msg);
+    yo_print_error_no_newlinev(msg, args);
+    va_end(args);
 }
 
 static void
@@ -2459,21 +2468,19 @@ yo_print_thinking(void)
 static void
 yo_clear_thinking(void)
 {
+    int saved_errno = errno;
     /* Move cursor back and clear the line */
     fprintf(rl_outstream, "\r\033[K");
     fflush(rl_outstream);
+    errno = saved_errno;
 }
 
 static void
 yo_report_parse_error(cJSON *tool_use)
 {
     yo_clear_thinking();
-    char *json_str = tool_use ? cJSON_PrintUnformatted(tool_use) : strdup("(null)");
-    char *message;
-    asprintf(&message, "Failed to parse tool_use from Claude: %s", json_str);
-    yo_print_error_no_newline(message);
-    free(message);
-    free(json_str);
+    yo_print_error_no_newline("Failed to parse tool_use from Claude: %s",
+                              tool_use ? cJSON_PrintUnformatted(tool_use) : "(null)");
 }
 
 /* **************************************************************** */
@@ -2612,30 +2619,18 @@ yo_build_messages(const char *current_query)
     int i;
 
     messages = cJSON_CreateArray();
-    if (!messages)
-        return NULL;
 
     /* Add history entries */
     for (i = 0; i < yo_history_count; i++)
     {
         /* User message with query */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         cJSON_AddStringToObject(msg, "content", yo_history[i].query);
         cJSON_AddItemToArray(messages, msg);
 
         /* Assistant message with tool_use */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "assistant");
         content_array = cJSON_CreateArray();
         cJSON_AddItemToArray(content_array,
@@ -2648,11 +2643,6 @@ yo_build_messages(const char *current_query)
 
         /* User message with tool_result */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
 
@@ -2673,11 +2663,6 @@ yo_build_messages(const char *current_query)
 
     /* Add current query */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
@@ -2706,30 +2691,18 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
         lines_requested = 50;
 
     messages = cJSON_CreateArray();
-    if (!messages)
-        return NULL;
 
     /* Add history entries (same as yo_build_messages) */
     for (i = 0; i < yo_history_count; i++)
     {
         /* User message with query */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         cJSON_AddStringToObject(msg, "content", yo_history[i].query);
         cJSON_AddItemToArray(messages, msg);
 
         /* Assistant message with tool_use */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "assistant");
         content_array = cJSON_CreateArray();
         cJSON_AddItemToArray(content_array,
@@ -2742,11 +2715,6 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 
         /* User message with tool_result */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
         if (strcmp(yo_history[i].response_type, "command") == 0)
@@ -2766,22 +2734,12 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 
     /* Add current query */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
     /* Add assistant's scrollback tool_use */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "assistant");
     content_array = cJSON_CreateArray();
     tool_use = cJSON_CreateObject();
@@ -2797,11 +2755,6 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 
     /* Add user's tool_result with scrollback data */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     content_array = cJSON_CreateArray();
     asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
@@ -2833,30 +2786,18 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     (void)docs_request;  /* unused with tool use - we just need the tool_id */
 
     messages = cJSON_CreateArray();
-    if (!messages)
-        return NULL;
 
     /* Add history entries (same as yo_build_messages) */
     for (i = 0; i < yo_history_count; i++)
     {
         /* User message with query */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         cJSON_AddStringToObject(msg, "content", yo_history[i].query);
         cJSON_AddItemToArray(messages, msg);
 
         /* Assistant message with tool_use */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "assistant");
         content_array = cJSON_CreateArray();
         cJSON_AddItemToArray(content_array,
@@ -2869,11 +2810,6 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 
         /* User message with tool_result */
         msg = cJSON_CreateObject();
-        if (!msg)
-        {
-            cJSON_Delete(messages);
-            return NULL;
-        }
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
         if (strcmp(yo_history[i].response_type, "command") == 0)
@@ -2893,22 +2829,12 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 
     /* Add current query */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
     /* Add assistant's docs tool_use */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "assistant");
     content_array = cJSON_CreateArray();
     tool_use = cJSON_CreateObject();
@@ -2923,11 +2849,6 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 
     /* Add user's tool_result with documentation */
     msg = cJSON_CreateObject();
-    if (!msg)
-    {
-        cJSON_Delete(messages);
-        return NULL;
-    }
     cJSON_AddStringToObject(msg, "role", "user");
     content_array = cJSON_CreateArray();
     asprintf(&docs_msg, "Here is the yosh documentation:\n\n%s\n\n"
@@ -2948,11 +2869,5 @@ yo_call_claude_with_docs(const char *api_key, const char *query, const char *doc
                          const char *docs_tool_id)
 {
     cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id);
-    if (!messages)
-    {
-        yo_clear_thinking();
-        yo_print_error("Failed to build request");
-        return NULL;
-    }
     return yo_call_claude_with_messages(api_key, messages);
 }

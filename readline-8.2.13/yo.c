@@ -1003,11 +1003,17 @@ rl_yo_enable(const char *system_prompt, const char *documentation)
         "  a brief explanation. You will not see the output unless you request it.\n"
         "  Prefer short, focused commands. For multi-step tasks, set pending=true and you'll\n"
         "  receive terminal output after execution to continue with the next step.\n"
-        "  If a task requires a command, you MUST use this tool - never describe a command\n"
-        "  in a chat response instead of providing it as an actual command.\n"
+        "  IMPORTANT: If the user asks you to DO something (install, remove, configure, fix,\n"
+        "  create, delete, move, change, set up, etc.), you MUST respond with a command.\n"
+        "  Never respond with chat when a command is needed. If you're unsure what command\n"
+        "  to run or need to investigate first, use command with pending=true to run an\n"
+        "  investigative command (like grep, cat, echo, which, etc.), then continue with\n"
+        "  the actual fix after seeing the output.\n"
         "\n"
-        "- chat: Respond with text ONLY when no command is needed (pure questions,\n"
-        "  explanations, or conversational replies). Never use chat to suggest a command.\n"
+        "- chat: Respond with text ONLY for pure knowledge questions where no action is\n"
+        "  requested (e.g. 'what does -r do', 'explain pipes', 'how does git rebase work').\n"
+        "  NEVER use chat when the user is asking you to do, change, fix, or accomplish\n"
+        "  something - use command instead, even if you need to investigate first.\n"
         "\n"
         "- scrollback: Request recent terminal output when you need to see what happened\n"
         "  (errors, command results, etc.). You'll get another turn to respond after.\n"
@@ -1811,7 +1817,7 @@ yo_build_tools(void)
     tool = cJSON_CreateObject();
     cJSON_AddStringToObject(tool, "name", "chat");
     cJSON_AddStringToObject(tool, "description",
-        "Respond with a text message for questions, explanations, or when no command is needed.");
+        "Respond with a text message for questions and explanations; use ONLY when no command is needed.");
     schema = cJSON_CreateObject();
     cJSON_AddStringToObject(schema, "type", "object");
     props = cJSON_CreateObject();

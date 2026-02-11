@@ -810,7 +810,10 @@ initialize_readline ()
       "- Token estimation: ~4 characters per token\n"
       ;
 
-    rl_yo_enable ("You are a shell command assistant for yosh (a bash-compatible shell on Linux).",
+    rl_yo_enable ("yosh",
+                  "You are a shell command assistant for yosh (a bash-compatible shell on Linux). "
+                  "yosh is based on bash 5.2.32 and behaves like bash in most ways (for example it "
+                  "uses .bashrc files; there are no .yoshrc files).",
                   yo_documentation);
   }
 

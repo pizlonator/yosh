@@ -40,7 +40,7 @@ extern "C" {
    should provide this to give context about the environment.
    The documentation parameter is comprehensive docs about the shell that
    the LLM can request when users ask about how to use the shell. */
-extern void rl_yo_enable (const char *system_prompt, const char *documentation);
+    extern void rl_yo_enable (const char* name, const char *system_prompt, const char *documentation);
 
 /* Check if yo is currently enabled. Returns non-zero if enabled. */
 extern int rl_yo_enabled (void);

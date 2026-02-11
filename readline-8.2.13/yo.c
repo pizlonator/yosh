@@ -103,6 +103,7 @@ static int yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
 static int yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
 static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
+static const char *yo_name = NULL;
 static const char *yo_documentation = NULL;
 
 /* Track if last command from yo was executed */
@@ -980,7 +981,7 @@ yo_detect_distro(void)
 }
 
 void
-rl_yo_enable(const char *system_prompt, const char *documentation)
+rl_yo_enable(const char* name, const char *system_prompt, const char *documentation)
 {
     if (yo_is_enabled)
         return;
@@ -988,7 +989,7 @@ rl_yo_enable(const char *system_prompt, const char *documentation)
     /* Initialize PTY proxy for scrollback capture (optional - may fail silently) */
     yo_pty_init();
 
-    /* Store documentation from caller */
+    yo_name = name;
     yo_documentation = documentation;
 
     /* Store system prompt from caller. Tool definitions handle the response format;
@@ -1021,7 +1022,7 @@ rl_yo_enable(const char *system_prompt, const char *documentation)
         "  garbled-looking lines from readline editing (e.g. the user pressing up/down\n"
         "  arrows to navigate history). Ignore these artifacts and focus on actual output.\n"
         "\n"
-        "- docs: Request yosh documentation when the user asks about yosh features,\n"
+        "- docs: Request %s documentation when the user asks about %s features,\n"
         "  configuration, environment variables, or usage.\n"
         "\n"
         "Multi-step sequences: When you set pending=true on a command, you'll receive a\n"
@@ -1029,7 +1030,7 @@ rl_yo_enable(const char *system_prompt, const char *documentation)
         "with the next command or use chat to wrap up. If the user edited the command\n"
         "substantially, acknowledge and wrap up with chat (don't continue the sequence).\n"
         "The last command in a sequence should NOT have pending=true.",
-        system_prompt);
+        system_prompt, name, name);
 
     /* Detect distro and append to system prompt if available */
     {
@@ -1855,9 +1856,13 @@ yo_build_tools(void)
     /* Tool: docs - request yosh documentation */
     tool = cJSON_CreateObject();
     cJSON_AddStringToObject(tool, "name", "docs");
-    cJSON_AddStringToObject(tool, "description",
-        "Request yosh documentation to answer questions about yosh features, configuration, "
-        "environment variables, API key setup, or usage.");
+    char *description;
+    asprintf(&description,
+             "Request %s documentation to answer questions about %s features, configuration, "
+             "environment variables, API key setup, or usage.",
+             yo_name, yo_name);
+    cJSON_AddStringToObject(tool, "description", description);
+    free(description);
     schema = cJSON_CreateObject();
     cJSON_AddStringToObject(schema, "type", "object");
     props = cJSON_CreateObject();

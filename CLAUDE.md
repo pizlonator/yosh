@@ -51,6 +51,7 @@ Response types from the LLM:
 - **YO_SCROLLBACK_ENABLED**: Set to `0` to disable PTY proxy / scrollback capture
 - **YO_SCROLLBACK_BYTES**: Max scrollback buffer size (default 1MB)
 - **YO_SCROLLBACK_LINES**: Max lines to return to LLM (default 1000)
+- **YO_SERVER_WEB**: Set to `0` to disable server-side web search and fetch (default: enabled)
 - **Distro detection**: `rl_yo_enable()` reads `/etc/os-release` and appends it to the system prompt.
 
 ### Session Memory

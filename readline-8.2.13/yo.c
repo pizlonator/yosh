@@ -125,6 +125,7 @@ static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
 static const char *yo_name = NULL;
 static const char *yo_documentation = NULL;
+static int yo_server_web_enabled = 1;
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -382,6 +383,13 @@ yo_reload_config(void)
     {
         yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
     }
+
+    /* Reload server web setting */
+    env_val = getenv("YO_SERVER_WEB");
+    if (env_val && *env_val == '0')
+        yo_server_web_enabled = 0;
+    else
+        yo_server_web_enabled = 1;
 }
 
 /* **************************************************************** */
@@ -1860,6 +1868,22 @@ yo_build_tools(void)
     cJSON_AddItemToObject(tool, "input_schema", schema);
     cJSON_AddItemToArray(tools, tool);
 
+    /* Server tools: web_search and web_fetch (conditionally enabled) */
+    if (yo_server_web_enabled)
+    {
+        tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "type", "web_search_20250305");
+        cJSON_AddStringToObject(tool, "name", "web_search");
+        cJSON_AddNumberToObject(tool, "max_uses", 5);
+        cJSON_AddItemToArray(tools, tool);
+
+        tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "type", "web_fetch_20250910");
+        cJSON_AddStringToObject(tool, "name", "web_fetch");
+        cJSON_AddNumberToObject(tool, "max_uses", 3);
+        cJSON_AddItemToArray(tools, tool);
+    }
+
     return tools;
 }
 
@@ -1935,8 +1959,26 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     request_json = cJSON_CreateObject();
 
     cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_MODEL);
-    cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
-    cJSON_AddStringToObject(request_json, "system", yo_system_prompt);
+    cJSON_AddNumberToObject(request_json, "max_tokens", yo_server_web_enabled ? 4096 : YO_MAX_TOKENS);
+    if (yo_server_web_enabled)
+    {
+        char *full_prompt;
+        asprintf(&full_prompt, "%s\n\n"
+            "When you need up-to-date information from the internet (current events, latest docs,\n"
+            "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
+            "These run automatically when you use them - just search or fetch as needed before\n"
+            "choosing your final response tool (command or chat).\n"
+            "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
+            "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
+            "inline citations or reference markers - the user does not need source attribution.",
+            yo_system_prompt);
+        cJSON_AddStringToObject(request_json, "system", full_prompt);
+        free(full_prompt);
+    }
+    else
+    {
+        cJSON_AddStringToObject(request_json, "system", yo_system_prompt);
+    }
 
     /* Add messages array to request (takes ownership) */
     cJSON_AddItemToObject(request_json, "messages", messages);
@@ -1957,6 +1999,8 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
+    if (yo_server_web_enabled)
+        headers = curl_slist_append(headers, "anthropic-beta: web-fetch-2025-09-10");
 
     /* Configure CURL easy handle */
     curl_easy_setopt(curl, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
@@ -1964,7 +2008,7 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, yo_curl_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, YO_API_TIMEOUT);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, yo_server_web_enabled ? 120L : YO_API_TIMEOUT);
 
     /* Add easy handle to multi handle */
     curl_multi_add_handle(multi, curl);

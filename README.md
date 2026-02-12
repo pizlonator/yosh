@@ -85,6 +85,7 @@ chmod 600 ~/.yoshkey
 | `YO_SCROLLBACK_ENABLED` | `1` | Set to `0` to disable terminal scrollback capture |
 | `YO_SCROLLBACK_BYTES` | `1048576` | Max scrollback buffer size (1MB) |
 | `YO_SCROLLBACK_LINES` | `1000` | Max lines to return to Claude |
+| `YO_SERVER_WEB` | `1` | Set to `0` to disable web search and fetch |
 
 ## Usage
 

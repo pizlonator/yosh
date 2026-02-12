@@ -80,13 +80,33 @@
 /*                                                                  */
 /* **************************************************************** */
 
+typedef enum {
+    YO_RESPONSE_COMMAND,
+    YO_RESPONSE_CHAT,
+    YO_RESPONSE_SCROLLBACK,
+    YO_RESPONSE_DOCS,
+    YO_RESPONSE_ERROR
+} yo_response_type_t;
+
 typedef struct {
-    char *query;           /* "yo find python files" */
-    char *response_type;   /* "command" or "chat" */
-    char *response;        /* the command or chat text */
-    char *tool_use_id;     /* tool_use.id from Claude's response */
-    int executed;          /* 1 if user ran it, 0 if not */
-    int pending;           /* 1 if response had "pending":true (multi-step) */
+    yo_response_type_t type;
+    char *content;        /* command string, chat text, scrollback lines count, etc. */
+    char *explanation;    /* command explanation (may be NULL) */
+    char *tool_use_id;    /* Anthropic tool_use "id" field */
+    int pending;          /* 1 if multi-step continuation */
+    cJSON *raw_tool_use;  /* raw cJSON tool_use block (owned by this struct) */
+} yo_response_t;
+
+#define YO_LLM_RETRY_EXPLANATION            (1 << 0)
+#define YO_LLM_RETRY_EXPLANATION_IF_PENDING  (1 << 1)
+
+typedef struct {
+    char *query;                   /* "yo find python files" */
+    yo_response_type_t response_type;  /* YO_RESPONSE_COMMAND, YO_RESPONSE_CHAT, etc. */
+    char *response;                /* the command or chat text */
+    char *tool_use_id;             /* tool_use.id from Claude's response */
+    int executed;                  /* 1 if user ran it, 0 if not */
+    int pending;                   /* 1 if response had "pending":true (multi-step) */
 } yo_exchange_t;
 
 /* **************************************************************** */
@@ -168,10 +188,9 @@ static cJSON *yo_call_claude_with_scrollback(const char *api_key, const char *qu
                                              const char *scrollback_tool_id);
 static cJSON *yo_call_claude_with_docs(const char *api_key, const char *query, const char *docs_request,
                                        const char *docs_tool_id);
-static int yo_parse_response(cJSON *tool_use, char **type, char **content, char **explanation,
-                             char **tool_use_id, int *pending);
+static int yo_parse_response(cJSON *tool_use, yo_response_t *resp);
 static void yo_display_chat(const char *response);
-static void yo_history_add(const char *query, const char *type, const char *response, const char *tool_use_id, int executed, int pending);
+static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending);
 static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
 static cJSON *yo_build_messages(const char *current_query);
@@ -194,13 +213,19 @@ static void yo_continuation_sigcleanup(int, void *);
 /* Explanation retry - re-prompts LLM when command response is missing explanation */
 static cJSON *yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original_tool_use);
 
-/* Request handling helpers (shared by continuation hook and accept line) */
+/* Response type helpers */
+static const char *yo_response_type_to_string(yo_response_type_t type);
+static yo_response_type_t yo_response_type_from_string(const char *str);
+static void yo_response_free(yo_response_t *resp);
+
+/* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
+static int yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *resp);
+
+/* Request handling helpers (shared by yo_call_llm internals) */
 static int yo_handle_requests(const char *api_key, const char *query,
-                              cJSON **tool_use, char **type, char **content,
-                              char **explanation, char **tool_use_id, int *pending, int max_turns);
+                              yo_response_t *resp, int max_turns);
 static int yo_handle_explanation_retry(const char *api_key, const char *query,
-                                       cJSON **tool_use, char **type, char **content,
-                                       char **explanation, char **tool_use_id, int *pending);
+                                       yo_response_t *resp);
 
 /* PTY proxy functions */
 static int yo_pty_init(void);
@@ -1061,8 +1086,6 @@ rl_yo_clear_history(void)
     {
         if (yo_history[i].query)
             free(yo_history[i].query);
-        if (yo_history[i].response_type)
-            free(yo_history[i].response_type);
         if (yo_history[i].response)
             free(yo_history[i].response);
         if (yo_history[i].tool_use_id)
@@ -1115,28 +1138,28 @@ yo_install_continuation_sigcleanup(void)
 /* **************************************************************** */
 
 /* Process scrollback and docs requests in a loop until a final response is
-   received or max_turns is exhausted.  Updates tool_use/type/content/explanation/
-   tool_use_id/pending in place.  Returns 1 on success, 0 on failure (error already
-   printed, *tool_use set to NULL). */
+   received or max_turns is exhausted.  Updates resp in place.
+   Returns 1 on success, 0 on failure (error already printed, resp zeroed). */
 static int
 yo_handle_requests(const char *api_key, const char *query,
-                   cJSON **tool_use, char **type, char **content,
-                   char **explanation, char **tool_use_id, int *pending, int max_turns)
+                   yo_response_t *resp, int max_turns)
 {
     while (max_turns > 0)
     {
-        if (strcmp(*type, "scrollback") == 0)
+        if (resp->type == YO_RESPONSE_SCROLLBACK)
         {
             char *scrollback_data = NULL;
             char *saved_tool_id = NULL;
             char *saved_content = NULL;
+            cJSON *new_tool_use;
+            yo_response_t new_resp;
             int lines_requested;
 
             /* Save the tool_use_id and content (lines count) before freeing */
-            saved_tool_id = *tool_use_id;
-            *tool_use_id = NULL;
-            saved_content = *content;
-            *content = NULL;
+            saved_tool_id = resp->tool_use_id;
+            resp->tool_use_id = NULL;
+            saved_content = resp->content;
+            resp->content = NULL;
 
             lines_requested = atoi(saved_content);
             if (lines_requested <= 0) lines_requested = 50;
@@ -1149,56 +1172,68 @@ yo_handle_requests(const char *api_key, const char *query,
                 scrollback_data = strdup("(No terminal output available)");
             }
 
-            free(*type); *type = NULL;
-            if (*explanation) { free(*explanation); *explanation = NULL; }
-            cJSON_Delete(*tool_use); *tool_use = NULL;
+            if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
+            if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            *tool_use = yo_call_claude_with_scrollback(api_key, query,
-                                                       saved_content, scrollback_data, saved_tool_id);
+            new_tool_use = yo_call_claude_with_scrollback(api_key, query,
+                                                          saved_content, scrollback_data, saved_tool_id);
             free(saved_tool_id);
             free(saved_content);
             free(scrollback_data);
 
-            if (!*tool_use)
-                return 0;
-
-            if (!yo_parse_response(*tool_use, type, content, explanation, tool_use_id, pending))
+            if (!new_tool_use)
             {
-                yo_report_parse_error(*tool_use);
-                cJSON_Delete(*tool_use);
-                *tool_use = NULL;
+                memset(resp, 0, sizeof(*resp));
                 return 0;
             }
 
+            memset(&new_resp, 0, sizeof(new_resp));
+            if (!yo_parse_response(new_tool_use, &new_resp))
+            {
+                yo_report_parse_error(new_tool_use);
+                cJSON_Delete(new_tool_use);
+                memset(resp, 0, sizeof(*resp));
+                return 0;
+            }
+
+            new_resp.raw_tool_use = new_tool_use;
+            *resp = new_resp;
             max_turns--;
         }
-        else if (strcmp(*type, "docs") == 0)
+        else if (resp->type == YO_RESPONSE_DOCS)
         {
             char *saved_tool_id = NULL;
+            cJSON *new_tool_use;
+            yo_response_t new_resp;
 
             /* Save the tool_use_id before freeing */
-            saved_tool_id = *tool_use_id;
-            *tool_use_id = NULL;
+            saved_tool_id = resp->tool_use_id;
+            resp->tool_use_id = NULL;
 
-            free(*type); *type = NULL;
-            free(*content); *content = NULL;
-            if (*explanation) { free(*explanation); *explanation = NULL; }
-            cJSON_Delete(*tool_use); *tool_use = NULL;
+            free(resp->content); resp->content = NULL;
+            if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
+            if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            *tool_use = yo_call_claude_with_docs(api_key, query, "", saved_tool_id);
+            new_tool_use = yo_call_claude_with_docs(api_key, query, "", saved_tool_id);
             free(saved_tool_id);
 
-            if (!*tool_use)
-                return 0;
-
-            if (!yo_parse_response(*tool_use, type, content, explanation, tool_use_id, pending))
+            if (!new_tool_use)
             {
-                yo_report_parse_error(*tool_use);
-                cJSON_Delete(*tool_use);
-                *tool_use = NULL;
+                memset(resp, 0, sizeof(*resp));
                 return 0;
             }
 
+            memset(&new_resp, 0, sizeof(new_resp));
+            if (!yo_parse_response(new_tool_use, &new_resp))
+            {
+                yo_report_parse_error(new_tool_use);
+                cJSON_Delete(new_tool_use);
+                memset(resp, 0, sizeof(*resp));
+                return 0;
+            }
+
+            new_resp.raw_tool_use = new_tool_use;
+            *resp = new_resp;
             max_turns--;
         }
         else
@@ -1212,51 +1247,111 @@ yo_handle_requests(const char *api_key, const char *query,
 }
 
 /* When a command response is missing the explanation field, retry once asking
-   the LLM to include it.  Updates tool_use/type/content/explanation/tool_use_id/pending
-   in place if the retry succeeds.
+   the LLM to include it.  Updates resp in place if the retry succeeds.
    Returns 1 to continue normally, 0 if the user cancelled (caller should abort). */
 static int
 yo_handle_explanation_retry(const char *api_key, const char *query,
-                            cJSON **tool_use, char **type, char **content,
-                            char **explanation, char **tool_use_id, int *pending)
+                            yo_response_t *resp)
 {
     cJSON *retry_tool_use;
 
-    if (strcmp(*type, "command") != 0 || (*explanation && **explanation))
+    if (resp->type != YO_RESPONSE_COMMAND || (resp->explanation && *resp->explanation))
         return 1;  /* No retry needed */
 
-    retry_tool_use = yo_retry_for_explanation(api_key, query, *tool_use);
+    retry_tool_use = yo_retry_for_explanation(api_key, query, resp->raw_tool_use);
     if (retry_tool_use)
     {
-        char *r_type = NULL, *r_content = NULL, *r_explanation = NULL, *r_tool_use_id = NULL;
-        int r_pending = 0;
-        if (yo_parse_response(retry_tool_use, &r_type, &r_content, &r_explanation, &r_tool_use_id, &r_pending)
-            && r_type && strcmp(r_type, "command") == 0
-            && r_explanation && *r_explanation)
+        yo_response_t r;
+        memset(&r, 0, sizeof(r));
+        if (yo_parse_response(retry_tool_use, &r)
+            && r.type == YO_RESPONSE_COMMAND
+            && r.explanation && *r.explanation)
         {
             /* Retry succeeded — use the new response */
-            free(*type); *type = r_type;
-            free(*content); *content = r_content;
-            if (*explanation) free(*explanation);
-            *explanation = r_explanation;
-            if (*tool_use_id) free(*tool_use_id);
-            *tool_use_id = r_tool_use_id;
-            *pending = r_pending;
-            cJSON_Delete(*tool_use); *tool_use = retry_tool_use;
+            free(resp->content); resp->content = r.content;
+            if (resp->explanation) free(resp->explanation);
+            resp->explanation = r.explanation;
+            if (resp->tool_use_id) free(resp->tool_use_id);
+            resp->tool_use_id = r.tool_use_id;
+            resp->pending = r.pending;
+            cJSON_Delete(resp->raw_tool_use);
+            resp->raw_tool_use = retry_tool_use;
         }
         else
         {
             /* Retry didn't produce a valid command with explanation — use original */
-            if (r_type) free(r_type);
-            if (r_content) free(r_content);
-            if (r_explanation) free(r_explanation);
-            if (r_tool_use_id) free(r_tool_use_id);
+            if (r.content) free(r.content);
+            if (r.explanation) free(r.explanation);
+            if (r.tool_use_id) free(r.tool_use_id);
             cJSON_Delete(retry_tool_use);
         }
     }
     else if (yo_cancelled)
     {
         return 0;  /* Cancelled */
+    }
+
+    return 1;
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*                    Unified LLM Call                              */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Encapsulates the full call chain: yo_call_claude → yo_parse_response →
+   yo_handle_requests → yo_handle_explanation_retry.
+   Returns 1 on success (resp filled in), 0 on error/cancellation (resp zeroed).
+   Flags:
+     YO_LLM_RETRY_EXPLANATION            — always retry if explanation missing
+     YO_LLM_RETRY_EXPLANATION_IF_PENDING  — retry only if resp->pending */
+static int
+yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *resp)
+{
+    cJSON *tool_use;
+
+    memset(resp, 0, sizeof(*resp));
+
+    /* Step 1: Call Claude API */
+    tool_use = yo_call_claude(api_key, query);
+    if (!tool_use)
+        return 0;  /* Error/cancellation already printed */
+
+    /* Step 2: Parse the response */
+    if (!yo_parse_response(tool_use, resp))
+    {
+        yo_report_parse_error(tool_use);
+        cJSON_Delete(tool_use);
+        memset(resp, 0, sizeof(*resp));
+        return 0;
+    }
+    resp->raw_tool_use = tool_use;  /* Transfer ownership */
+
+    /* Step 3: Handle scrollback/docs requests */
+    if (!yo_handle_requests(api_key, query, resp, 3))
+    {
+        memset(resp, 0, sizeof(*resp));
+        return 0;
+    }
+
+    /* Step 4: Conditionally retry for missing explanation */
+    {
+        int do_retry = 0;
+        if (flags & YO_LLM_RETRY_EXPLANATION)
+            do_retry = 1;
+        else if ((flags & YO_LLM_RETRY_EXPLANATION_IF_PENDING) && resp->pending)
+            do_retry = 1;
+
+        if (do_retry)
+        {
+            if (!yo_handle_explanation_retry(api_key, query, resp))
+            {
+                /* User cancelled during retry */
+                yo_response_free(resp);
+                return 0;
+            }
+        }
     }
 
     return 1;
@@ -1272,12 +1367,9 @@ yo_continuation_hook(void)
     char *api_key = NULL;
     char *scrollback = NULL;
     char *cont_query = NULL;
-    cJSON *tool_use = NULL;
-    char *type = NULL;
-    char *content = NULL;
-    char *explanation = NULL;
-    char *tool_use_id = NULL;
-    int pending = 0;
+    yo_response_t resp;
+
+    memset(&resp, 0, sizeof(resp));
 
     /* One-shot: uninstall ourselves immediately, restore previous hook */
     rl_startup_hook = yo_saved_startup_hook;
@@ -1339,51 +1431,12 @@ yo_continuation_hook(void)
         return 0;
     }
 
-    /* Call Claude API */
-    tool_use = yo_call_claude(api_key, cont_query);
-    if (!tool_use)
-    {
-        /* Error/cancellation — already printed by yo_call_claude */
-        yo_continuation_active = 0;
-        free(api_key);
-        free(cont_query);
-        return 0;
-    }
-
-    /* Parse response */
-    if (!yo_parse_response(tool_use, &type, &content, &explanation, &tool_use_id, &pending))
-    {
-        yo_report_parse_error(tool_use);
-        yo_continuation_active = 0;
-        cJSON_Delete(tool_use);
-        free(api_key);
-        free(cont_query);
-        return 0;
-    }
-
-    /* Handle scrollback requests */
-    if (!yo_handle_requests(api_key, cont_query, &tool_use, &type, &content,
-                            &explanation, &tool_use_id, &pending, 3))
+    /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
+    if (!yo_call_llm(api_key, cont_query, YO_LLM_RETRY_EXPLANATION, &resp))
     {
         yo_continuation_active = 0;
         free(api_key);
         free(cont_query);
-        return 0;
-    }
-
-    /* If command response is missing explanation, retry once asking for it */
-    if (!yo_handle_explanation_retry(api_key, cont_query, &tool_use, &type, &content,
-                                     &explanation, &tool_use_id, &pending))
-    {
-        /* User cancelled during retry */
-        yo_continuation_active = 0;
-        cJSON_Delete(tool_use);
-        free(api_key);
-        free(cont_query);
-        if (type) free(type);
-        if (content) free(content);
-        if (explanation) free(explanation);
-        if (tool_use_id) free(tool_use_id);
         return 0;
     }
 
@@ -1391,28 +1444,28 @@ yo_continuation_hook(void)
     yo_clear_thinking();
 
     /* Handle the response */
-    if (strcmp(type, "command") == 0)
+    if (resp.type == YO_RESPONSE_COMMAND)
     {
-        if (explanation && *explanation)
-            yo_display_chat(explanation);
+        if (resp.explanation && *resp.explanation)
+            yo_display_chat(resp.explanation);
 
         /* Add continuation exchange to session history */
-        yo_history_add(cont_query, type, content, tool_use_id, 0, pending);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending);
 
         /* Prefill the command */
-        rl_replace_line(content, 0);
+        rl_replace_line(resp.content, 0);
         rl_point = rl_end;
         yo_last_was_command = 1;
 
         /* Continue or finish? */
-        yo_continuation_active = pending;
-        if (pending)
+        yo_continuation_active = resp.pending;
+        if (resp.pending)
             yo_install_continuation_sigcleanup();
     }
-    else if (strcmp(type, "chat") == 0)
+    else if (resp.type == YO_RESPONSE_CHAT)
     {
-        yo_display_chat(content);
-        yo_history_add(cont_query, type, content, tool_use_id, 1, 0);
+        yo_display_chat(resp.content);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 1, 0);
         rl_replace_line("", 0);
         yo_continuation_active = 0;
     }
@@ -1424,13 +1477,9 @@ yo_continuation_hook(void)
     }
 
     /* Cleanup */
-    cJSON_Delete(tool_use);
+    yo_response_free(&resp);
     free(api_key);
     free(cont_query);
-    if (type) free(type);
-    if (content) free(content);
-    if (explanation) free(explanation);
-    if (tool_use_id) free(tool_use_id);
 
     return 0;
 }
@@ -1445,13 +1494,8 @@ int
 rl_yo_accept_line(int count, int key)
 {
     char *api_key = NULL;
-    cJSON *tool_use = NULL;
-    char *type = NULL;
-    char *content = NULL;
-    char *explanation = NULL;
-    char *tool_use_id = NULL;
     char *saved_query = NULL;
-    int pending = 0;
+    yo_response_t resp;
 
     /* Track if previous yo command was executed */
     if (yo_last_was_command)
@@ -1540,36 +1584,9 @@ rl_yo_accept_line(int count, int key)
     fprintf(rl_outstream, "\n");
     yo_print_thinking();
 
-    /* Call Claude API - handles its own error/cancellation messages */
-    tool_use = yo_call_claude(api_key, saved_query);
-
-    if (!tool_use)
-    {
-        /* Error already printed by yo_call_claude */
-        rl_replace_line("", 0);
-        rl_on_new_line();
-        rl_redisplay();
-        free(api_key);
-        free(saved_query);
-        return 0;
-    }
-
-    /* Parse the response */
-    if (!yo_parse_response(tool_use, &type, &content, &explanation, &tool_use_id, &pending))
-    {
-        yo_report_parse_error(tool_use);
-        rl_replace_line("", 0);
-        rl_on_new_line();
-        rl_redisplay();
-        cJSON_Delete(tool_use);
-        free(api_key);
-        free(saved_query);
-        return 0;
-    }
-
-    /* Handle scrollback requests with follow-up calls */
-    if (!yo_handle_requests(api_key, saved_query, &tool_use, &type, &content,
-                            &explanation, &tool_use_id, &pending, 3))
+    /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
+    memset(&resp, 0, sizeof(resp));
+    if (!yo_call_llm(api_key, saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
     {
         rl_replace_line("", 0);
         rl_on_new_line();
@@ -1578,67 +1595,47 @@ rl_yo_accept_line(int count, int key)
         free(saved_query);
         return 0;
     }
-
-    /* If command response is missing explanation, retry once asking for it */
-    if (pending && !yo_handle_explanation_retry(api_key, saved_query, &tool_use, &type, &content,
-                                                &explanation, &tool_use_id, &pending))
-    {
-        /* User cancelled during retry */
-        cJSON_Delete(tool_use);
-        free(api_key);
-        free(saved_query);
-        free(type);
-        free(content);
-        if (explanation) free(explanation);
-        if (tool_use_id) free(tool_use_id);
-        rl_replace_line("", 0);
-        rl_on_new_line();
-        rl_redisplay();
-        return 0;
-    }
-
-    cJSON_Delete(tool_use);
     free(api_key);
 
     /* Clear thinking indicator on success */
     yo_clear_thinking();
 
-    if (strcmp(type, "command") == 0)
+    if (resp.type == YO_RESPONSE_COMMAND)
     {
         /* Command mode: replace input with generated command */
 
         /* Print explanation if present */
-        if (explanation && *explanation)
+        if (resp.explanation && *resp.explanation)
         {
-            yo_display_chat(explanation);
+            yo_display_chat(resp.explanation);
         }
 
         /* Add to session history (not executed yet) */
-        yo_history_add(saved_query, type, content, tool_use_id, 0, pending);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending);
 
         /* Replace line with the command */
-        rl_replace_line(content, 0);
+        rl_replace_line(resp.content, 0);
         rl_point = rl_end;
 
         /* Mark that we just generated a command */
         yo_last_was_command = 1;
 
         /* Set continuation state if response is pending */
-        yo_continuation_active = pending;
-        if (pending)
+        yo_continuation_active = resp.pending;
+        if (resp.pending)
             yo_install_continuation_sigcleanup();
 
         /* Redisplay with new content */
         rl_on_new_line();
         rl_redisplay();
     }
-    else if (strcmp(type, "chat") == 0)
+    else if (resp.type == YO_RESPONSE_CHAT)
     {
         /* Chat mode: display response, return to fresh prompt */
-        yo_display_chat(content);
+        yo_display_chat(resp.content);
 
         /* Add to session history */
-        yo_history_add(saved_query, type, content, tool_use_id, 1, 0);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 1, 0);
 
         /* Clear any active continuation */
         yo_continuation_active = 0;
@@ -1648,7 +1645,7 @@ rl_yo_accept_line(int count, int key)
         rl_on_new_line();
         rl_redisplay();
     }
-    else if (strcmp(type, "scrollback") == 0)
+    else if (resp.type == YO_RESPONSE_SCROLLBACK)
     {
         /* Exceeded max scrollback turns */
         yo_print_error("Too many scrollback requests");
@@ -1659,18 +1656,11 @@ rl_yo_accept_line(int count, int key)
     else
     {
         yo_print_error("Unknown response type from Claude (full tool use response: %s)",
-                       cJSON_PrintUnformatted(tool_use));
+                       resp.raw_tool_use ? cJSON_PrintUnformatted(resp.raw_tool_use) : "(null)");
     }
 
     free(saved_query);
-    if (type)
-        free(type);
-    if (content)
-        free(content);
-    if (explanation)
-        free(explanation);
-    if (tool_use_id)
-        free(tool_use_id);
+    yo_response_free(&resp);
 
     return 0;
 }
@@ -2318,16 +2308,58 @@ yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original
 
 /* **************************************************************** */
 /*                                                                  */
+/*                  Response Type Helpers                            */
+/*                                                                  */
+/* **************************************************************** */
+
+static const char *
+yo_response_type_to_string(yo_response_type_t type)
+{
+    switch (type)
+    {
+    case YO_RESPONSE_COMMAND:    return "command";
+    case YO_RESPONSE_CHAT:       return "chat";
+    case YO_RESPONSE_SCROLLBACK: return "scrollback";
+    case YO_RESPONSE_DOCS:       return "docs";
+    case YO_RESPONSE_ERROR:      return "error";
+    }
+    return "error";
+}
+
+static yo_response_type_t
+yo_response_type_from_string(const char *str)
+{
+    if (!str) return YO_RESPONSE_ERROR;
+    if (strcmp(str, "command") == 0)    return YO_RESPONSE_COMMAND;
+    if (strcmp(str, "chat") == 0)       return YO_RESPONSE_CHAT;
+    if (strcmp(str, "scrollback") == 0) return YO_RESPONSE_SCROLLBACK;
+    if (strcmp(str, "docs") == 0)       return YO_RESPONSE_DOCS;
+    return YO_RESPONSE_ERROR;
+}
+
+static void
+yo_response_free(yo_response_t *resp)
+{
+    if (resp->content)      { free(resp->content);      resp->content = NULL; }
+    if (resp->explanation)  { free(resp->explanation);  resp->explanation = NULL; }
+    if (resp->tool_use_id)  { free(resp->tool_use_id);  resp->tool_use_id = NULL; }
+    if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
+    resp->type = YO_RESPONSE_ERROR;
+    resp->pending = 0;
+}
+
+/* **************************************************************** */
+/*                                                                  */
 /*                    Response Parsing                              */
 /*                                                                  */
 /* **************************************************************** */
 
 /* Parse a tool_use cJSON object (from API response).
    Extracts the tool name as type, the tool_use id, and fields from input.
-   The tool_use object is NOT freed - caller retains ownership. */
+   The tool_use object is NOT freed - caller retains ownership.
+   Does NOT set resp->raw_tool_use (caller does that). */
 static int
-yo_parse_response(cJSON *tool_use, char **type, char **content, char **explanation,
-                  char **tool_use_id, int *pending)
+yo_parse_response(cJSON *tool_use, yo_response_t *resp)
 {
     cJSON *name_item;
     cJSON *id_item;
@@ -2337,11 +2369,12 @@ yo_parse_response(cJSON *tool_use, char **type, char **content, char **explanati
     cJSON *lines_item;
     cJSON *pending_item;
 
-    *type = NULL;
-    *content = NULL;
-    *explanation = NULL;
-    *tool_use_id = NULL;
-    *pending = 0;
+    resp->type = YO_RESPONSE_ERROR;
+    resp->content = NULL;
+    resp->explanation = NULL;
+    resp->tool_use_id = NULL;
+    resp->pending = 0;
+    /* Note: resp->raw_tool_use is NOT touched here - caller manages it */
 
     if (!tool_use)
         return 0;
@@ -2351,73 +2384,71 @@ yo_parse_response(cJSON *tool_use, char **type, char **content, char **explanati
     if (!name_item || !cJSON_IsString(name_item))
         return 0;
 
-    *type = strdup(name_item->valuestring);
+    resp->type = yo_response_type_from_string(name_item->valuestring);
 
     /* Extract tool_use id */
     id_item = cJSON_GetObjectItem(tool_use, "id");
     if (id_item && cJSON_IsString(id_item))
-        *tool_use_id = strdup(id_item->valuestring);
+        resp->tool_use_id = strdup(id_item->valuestring);
 
     /* Extract input object */
     input = cJSON_GetObjectItem(tool_use, "input");
     if (!input)
     {
         /* docs tool may have empty input */
-        if (strcmp(*type, "docs") == 0)
+        if (resp->type == YO_RESPONSE_DOCS)
         {
-            *content = strdup("");
+            resp->content = strdup("");
             return 1;
         }
-        free(*type);
-        *type = NULL;
-        if (*tool_use_id) { free(*tool_use_id); *tool_use_id = NULL; }
+        resp->type = YO_RESPONSE_ERROR;
+        if (resp->tool_use_id) { free(resp->tool_use_id); resp->tool_use_id = NULL; }
         return 0;
     }
 
-    if (strcmp(*type, "command") == 0)
+    if (resp->type == YO_RESPONSE_COMMAND)
     {
         content_item = cJSON_GetObjectItem(input, "command");
         if (content_item && cJSON_IsString(content_item))
-            *content = strdup(content_item->valuestring);
+            resp->content = strdup(content_item->valuestring);
 
         explanation_item = cJSON_GetObjectItem(input, "explanation");
         if (explanation_item && cJSON_IsString(explanation_item))
-            *explanation = strdup(explanation_item->valuestring);
+            resp->explanation = strdup(explanation_item->valuestring);
 
         pending_item = cJSON_GetObjectItem(input, "pending");
         if (pending_item && cJSON_IsTrue(pending_item))
-            *pending = 1;
+            resp->pending = 1;
     }
-    else if (strcmp(*type, "chat") == 0)
+    else if (resp->type == YO_RESPONSE_CHAT)
     {
         content_item = cJSON_GetObjectItem(input, "response");
         if (content_item && cJSON_IsString(content_item))
-            *content = strdup(content_item->valuestring);
+            resp->content = strdup(content_item->valuestring);
     }
-    else if (strcmp(*type, "scrollback") == 0)
+    else if (resp->type == YO_RESPONSE_SCROLLBACK)
     {
         lines_item = cJSON_GetObjectItem(input, "lines");
         if (lines_item && cJSON_IsNumber(lines_item))
         {
             char lines_str[32];
             snprintf(lines_str, sizeof(lines_str), "%d", (int)lines_item->valuedouble);
-            *content = strdup(lines_str);
+            resp->content = strdup(lines_str);
         }
         else
         {
-            *content = strdup("50");
+            resp->content = strdup("50");
         }
     }
-    else if (strcmp(*type, "docs") == 0)
+    else if (resp->type == YO_RESPONSE_DOCS)
     {
-        *content = strdup("");
+        resp->content = strdup("");
     }
 
-    if (!*content)
+    if (!resp->content)
     {
-        free(*type);
-        *type = NULL;
-        if (*tool_use_id) { free(*tool_use_id); *tool_use_id = NULL; }
+        resp->type = YO_RESPONSE_ERROR;
+        if (resp->tool_use_id) { free(resp->tool_use_id); resp->tool_use_id = NULL; }
         return 0;
     }
 
@@ -2506,7 +2537,7 @@ yo_report_parse_error(cJSON *tool_use)
 /* **************************************************************** */
 
 static void
-yo_history_add(const char *query, const char *type, const char *response, const char *tool_use_id, int executed, int pending)
+yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending)
 {
     /* Prune if necessary */
     yo_history_prune();
@@ -2524,7 +2555,7 @@ yo_history_add(const char *query, const char *type, const char *response, const 
 
     /* Add new entry */
     yo_history[yo_history_count].query = strdup(query);
-    yo_history[yo_history_count].response_type = strdup(type);
+    yo_history[yo_history_count].response_type = type;
     yo_history[yo_history_count].response = strdup(response);
     yo_history[yo_history_count].tool_use_id = tool_use_id ? strdup(tool_use_id) : NULL;
     yo_history[yo_history_count].executed = executed;
@@ -2541,8 +2572,6 @@ yo_history_prune(void)
         /* Remove oldest entry */
         if (yo_history[0].query)
             free(yo_history[0].query);
-        if (yo_history[0].response_type)
-            free(yo_history[0].response_type);
         if (yo_history[0].response)
             free(yo_history[0].response);
         if (yo_history[0].tool_use_id)
@@ -2558,8 +2587,6 @@ yo_history_prune(void)
         /* Remove oldest entry */
         if (yo_history[0].query)
             free(yo_history[0].query);
-        if (yo_history[0].response_type)
-            free(yo_history[0].response_type);
         if (yo_history[0].response)
             free(yo_history[0].response);
         if (yo_history[0].tool_use_id)
@@ -2590,23 +2617,23 @@ yo_estimate_tokens(void)
 
 /* Helper to build a tool_use content block for history reconstruction */
 static cJSON *
-yo_build_tool_use_block(const char *tool_use_id, const char *type, const char *response, int pending)
+yo_build_tool_use_block(const char *tool_use_id, yo_response_type_t type, const char *response, int pending)
 {
     cJSON *tool_use = cJSON_CreateObject();
     cJSON *input = cJSON_CreateObject();
 
     cJSON_AddStringToObject(tool_use, "type", "tool_use");
     cJSON_AddStringToObject(tool_use, "id", tool_use_id);
-    cJSON_AddStringToObject(tool_use, "name", type);
+    cJSON_AddStringToObject(tool_use, "name", yo_response_type_to_string(type));
 
-    if (strcmp(type, "command") == 0)
+    if (type == YO_RESPONSE_COMMAND)
     {
         cJSON_AddStringToObject(input, "command", response);
         cJSON_AddStringToObject(input, "explanation", "(from history)");
         if (pending)
             cJSON_AddTrueToObject(input, "pending");
     }
-    else if (strcmp(type, "chat") == 0)
+    else if (type == YO_RESPONSE_CHAT)
     {
         cJSON_AddStringToObject(input, "response", response);
     }
@@ -2662,7 +2689,7 @@ yo_build_messages(const char *current_query)
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
 
-        if (strcmp(yo_history[i].response_type, "command") == 0)
+        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
         {
             cJSON_AddItemToArray(content_array,
                 yo_build_tool_result_block(yo_history[i].tool_use_id,
@@ -2733,7 +2760,7 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
         msg = cJSON_CreateObject();
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
-        if (strcmp(yo_history[i].response_type, "command") == 0)
+        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
         {
             cJSON_AddItemToArray(content_array,
                 yo_build_tool_result_block(yo_history[i].tool_use_id,
@@ -2828,7 +2855,7 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
         msg = cJSON_CreateObject();
         cJSON_AddStringToObject(msg, "role", "user");
         content_array = cJSON_CreateArray();
-        if (strcmp(yo_history[i].response_type, "command") == 0)
+        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
         {
             cJSON_AddItemToArray(content_array,
                 yo_build_tool_result_block(yo_history[i].tool_use_id,

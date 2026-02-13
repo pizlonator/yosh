@@ -65,6 +65,7 @@
 #define YO_DEFAULT_TOKEN_BUDGET 4096
 #define YO_API_TIMEOUT 30L
 #define YO_MAX_TOKENS 1024
+#define YO_DEFAULT_OPENAI_MODEL "gpt-4o-mini"
 
 /* Default color: red italics */
 #define YO_DEFAULT_CHAT_COLOR "\033[3;36m"
@@ -88,6 +89,11 @@ typedef enum {
     YO_RESPONSE_ERROR
 } yo_response_type_t;
 
+typedef enum {
+    YO_PROVIDER_ANTHROPIC,
+    YO_PROVIDER_OPENAI
+} yo_provider_t;
+
 typedef struct {
     yo_response_type_t type;
     char *content;        /* command string, chat text, scrollback lines count, etc. */
@@ -104,7 +110,7 @@ typedef struct {
     char *query;                   /* "yo find python files" */
     yo_response_type_t response_type;  /* YO_RESPONSE_COMMAND, YO_RESPONSE_CHAT, etc. */
     char *response;                /* the command or chat text */
-    char *tool_use_id;             /* tool_use.id from Claude's response */
+    char *tool_use_id;             /* tool_use.id from LLM response */
     int executed;                  /* 1 if user ran it, 0 if not */
     int pending;                   /* 1 if response had "pending":true (multi-step) */
 } yo_exchange_t;
@@ -126,6 +132,8 @@ static char *yo_system_prompt = NULL;
 static const char *yo_name = NULL;
 static const char *yo_documentation = NULL;
 static int yo_server_web_enabled = 1;
+static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
+static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -182,12 +190,19 @@ static int yo_is_pump = 0;
 /* **************************************************************** */
 
 static void yo_reload_config(void);
-static char *yo_load_api_key(void);
-static cJSON *yo_call_claude(const char *api_key, const char *query);
-static cJSON *yo_call_claude_with_scrollback(const char *api_key, const char *query,
+static char *yo_load_config(void);
+static cJSON *yo_build_tools_openai(void);
+static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
+                                const char *tool_name, cJSON *input);
+static void yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
+                                   const char *result_content);
+static cJSON *yo_build_history_tool_input(int idx);
+static const char *yo_response_type_to_string(yo_response_type_t type);
+static cJSON *yo_call_api(const char *api_key, const char *query);
+static cJSON *yo_call_api_with_scrollback(const char *api_key, const char *query,
                                              const char *scrollback_request, const char *scrollback_data,
                                              const char *scrollback_tool_id);
-static cJSON *yo_call_claude_with_docs(const char *api_key, const char *query, const char *docs_request,
+static cJSON *yo_call_api_with_docs(const char *api_key, const char *query, const char *docs_request,
                                        const char *docs_tool_id);
 static int yo_parse_response(cJSON *tool_use, yo_response_t *resp);
 static void yo_display_chat(const char *response);
@@ -342,7 +357,7 @@ yo_reload_config(void)
 {
     const char *env_val;
 
-    /* Reload model setting */
+    /* Reload model setting: YO_MODEL env > config file model > provider default */
     if (yo_model)
     {
         free(yo_model);
@@ -352,6 +367,14 @@ yo_reload_config(void)
     if (env_val && *env_val)
     {
         yo_model = strdup(env_val);
+    }
+    else if (yo_config_model)
+    {
+        yo_model = strdup(yo_config_model);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        yo_model = strdup(YO_DEFAULT_OPENAI_MODEL);
     }
     else
     {
@@ -1183,7 +1206,7 @@ yo_handle_requests(const char *api_key, const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_claude_with_scrollback(api_key, query,
+            new_tool_use = yo_call_api_with_scrollback(api_key, query,
                                                           saved_content, scrollback_data, saved_tool_id);
             free(saved_tool_id);
             free(saved_content);
@@ -1222,7 +1245,7 @@ yo_handle_requests(const char *api_key, const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_claude_with_docs(api_key, query, "", saved_tool_id);
+            new_tool_use = yo_call_api_with_docs(api_key, query, "", saved_tool_id);
             free(saved_tool_id);
 
             if (!new_tool_use)
@@ -1308,8 +1331,7 @@ yo_handle_explanation_retry(const char *api_key, const char *query,
 /*                                                                  */
 /* **************************************************************** */
 
-/* Encapsulates the full call chain: yo_call_claude → yo_parse_response →
-   yo_handle_requests → yo_handle_explanation_retry.
+/* Encapsulates the full LLM call chain: API call → parse → handle requests → retry.
    Returns 1 on success (resp filled in), 0 on error/cancellation (resp zeroed).
    Flags:
      YO_LLM_RETRY_EXPLANATION            — always retry if explanation missing
@@ -1321,8 +1343,8 @@ yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *re
 
     memset(resp, 0, sizeof(*resp));
 
-    /* Step 1: Call Claude API */
-    tool_use = yo_call_claude(api_key, query);
+    /* Step 1: Call LLM API */
+    tool_use = yo_call_api(api_key, query);
     if (!tool_use)
         return 0;  /* Error/cancellation already printed */
 
@@ -1366,7 +1388,7 @@ yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *re
 }
 
 /* One-shot rl_startup_hook that fires on the next readline() call after
-   the user executes a pending command.  Grabs scrollback, calls Claude
+   the user executes a pending command.  Grabs scrollback, calls the LLM
    with a synthetic [continuation] query, and prefills the next command
    (or displays a chat response). */
 static int
@@ -1387,16 +1409,16 @@ yo_continuation_hook(void)
     if (!yo_continuation_active)
         return 0;
 
-    yo_print_thinking();
-
-    /* Load API key */
-    api_key = yo_load_api_key();
+    /* Load config and API key */
+    api_key = yo_load_config();
     if (!api_key)
     {
-        yo_clear_thinking();
         yo_continuation_active = 0;
         return 0;
     }
+    yo_reload_config();
+
+    yo_print_thinking();
 
     /* Grab scrollback (limit to 200 lines for continuation) */
     scrollback = rl_yo_get_scrollback(200);
@@ -1549,6 +1571,14 @@ rl_yo_accept_line(int count, int key)
 
     /* It's a yo command - process it */
 
+    /* Save the query for potential follow-up calls */
+    saved_query = strdup(rl_line_buffer);
+
+    /* Add the yo command itself to shell history, then reset history state
+       so UP arrow finds this entry and any saved line state is cleared. */
+    add_history(saved_query);
+    _rl_start_using_history();
+
     /* Handle "yo reset" — clear LLM context without calling the API */
     if (strcmp(rl_line_buffer, "yo reset") == 0)
     {
@@ -1565,28 +1595,19 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    /* Reload config from environment (allows mid-session changes) */
-    yo_reload_config();
-
-    /* Save the query for potential follow-up calls */
-    saved_query = strdup(rl_line_buffer);
-
-    /* Add the yo command itself to shell history, then reset history state
-       so UP arrow finds this entry and any saved line state is cleared. */
-    add_history(saved_query);
-    _rl_start_using_history();
-
-    /* Load API key fresh each time */
-    api_key = yo_load_api_key();
+    /* Load config file fresh each time (sets provider, config_model, returns key) */
+    api_key = yo_load_config();
     if (!api_key)
     {
-        /* Error already printed by yo_load_api_key */
+        /* Error already printed by yo_load_config */
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
-        free(saved_query);
         return 0;
     }
+
+    /* Reload env overrides (uses yo_provider and yo_config_model from above) */
+    yo_reload_config();
 
     /* Show thinking indicator after a newline */
     fprintf(rl_outstream, "\n");
@@ -1663,7 +1684,7 @@ rl_yo_accept_line(int count, int key)
     }
     else
     {
-        yo_print_error("Unknown response type from Claude (full tool use response: %s)",
+        yo_print_error("Unknown response type from LLM (full tool use response: %s)",
                        resp.raw_tool_use ? cJSON_PrintUnformatted(resp.raw_tool_use) : "(null)");
     }
 
@@ -1675,20 +1696,38 @@ rl_yo_accept_line(int count, int key)
 
 /* **************************************************************** */
 /*                                                                  */
-/*                    API Key Management                            */
+/*                    Configuration Loading                         */
 /*                                                                  */
 /* **************************************************************** */
 
+/* Trim leading and trailing whitespace in place.  Returns pointer into
+   the same buffer (may be advanced past leading whitespace). */
 static char *
-yo_load_api_key(void)
+yo_trim(char *s)
+{
+    char *end;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+
+    end = s + strlen(s);
+    while (end > s && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+        end--;
+    *end = '\0';
+
+    return s;
+}
+
+/* Load configuration from ~/.yoconf (preferred) or ~/.yoshkey (legacy fallback).
+   Sets yo_provider and yo_config_model as side effects.
+   Returns malloc'd API key string on success, NULL on error (error already printed). */
+static char *
+yo_load_config(void)
 {
     char *home;
     char path[1024];
     struct stat st;
     FILE *fp;
-    char *key;
-    size_t len;
-    char *end;
 
     /* Get home directory */
     home = getenv("HOME");
@@ -1705,23 +1744,165 @@ yo_load_api_key(void)
         return NULL;
     }
 
+    /* Try ~/.yoconf first */
+    snprintf(path, sizeof(path), "%s/.yoconf", home);
+
+    if (stat(path, &st) == 0)
+    {
+        /* ~/.yoconf exists - parse it */
+        char line[1024];
+        char *parsed_provider = NULL;
+        char *parsed_model = NULL;
+        char *parsed_key = NULL;
+        int line_num = 0;
+        int had_error = 0;
+
+        if ((st.st_mode & 0777) != 0600)
+        {
+            yo_print_error("~/.yoconf must have mode 0600 (current: %04o)", st.st_mode & 0777);
+            return NULL;
+        }
+
+        fp = fopen(path, "r");
+        if (!fp)
+        {
+            yo_print_error("Cannot read ~/.yoconf: %s", strerror(errno));
+            return NULL;
+        }
+
+        while (fgets(line, sizeof(line), fp))
+        {
+            char *trimmed, *directive, *value;
+
+            line_num++;
+            trimmed = yo_trim(line);
+
+            /* Skip empty lines and comments */
+            if (*trimmed == '\0' || *trimmed == '#')
+                continue;
+
+            /* Split into directive and value at first whitespace */
+            directive = trimmed;
+            value = trimmed;
+            while (*value && *value != ' ' && *value != '\t')
+                value++;
+
+            if (*value)
+            {
+                *value = '\0';
+                value++;
+                value = yo_trim(value);
+            }
+
+            if (strcmp(directive, "provider") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error("~/.yoconf:%d: 'provider' requires a value (anthropic or openai)", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (parsed_provider) free(parsed_provider);
+                parsed_provider = strdup(value);
+            }
+            else if (strcmp(directive, "model") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error("~/.yoconf:%d: 'model' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (parsed_model) free(parsed_model);
+                parsed_model = strdup(value);
+            }
+            else if (strcmp(directive, "key") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error("~/.yoconf:%d: 'key' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (parsed_key) free(parsed_key);
+                parsed_key = strdup(value);
+            }
+            else
+            {
+                yo_print_error("~/.yoconf:%d: unknown directive '%s'", line_num, directive);
+                had_error = 1;
+                break;
+            }
+        }
+
+        fclose(fp);
+
+        if (had_error)
+        {
+            if (parsed_provider) free(parsed_provider);
+            if (parsed_model) free(parsed_model);
+            if (parsed_key) free(parsed_key);
+            return NULL;
+        }
+
+        if (!parsed_key)
+        {
+            yo_print_error("~/.yoconf: missing 'key' directive");
+            if (parsed_provider) free(parsed_provider);
+            if (parsed_model) free(parsed_model);
+            return NULL;
+        }
+
+        /* Apply provider */
+        if (parsed_provider)
+        {
+            if (strcmp(parsed_provider, "anthropic") == 0)
+                yo_provider = YO_PROVIDER_ANTHROPIC;
+            else if (strcmp(parsed_provider, "openai") == 0)
+                yo_provider = YO_PROVIDER_OPENAI;
+            else
+            {
+                yo_print_error("~/.yoconf: unknown provider '%s' (expected 'anthropic' or 'openai')",
+                               parsed_provider);
+                free(parsed_provider);
+                if (parsed_model) free(parsed_model);
+                free(parsed_key);
+                return NULL;
+            }
+            free(parsed_provider);
+        }
+        else
+        {
+            yo_provider = YO_PROVIDER_ANTHROPIC;
+        }
+
+        /* Apply model from config */
+        if (yo_config_model)
+        {
+            free(yo_config_model);
+            yo_config_model = NULL;
+        }
+        yo_config_model = parsed_model;  /* may be NULL, that's fine */
+
+        return parsed_key;
+    }
+
+    /* Fall back to ~/.yoshkey (deprecated) */
     snprintf(path, sizeof(path), "%s/.yoshkey", home);
 
-    /* Check if file exists */
     if (stat(path, &st) != 0)
     {
-        yo_print_error("Create ~/.yoshkey with your Anthropic API key (mode 0600)");
+        yo_print_error("Create ~/.yoconf with your API key (mode 0600). "
+                       "See 'yo how do I configure yosh' for details.");
         return NULL;
     }
 
-    /* Check permissions - must be 0600 */
     if ((st.st_mode & 0777) != 0600)
     {
         yo_print_error("~/.yoshkey must have mode 0600 (current: %04o)", st.st_mode & 0777);
         return NULL;
     }
 
-    /* Read the key */
     fp = fopen(path, "r");
     if (!fp)
     {
@@ -1729,46 +1910,55 @@ yo_load_api_key(void)
         return NULL;
     }
 
-    key = malloc(256);
-
-    if (!fgets(key, 256, fp))
     {
+        char *key = malloc(256);
+        size_t len;
+        char *end;
+
+        if (!fgets(key, 256, fp))
+        {
+            fclose(fp);
+            free(key);
+            yo_print_error("~/.yoshkey is empty");
+            return NULL;
+        }
+
         fclose(fp);
-        free(key);
-        yo_print_error("~/.yoshkey is empty");
-        return NULL;
+
+        /* Trim whitespace */
+        len = strlen(key);
+        while (len > 0 && (key[len-1] == '\n' || key[len-1] == '\r' || key[len-1] == ' ' || key[len-1] == '\t'))
+            key[--len] = '\0';
+
+        end = key;
+        while (*end == ' ' || *end == '\t')
+            end++;
+
+        if (end != key)
+            memmove(key, end, strlen(end) + 1);
+
+        if (strlen(key) == 0)
+        {
+            free(key);
+            yo_print_error("~/.yoshkey is empty");
+            return NULL;
+        }
+
+        /* Legacy file is always Anthropic */
+        yo_provider = YO_PROVIDER_ANTHROPIC;
+        if (yo_config_model)
+        {
+            free(yo_config_model);
+            yo_config_model = NULL;
+        }
+
+        return key;
     }
-
-    fclose(fp);
-
-    /* Trim whitespace */
-    len = strlen(key);
-    while (len > 0 && (key[len-1] == '\n' || key[len-1] == '\r' || key[len-1] == ' ' || key[len-1] == '\t'))
-    {
-        key[--len] = '\0';
-    }
-
-    /* Trim leading whitespace */
-    end = key;
-    while (*end == ' ' || *end == '\t')
-        end++;
-
-    if (end != key)
-        memmove(key, end, strlen(end) + 1);
-
-    if (strlen(key) == 0)
-    {
-        free(key);
-        yo_print_error("~/.yoshkey is empty");
-        return NULL;
-    }
-
-    return key;
 }
 
 /* **************************************************************** */
 /*                                                                  */
-/*                      Claude API Call                             */
+/*                       LLM API Call                               */
 /*                                                                  */
 /* **************************************************************** */
 
@@ -1865,6 +2055,8 @@ yo_build_tools(void)
     cJSON_AddStringToObject(schema, "type", "object");
     props = cJSON_CreateObject();
     cJSON_AddItemToObject(schema, "properties", props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToObject(schema, "required", required);
     cJSON_AddItemToObject(tool, "input_schema", schema);
     cJSON_AddItemToArray(tools, tool);
 
@@ -1887,46 +2079,100 @@ yo_build_tools(void)
     return tools;
 }
 
-/* Forward declaration for retry logic */
-static cJSON *yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int is_retry);
-
-/* Internal function to call Claude API with pre-built messages array.
-   The messages array is consumed (added to request JSON and freed).
-   Returns the tool_use cJSON object (caller must free with cJSON_Delete). */
+/* Build tools array in OpenAI function-calling format.
+   Converts from Anthropic tool format, skipping Anthropic-specific server tools. */
 static cJSON *
-yo_call_claude_with_messages(const char *api_key, cJSON *messages)
+yo_build_tools_openai(void)
 {
-    return yo_call_claude_with_messages_internal(api_key, messages, 0);
+    cJSON *anthropic_tools = yo_build_tools();
+    cJSON *openai_tools = cJSON_CreateArray();
+    cJSON *item;
+
+    cJSON_ArrayForEach(item, anthropic_tools)
+    {
+        cJSON *type_item = cJSON_GetObjectItem(item, "type");
+        cJSON *name_item = cJSON_GetObjectItem(item, "name");
+        cJSON *desc_item = cJSON_GetObjectItem(item, "description");
+        cJSON *schema_item = cJSON_GetObjectItem(item, "input_schema");
+
+        /* Skip Anthropic-specific server tools (web_search, web_fetch) */
+        if (type_item && cJSON_IsString(type_item)
+            && (strcmp(type_item->valuestring, "web_search_20250305") == 0
+                || strcmp(type_item->valuestring, "web_fetch_20250910") == 0))
+            continue;
+
+        {
+            /* Responses API: flat tool format (no function wrapper) */
+            cJSON *tool = cJSON_CreateObject();
+
+            cJSON_AddStringToObject(tool, "type", "function");
+
+            if (name_item && cJSON_IsString(name_item))
+                cJSON_AddStringToObject(tool, "name", name_item->valuestring);
+            if (desc_item && cJSON_IsString(desc_item))
+                cJSON_AddStringToObject(tool, "description", desc_item->valuestring);
+            if (schema_item)
+            {
+                cJSON *params = cJSON_Duplicate(schema_item, 1);
+                /* OpenAI strict mode requires additionalProperties: false */
+                cJSON_AddFalseToObject(params, "additionalProperties");
+                /* For the command tool, make pending required so the model
+                   always explicitly decides whether to continue */
+                if (name_item && cJSON_IsString(name_item)
+                    && strcmp(name_item->valuestring, "command") == 0)
+                {
+                    cJSON *req = cJSON_GetObjectItem(params, "required");
+                    if (req && cJSON_IsArray(req))
+                        cJSON_AddItemToArray(req, cJSON_CreateString("pending"));
+                }
+                cJSON_AddItemToObject(tool, "parameters", params);
+            }
+            cJSON_AddTrueToObject(tool, "strict");
+
+            cJSON_AddItemToArray(openai_tools, tool);
+        }
+    }
+
+    /* Add web_search tool when server-side web is enabled */
+    if (yo_server_web_enabled)
+    {
+        cJSON *ws = cJSON_CreateObject();
+        cJSON_AddStringToObject(ws, "type", "web_search");
+        cJSON_AddItemToArray(openai_tools, ws);
+    }
+
+    cJSON_Delete(anthropic_tools);
+    return openai_tools;
 }
 
-static cJSON *
-yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int is_retry)
+/* **************************************************************** */
+/*                                                                  */
+/*                  Shared HTTP Infrastructure                      */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Make an HTTP POST request with curl multi-handle and Ctrl-C cancellation.
+   Returns malloc'd response body on success, NULL on error/cancel.
+   The caller owns the returned string and must free it.
+   On error, an error message is already printed.
+   The headers list is freed by this function. */
+static char *
+yo_http_post(const char *url, struct curl_slist *headers,
+             const char *body, long timeout)
 {
     CURL *curl;
     CURLM *multi;
-    struct curl_slist *headers = NULL;
     yo_response_buffer_t response_buf = {0};
-    cJSON *request_json = NULL;
-    cJSON *tools = NULL;
-    cJSON *tool_choice = NULL;
-    char *request_body = NULL;
-    char auth_header[300];
-    cJSON *result = NULL;
-    cJSON *response_json = NULL;
-    cJSON *content_array = NULL;
-    cJSON *content_item = NULL;
-    cJSON *type_item = NULL;
     struct sigaction sa, old_sa;
     int still_running = 1;
     int cancelled = 0;
-    int i, content_count;
 
     /* Initialize self-pipe for Ctrl-C handling */
     if (yo_init_sigint_pipe() < 0)
     {
         yo_clear_thinking();
         yo_print_error_no_newline("Failed to initialize signal handling: %s", strerror(errno));
-        cJSON_Delete(messages);
+        curl_slist_free_all(headers);
         return NULL;
     }
 
@@ -1938,7 +2184,7 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     {
         yo_clear_thinking();
         yo_print_error_no_newline("Failed to initialize HTTP client (curl_easy_init returned NULL)");
-        cJSON_Delete(messages);
+        curl_slist_free_all(headers);
         return NULL;
     }
 
@@ -1948,36 +2194,212 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
         curl_easy_cleanup(curl);
         yo_clear_thinking();
         yo_print_error_no_newline("Failed to initialize HTTP client (curl_multi_init returned NULL)");
-        cJSON_Delete(messages);
+        curl_slist_free_all(headers);
         return NULL;
     }
+
+    /* Configure CURL easy handle */
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, yo_curl_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+
+    /* Add easy handle to multi handle */
+    curl_multi_add_handle(multi, curl);
+
+    /* Install our SIGINT handler for the duration of the request */
+    sa.sa_handler = yo_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, &old_sa);
+
+    /* Multi interface loop with curl_multi_poll() */
+    {
+        CURLMcode mc;
+        bool had_curl_error = false;
+        while (still_running && !cancelled)
+        {
+            int numfds;
+            struct curl_waitfd extra_fd;
+
+            /* Let curl do any immediate work */
+            mc = curl_multi_perform(multi, &still_running);
+            if (mc != CURLM_OK)
+            {
+                had_curl_error = true;
+                break;
+            }
+
+            if (!still_running)
+                break;
+
+            /* Set up our signal pipe as an extra fd to poll */
+            extra_fd.fd = yo_sigint_pipe[0];
+            extra_fd.events = CURL_WAIT_POLLIN;
+            extra_fd.revents = 0;
+
+            /* Wait for activity on curl sockets or our signal pipe */
+            mc = curl_multi_poll(multi, &extra_fd, 1, 1000, &numfds);
+            if (mc != CURLM_OK)
+            {
+                had_curl_error = true;
+                break;
+            }
+
+            /* Check if signal pipe has data (SIGINT was received) */
+            if (extra_fd.revents & CURL_WAIT_POLLIN)
+            {
+                cancelled = 1;
+                break;
+            }
+
+            /* Also check the flag in case signal arrived but poll didn't catch it */
+            if (yo_cancelled)
+            {
+                cancelled = 1;
+                break;
+            }
+        }
+
+        /* Restore original SIGINT handler */
+        sigaction(SIGINT, &old_sa, NULL);
+
+        if (had_curl_error)
+        {
+            yo_clear_thinking();
+            yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
+            goto http_error;
+        }
+    }
+
+    /* Handle cancellation */
+    if (cancelled)
+    {
+        yo_clear_thinking();
+        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fflush(rl_outstream);
+        goto http_error;
+    }
+
+    {
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(multi, &msgs_left)))
+        {
+            if (msg->msg == CURLMSG_DONE)
+            {
+                CURL *easy = msg->easy_handle;
+                ZASSERT(easy == curl);
+                CURLcode result = msg->data.result;
+
+                if (result != CURLE_OK)
+                {
+                    yo_clear_thinking();
+                    yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
+                    goto http_error;
+                }
+
+                {
+                    long http_code = 0;
+                    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+                    if (http_code == 200)
+                        break;
+
+                    yo_clear_thinking();
+                    if (response_buf.data) {
+                        yo_print_error_no_newline(
+                            "Unexpected HTTP status code: %ld; full response: %s",
+                            http_code, response_buf.data);
+                    } else
+                        yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
+                    goto http_error;
+                }
+            }
+        }
+    }
+
+    /* Clean up curl handles */
+    curl_multi_remove_handle(multi, curl);
+    curl_multi_cleanup(multi);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (!response_buf.data)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("No response from API");
+        return NULL;
+    }
+
+    return response_buf.data;
+
+http_error:
+    if (response_buf.data)
+        free(response_buf.data);
+    curl_multi_remove_handle(multi, curl);
+    curl_multi_cleanup(multi);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return NULL;
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*              Anthropic: Request Building & Response Parsing       */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Build Anthropic request body, URL, and headers from provider-native messages.
+   Returns malloc'd request body string.  Sets *url_out and *headers_out.
+   Caller must free the request body and the headers (via curl_slist_free_all). */
+static char *
+yo_build_anthropic_request(const char *api_key, cJSON *messages,
+                           const char **url_out, struct curl_slist **headers_out,
+                           long *timeout_out)
+{
+    cJSON *request_json;
+    cJSON *tools;
+    cJSON *tool_choice;
+    char *request_body;
+    char auth_header[300];
+    struct curl_slist *headers = NULL;
+    int web_enabled = yo_server_web_enabled;
 
     /* Build tools array */
     tools = yo_build_tools();
 
     /* Build request JSON */
     request_json = cJSON_CreateObject();
-
     cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_MODEL);
-    cJSON_AddNumberToObject(request_json, "max_tokens", yo_server_web_enabled ? 4096 : YO_MAX_TOKENS);
-    if (yo_server_web_enabled)
+    cJSON_AddNumberToObject(request_json, "max_tokens", web_enabled ? 4096 : YO_MAX_TOKENS);
+
     {
-        char *full_prompt;
-        asprintf(&full_prompt, "%s\n\n"
-            "When you need up-to-date information from the internet (current events, latest docs,\n"
-            "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
-            "These run automatically when you use them - just search or fetch as needed before\n"
-            "choosing your final response tool (command or chat).\n"
-            "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
-            "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
-            "inline citations or reference markers - the user does not need source attribution.",
-            yo_system_prompt);
-        cJSON_AddStringToObject(request_json, "system", full_prompt);
-        free(full_prompt);
-    }
-    else
-    {
-        cJSON_AddStringToObject(request_json, "system", yo_system_prompt);
+        char *base_prompt;
+        asprintf(&base_prompt, "You are powered by %s (provider: anthropic).\n\n%s",
+                 yo_model ? yo_model : YO_DEFAULT_MODEL, yo_system_prompt);
+
+        if (web_enabled)
+        {
+            char *full_prompt;
+            asprintf(&full_prompt, "%s\n\n"
+                "When you need up-to-date information from the internet (current events, latest docs,\n"
+                "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
+                "These run automatically when you use them - just search or fetch as needed before\n"
+                "choosing your final response tool (command or chat).\n"
+                "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
+                "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
+                "inline citations or reference markers - the user does not need source attribution.",
+                base_prompt);
+            cJSON_AddStringToObject(request_json, "system", full_prompt);
+            free(full_prompt);
+        }
+        else
+        {
+            cJSON_AddStringToObject(request_json, "system", base_prompt);
+        }
+        free(base_prompt);
     }
 
     /* Add messages array to request (takes ownership) */
@@ -1999,140 +2421,38 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
-    if (yo_server_web_enabled)
+    if (web_enabled)
         headers = curl_slist_append(headers, "anthropic-beta: web-fetch-2025-09-10");
 
-    /* Configure CURL easy handle */
-    curl_easy_setopt(curl, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, yo_curl_write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, yo_server_web_enabled ? 120L : YO_API_TIMEOUT);
+    *url_out = "https://api.anthropic.com/v1/messages";
+    *headers_out = headers;
+    *timeout_out = web_enabled ? 120L : YO_API_TIMEOUT;
 
-    /* Add easy handle to multi handle */
-    curl_multi_add_handle(multi, curl);
+    return request_body;
+}
 
-    /* Install our SIGINT handler for the duration of the request */
-    sa.sa_handler = yo_sigint_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, &old_sa);
+/* Parse Anthropic API response → normalized tool_use cJSON.
+   If is_retry is set and there are multiple tool_use blocks, takes the first.
+   Otherwise for multiple tool_use blocks, returns NULL and sets *needs_retry=1
+   with the content array duplicated into *retry_content_out.
+   Caller must free the returned cJSON with cJSON_Delete. */
+static cJSON *
+yo_parse_anthropic_response(const char *response_data, int is_retry,
+                            int *needs_retry, cJSON **retry_content_out)
+{
+    cJSON *response_json;
+    cJSON *content_array;
+    cJSON *result = NULL;
+    int i, content_count;
 
-    /* Multi interface loop with curl_multi_poll() */
-    CURLMcode mc;
-    bool had_curl_error = false;
-    while (still_running && !cancelled)
-    {
-        int numfds;
-        struct curl_waitfd extra_fd;
+    *needs_retry = 0;
+    *retry_content_out = NULL;
 
-        /* Let curl do any immediate work */
-        mc = curl_multi_perform(multi, &still_running);
-        if (mc != CURLM_OK)
-        {
-            had_curl_error = true;
-            break;
-        }
-
-        if (!still_running)
-            break;
-
-        /* Set up our signal pipe as an extra fd to poll */
-        extra_fd.fd = yo_sigint_pipe[0];
-        extra_fd.events = CURL_WAIT_POLLIN;
-        extra_fd.revents = 0;
-
-        /* Wait for activity on curl sockets or our signal pipe */
-        mc = curl_multi_poll(multi, &extra_fd, 1, 1000, &numfds);
-        if (mc != CURLM_OK)
-        {
-            had_curl_error = true;
-            break;
-        }
-
-        /* Check if signal pipe has data (SIGINT was received) */
-        if (extra_fd.revents & CURL_WAIT_POLLIN)
-        {
-            cancelled = 1;
-            break;
-        }
-
-        /* Also check the flag in case signal arrived but poll didn't catch it */
-        if (yo_cancelled)
-        {
-            cancelled = 1;
-            break;
-        }
-    }
-
-    /* Restore original SIGINT handler */
-    sigaction(SIGINT, &old_sa, NULL);
-
-    if (had_curl_error)
-    {
-        yo_clear_thinking();
-        yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
-        goto curl_error;
-    }
-
-    /* Handle cancellation */
-    if (cancelled)
-    {
-        yo_clear_thinking();
-        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
-        fflush(rl_outstream);
-        goto curl_error;
-    }
-
-    CURLMsg *msg;
-    int msgs_left;
-    while ((msg = curl_multi_info_read(multi, &msgs_left))) {
-        if (msg->msg == CURLMSG_DONE) {
-            CURL *easy = msg->easy_handle;
-            ZASSERT(easy == curl);
-            CURLcode result = msg->data.result;
-            
-            if (result != CURLE_OK) {
-                yo_clear_thinking();
-                yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
-                goto curl_error;
-            }
-            
-            // Even if result == CURLE_OK, check the HTTP status code
-            long http_code = 0;
-            curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
-            if (http_code == 200)
-                break;
-
-            yo_clear_thinking();
-            yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
-            goto curl_error;
-        }
-    }
-
-    /* Clean up curl handles */
-    curl_multi_remove_handle(multi, curl);
-    curl_multi_cleanup(multi);
-    curl_slist_free_all(headers);
-    free(request_body);
-    curl_easy_cleanup(curl);
-
-    if (!response_buf.data)
-    {
-        yo_clear_thinking();
-        yo_print_error_no_newline("No response from API");
-        return NULL;
-    }
-
-    /* Parse API response */
-    response_json = cJSON_Parse(response_buf.data);
-    free(response_buf.data);
-
+    response_json = cJSON_Parse(response_data);
     if (!response_json)
     {
         yo_clear_thinking();
-        yo_print_error_no_newline("Failed to parse API response: %s", response_buf.data);
+        yo_print_error_no_newline("Failed to parse API response");
         return NULL;
     }
 
@@ -2154,13 +2474,12 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
             }
             else
             {
-                yo_print_error_no_newline("API returned an error");
+                yo_print_error_no_newline("API returned an error: %s", response_data);
             }
         }
         else
         {
-            yo_print_error_no_newline("Unexpected API response format: %s",
-                                      cJSON_PrintUnformatted(response_json));
+            yo_print_error_no_newline("Unexpected API response format: %s", response_data);
         }
         cJSON_Delete(response_json);
         return NULL;
@@ -2176,7 +2495,8 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
 
         for (i = 0; i < content_count; i++)
         {
-            content_item = cJSON_GetArrayItem(content_array, i);
+            cJSON *content_item = cJSON_GetArrayItem(content_array, i);
+            cJSON *type_item;
             if (!content_item)
                 continue;
 
@@ -2221,75 +2541,378 @@ yo_call_claude_with_messages_internal(const char *api_key, cJSON *messages, int 
             cJSON_Delete(response_json);
             return result;
         }
-        else if (tool_use_count == 1)
+        else if (tool_use_count == 1 || is_retry)
         {
-            /* Exactly one tool_use - return it */
-            result = cJSON_DetachItemFromArray(content_array, first_tool_use_idx);
-            cJSON_Delete(response_json);
-            return result;
-        }
-        else if (is_retry)
-        {
-            /* Multiple tool_use blocks on retry - just take the first one */
             result = cJSON_DetachItemFromArray(content_array, first_tool_use_idx);
             cJSON_Delete(response_json);
             return result;
         }
         else
         {
-            /* Multiple tool_use blocks - ask Claude to pick exactly one */
+            /* Multiple tool_use blocks - signal caller to retry */
+            *needs_retry = 1;
+            *retry_content_out = cJSON_Duplicate(content_array, 1);
+            cJSON_Delete(response_json);
+            return NULL;
+        }
+    }
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*               OpenAI: Request Building & Response Parsing        */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Build OpenAI request body, URL, and headers from provider-native messages.
+   The system prompt is prepended as a system message.
+   Returns malloc'd request body string.  Sets *url_out and *headers_out.
+   Caller must free the request body and the headers. */
+static char *
+yo_build_openai_request(const char *api_key, cJSON *messages,
+                        const char **url_out, struct curl_slist **headers_out,
+                        long *timeout_out)
+{
+    cJSON *request_json;
+    cJSON *tools;
+    char *request_body;
+    char auth_header[300];
+    struct curl_slist *headers = NULL;
+    char *openai_prompt;
+    int max_tokens = YO_MAX_TOKENS;
+
+    /* Build tools array in OpenAI Responses API format */
+    tools = yo_build_tools_openai();
+
+    /* Build system instructions.
+       Append additional guidance to strongly bias toward command responses,
+       since OpenAI models tend to over-use chat for things a shell assistant
+       should answer with commands. */
+    asprintf(&openai_prompt,
+        "You are powered by %s (provider: openai).\n\n"
+        "%s\n\n"
+        "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+        "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+        "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+        "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+        "If the user's question can be answered by running a command on this system\n"
+        "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+        "Examples that MUST use command, not chat:\n"
+        "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+        "- 'what version of gcc do I have' -> command: gcc --version\n"
+        "- 'how much disk space is left' -> command: df -h\n"
+        "- 'what ports are open' -> command: ss -tlnp\n"
+        "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+        "\n"
+        "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+        "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+        "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+        "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+        "(except the last step, which should have pending=false).\n"
+        "Examples that MUST use pending=true (one command at a time):\n"
+        "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+        "  then after seeing output: echo world (pending=false)\n"
+        "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+        "  then after seeing it succeed: configure command (pending=false)\n"
+        "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+        "  (pending=true), then decide based on output"
+        "%s",
+        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt,
+        yo_server_web_enabled
+            ? "\n\nYou have web search available. When you find the answer to the user's question "
+              "via web search (weather, news, sports scores, prices, current events, etc.), "
+              "relay the information directly using chat. Do NOT suggest a curl/wget command "
+              "when you already have the answer from web search.\n"
+              "When citing web sources, use plain text references only. Do not use HTML tags "
+              "or markdown link syntax in citations."
+            : "");
+
+    /* When web search is enabled, bump max tokens to accommodate citations */
+    if (yo_server_web_enabled)
+        max_tokens = 4096;
+
+    /* Build Responses API request JSON */
+    request_json = cJSON_CreateObject();
+    cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL);
+    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
+
+    /* System prompt goes in top-level "instructions" field */
+    cJSON_AddStringToObject(request_json, "instructions", openai_prompt);
+    free(openai_prompt);
+
+    /* Add input array (conversation messages — takes ownership) */
+    cJSON_AddItemToObject(request_json, "input", messages);
+
+    /* Add tools array (takes ownership) */
+    cJSON_AddItemToObject(request_json, "tools", tools);
+
+    /* Force tool use */
+    cJSON_AddStringToObject(request_json, "tool_choice", "required");
+
+    /* Privacy: don't store responses */
+    cJSON_AddFalseToObject(request_json, "store");
+
+    request_body = cJSON_PrintUnformatted(request_json);
+    cJSON_Delete(request_json);
+
+    /* Set up headers */
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
+    headers = curl_slist_append(headers, auth_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    *url_out = "https://api.openai.com/v1/responses";
+    *headers_out = headers;
+    *timeout_out = YO_API_TIMEOUT;
+
+    return request_body;
+}
+
+/* Parse OpenAI Responses API output → normalized tool_use cJSON.
+   Extracts function_call items from the output[] array.
+   Falls back to message items for text content.
+   Caller must free the returned cJSON with cJSON_Delete. */
+static cJSON *
+yo_parse_openai_response(const char *response_data)
+{
+    cJSON *response_json;
+    cJSON *output_array;
+    cJSON *result = NULL;
+
+    response_json = cJSON_Parse(response_data);
+    if (!response_json)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Failed to parse API response");
+        return NULL;
+    }
+
+    /* Check for error response */
+    {
+        cJSON *error = cJSON_GetObjectItem(response_json, "error");
+        if (error && !cJSON_IsNull(error))
+        {
+            cJSON *msg = cJSON_GetObjectItem(error, "message");
+            yo_clear_thinking();
+            if (msg && cJSON_IsString(msg))
+            {
+                fprintf(rl_outstream, "%sAPI error: %s%s\n",
+                        yo_get_chat_color(), msg->valuestring, YO_COLOR_RESET);
+                fflush(rl_outstream);
+            }
+            else
+            {
+                yo_print_error_no_newline("API returned an error: %s", response_data);
+            }
+            cJSON_Delete(response_json);
+            return NULL;
+        }
+    }
+
+    /* Extract output[] array */
+    output_array = cJSON_GetObjectItem(response_json, "output");
+    if (!output_array || !cJSON_IsArray(output_array) || cJSON_GetArraySize(output_array) == 0)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Unexpected API response format: %s",
+                                  cJSON_PrintUnformatted(response_json));
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    /* Find first function_call item in the output array */
+    {
+        cJSON *item;
+        cJSON_ArrayForEach(item, output_array)
+        {
+            cJSON *type_item = cJSON_GetObjectItem(item, "type");
+            if (type_item && cJSON_IsString(type_item)
+                && strcmp(type_item->valuestring, "function_call") == 0)
+            {
+                cJSON *call_id = cJSON_GetObjectItem(item, "call_id");
+                cJSON *name = cJSON_GetObjectItem(item, "name");
+                cJSON *arguments = cJSON_GetObjectItem(item, "arguments");
+                cJSON *input;
+
+                result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "type", "tool_use");
+                cJSON_AddStringToObject(result, "id",
+                    (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "openai_call");
+                cJSON_AddStringToObject(result, "name",
+                    (name && cJSON_IsString(name)) ? name->valuestring : "chat");
+
+                /* Parse arguments JSON string into an object */
+                input = (arguments && cJSON_IsString(arguments))
+                    ? cJSON_Parse(arguments->valuestring) : NULL;
+                if (!input)
+                    input = cJSON_CreateObject();
+                cJSON_AddItemToObject(result, "input", input);
+                break;
+            }
+        }
+    }
+
+    if (!result)
+    {
+        /* No function_call found — look for message items with text content */
+        cJSON *item;
+        char *text_content = NULL;
+
+        cJSON_ArrayForEach(item, output_array)
+        {
+            cJSON *type_item = cJSON_GetObjectItem(item, "type");
+            if (type_item && cJSON_IsString(type_item)
+                && strcmp(type_item->valuestring, "message") == 0)
+            {
+                cJSON *content_array = cJSON_GetObjectItem(item, "content");
+                if (content_array && cJSON_IsArray(content_array))
+                {
+                    cJSON *content_item;
+                    cJSON_ArrayForEach(content_item, content_array)
+                    {
+                        cJSON *ct = cJSON_GetObjectItem(content_item, "type");
+                        cJSON *text = cJSON_GetObjectItem(content_item, "text");
+                        if (ct && cJSON_IsString(ct)
+                            && strcmp(ct->valuestring, "output_text") == 0
+                            && text && cJSON_IsString(text))
+                        {
+                            text_content = text->valuestring;
+                            break;
+                        }
+                    }
+                }
+                if (text_content)
+                    break;
+            }
+        }
+
+        /* Wrap text as synthetic chat tool_use */
+        result = cJSON_CreateObject();
+        cJSON_AddStringToObject(result, "type", "tool_use");
+        cJSON_AddStringToObject(result, "id", "synthetic_text_response");
+        cJSON_AddStringToObject(result, "name", "chat");
+        {
+            cJSON *input = cJSON_CreateObject();
+            cJSON_AddStringToObject(input, "response",
+                text_content ? text_content : "(empty response)");
+            cJSON_AddItemToObject(result, "input", input);
+        }
+    }
+
+    cJSON_Delete(response_json);
+    return result;
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*                   LLM API Call (Provider Dispatch)               */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Forward declaration for retry logic */
+static cJSON *yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_retry);
+
+/* Internal function to call LLM API with pre-built messages array.
+   Messages must be in the current provider's native format.
+   The messages array is consumed (freed internally).
+   Returns a normalized tool_use cJSON object (caller must free with cJSON_Delete). */
+static cJSON *
+yo_call_api_with_messages(const char *api_key, cJSON *messages)
+{
+    return yo_call_api_with_messages_internal(api_key, messages, 0);
+}
+
+static cJSON *
+yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_retry)
+{
+    const char *url;
+    struct curl_slist *headers = NULL;
+    long timeout;
+    char *request_body;
+    char *response_data;
+    cJSON *result;
+
+    /* Provider-specific request building */
+    if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        request_body = yo_build_openai_request(api_key, messages, &url, &headers, &timeout);
+    }
+    else
+    {
+        request_body = yo_build_anthropic_request(api_key, messages, &url, &headers, &timeout);
+    }
+    /* Note: messages is now owned by the request JSON and freed with it */
+
+    if (!request_body)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Failed to build API request");
+        return NULL;
+    }
+
+    /* Shared HTTP call */
+    response_data = yo_http_post(url, headers, request_body, timeout);
+    free(request_body);
+
+    if (!response_data)
+        return NULL;  /* Error/cancellation already printed by yo_http_post */
+
+    /* Provider-specific response parsing */
+    if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        result = yo_parse_openai_response(response_data);
+        free(response_data);
+        return result;
+    }
+    else
+    {
+        int needs_retry = 0;
+        cJSON *retry_content = NULL;
+
+        result = yo_parse_anthropic_response(response_data, is_retry,
+                                              &needs_retry, &retry_content);
+        free(response_data);
+
+        if (needs_retry && retry_content)
+        {
+            /* Multiple tool_use blocks — ask the LLM to pick exactly one */
             cJSON *retry_messages = cJSON_CreateArray();
             cJSON *assistant_msg = cJSON_CreateObject();
             cJSON *user_msg = cJSON_CreateObject();
-            cJSON *content_copy = cJSON_Duplicate(content_array, 1);
 
-            /* Build assistant message with the multi-tool response */
             cJSON_AddStringToObject(assistant_msg, "role", "assistant");
-            cJSON_AddItemToObject(assistant_msg, "content", content_copy);
+            cJSON_AddItemToObject(assistant_msg, "content", retry_content);
             cJSON_AddItemToArray(retry_messages, assistant_msg);
 
-            /* Build user message asking to pick one */
             cJSON_AddStringToObject(user_msg, "role", "user");
             cJSON_AddStringToObject(user_msg, "content",
                 "You provided multiple tool calls. Please respond with exactly one tool call - "
                 "the most appropriate one for the user's request.");
             cJSON_AddItemToArray(retry_messages, user_msg);
 
-            cJSON_Delete(response_json);
-
-            /* Retry with the follow-up messages */
-            return yo_call_claude_with_messages_internal(api_key, retry_messages, 1);
+            return yo_call_api_with_messages_internal(api_key, retry_messages, 1);
         }
-    }
 
-curl_error:
-    if (response_buf.data)
-        free(response_buf.data);
-    curl_multi_remove_handle(multi, curl);
-    curl_multi_cleanup(multi);
-    curl_slist_free_all(headers);
-    free(request_body);
-    curl_easy_cleanup(curl);
-    return NULL;
+        return result;
+    }
 }
 
 /* Main API call function - builds messages from query and calls API */
 static cJSON *
-yo_call_claude(const char *api_key, const char *query)
+yo_call_api(const char *api_key, const char *query)
 {
     cJSON *messages = yo_build_messages(query);
-    return yo_call_claude_with_messages(api_key, messages);
+    return yo_call_api_with_messages(api_key, messages);
 }
 
 /* API call with scrollback context - for follow-up after scrollback request */
 static cJSON *
-yo_call_claude_with_scrollback(const char *api_key, const char *query,
+yo_call_api_with_scrollback(const char *api_key, const char *query,
                                const char *scrollback_request, const char *scrollback_data,
                                const char *scrollback_tool_id)
 {
     cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request,
                                                         scrollback_data, scrollback_tool_id);
-    return yo_call_claude_with_messages(api_key, messages);
+    return yo_call_api_with_messages(api_key, messages);
 }
 
 /* **************************************************************** */
@@ -2301,53 +2924,48 @@ yo_call_claude_with_scrollback(const char *api_key, const char *query,
 /* When the LLM returns a command response without the required explanation
    field, re-prompt it once with the original tool_use as context and a
    request to include the explanation.  Returns the new tool_use cJSON
-   (caller must free with cJSON_Delete), or NULL on failure/cancellation. */
+   (caller must free with cJSON_Delete), or NULL on failure/cancellation.
+   The original_tool_use is in normalized (internal) format; the retry
+   messages are built in the current provider's native format. */
 static cJSON *
 yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original_tool_use)
 {
     cJSON *messages;
-    cJSON *msg;
-    cJSON *content_array;
-    cJSON *tool_result;
-    cJSON *tool_use_copy;
     cJSON *id_item;
+    cJSON *name_item;
+    cJSON *input_item;
     const char *tool_use_id;
+    const char *tool_name;
 
-    /* Get the tool_use id */
+    /* Get the tool_use id and name */
     id_item = cJSON_GetObjectItem(original_tool_use, "id");
     if (!id_item || !cJSON_IsString(id_item))
         return NULL;
     tool_use_id = id_item->valuestring;
 
+    name_item = cJSON_GetObjectItem(original_tool_use, "name");
+    tool_name = (name_item && cJSON_IsString(name_item)) ? name_item->valuestring : "command";
+
+    input_item = cJSON_GetObjectItem(original_tool_use, "input");
+
     /* Build the normal message history including the current query */
     messages = yo_build_messages(query);
 
-    /* Append the assistant's original tool_use (the one missing explanation) */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "assistant");
-    content_array = cJSON_CreateArray();
-    tool_use_copy = cJSON_Duplicate(original_tool_use, 1);
-    cJSON_AddItemToArray(content_array, tool_use_copy);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
+    /* Append the assistant's original tool_use using provider-native format */
+    {
+        cJSON *input_copy = input_item ? cJSON_Duplicate(input_item, 1) : cJSON_CreateObject();
+        yo_msg_add_tool_use(messages, tool_use_id, tool_name, input_copy);
+        cJSON_Delete(input_copy);
+    }
 
-    /* Append a user message with tool_result requesting the explanation */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "user");
-    content_array = cJSON_CreateArray();
-    tool_result = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool_result, "type", "tool_result");
-    cJSON_AddStringToObject(tool_result, "tool_use_id", tool_use_id);
-    cJSON_AddStringToObject(tool_result, "content",
+    /* Append a tool result requesting the explanation */
+    yo_msg_add_tool_result(messages, tool_use_id,
         "Your command response is missing the required \"explanation\" field. "
         "Please respond again with the same command but include a brief explanation. "
         "The explanation is shown to the user before the command and is essential "
         "for them to understand what the command does.");
-    cJSON_AddItemToArray(content_array, tool_result);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
 
-    return yo_call_claude_with_messages(api_key, messages);
+    return yo_call_api_with_messages(api_key, messages);
 }
 
 /* **************************************************************** */
@@ -2570,7 +3188,7 @@ static void
 yo_report_parse_error(cJSON *tool_use)
 {
     yo_clear_thinking();
-    yo_print_error_no_newline("Failed to parse tool_use from Claude: %s",
+    yo_print_error_no_newline("Failed to parse tool_use from LLM: %s",
                               tool_use ? cJSON_PrintUnformatted(tool_use) : "(null)");
 }
 
@@ -2659,94 +3277,141 @@ yo_estimate_tokens(void)
     return total / 4;
 }
 
-/* Helper to build a tool_use content block for history reconstruction */
-static cJSON *
-yo_build_tool_use_block(const char *tool_use_id, yo_response_type_t type, const char *response, int pending)
+/* Add an assistant message with a single tool use to the messages array.
+   For Anthropic: content array with tool_use block.
+   For OpenAI: tool_calls array with function call.
+   The input object is NOT consumed (it is duplicated for Anthropic, serialized for OpenAI). */
+static void
+yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
+                    const char *tool_name, cJSON *input)
 {
-    cJSON *tool_use = cJSON_CreateObject();
-    cJSON *input = cJSON_CreateObject();
-
-    cJSON_AddStringToObject(tool_use, "type", "tool_use");
-    cJSON_AddStringToObject(tool_use, "id", tool_use_id);
-    cJSON_AddStringToObject(tool_use, "name", yo_response_type_to_string(type));
-
-    if (type == YO_RESPONSE_COMMAND)
+    if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        cJSON_AddStringToObject(input, "command", response);
-        cJSON_AddStringToObject(input, "explanation", "(from history)");
-        if (pending)
-            cJSON_AddTrueToObject(input, "pending");
-    }
-    else if (type == YO_RESPONSE_CHAT)
-    {
-        cJSON_AddStringToObject(input, "response", response);
-    }
+        /* Responses API: flat function_call item, no role wrapper */
+        cJSON *msg = cJSON_CreateObject();
+        char *args;
 
-    cJSON_AddItemToObject(tool_use, "input", input);
-    return tool_use;
+        cJSON_AddStringToObject(msg, "type", "function_call");
+        cJSON_AddStringToObject(msg, "call_id", tool_use_id);
+        cJSON_AddStringToObject(msg, "name", tool_name);
+        args = cJSON_PrintUnformatted(input);
+        cJSON_AddStringToObject(msg, "arguments", args);
+        free(args);
+        cJSON_AddItemToArray(messages, msg);
+    }
+    else
+    {
+        cJSON *msg = cJSON_CreateObject();
+        cJSON *content_array = cJSON_CreateArray();
+        cJSON *tool_use = cJSON_CreateObject();
+        cJSON_AddStringToObject(msg, "role", "assistant");
+        cJSON_AddStringToObject(tool_use, "type", "tool_use");
+        cJSON_AddStringToObject(tool_use, "id", tool_use_id);
+        cJSON_AddStringToObject(tool_use, "name", tool_name);
+        cJSON_AddItemToObject(tool_use, "input", cJSON_Duplicate(input, 1));
+        cJSON_AddItemToArray(content_array, tool_use);
+        cJSON_AddItemToObject(msg, "content", content_array);
+        cJSON_AddItemToArray(messages, msg);
+    }
 }
 
-/* Helper to build a tool_result content block */
-static cJSON *
-yo_build_tool_result_block(const char *tool_use_id, const char *result_content)
+/* Add a tool result message to the messages array.
+   For Anthropic: user message with tool_result content block.
+   For OpenAI: tool message with tool_call_id. */
+static void
+yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
+                       const char *result_content)
 {
-    cJSON *tool_result = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool_result, "type", "tool_result");
-    cJSON_AddStringToObject(tool_result, "tool_use_id", tool_use_id);
-    cJSON_AddStringToObject(tool_result, "content", result_content);
-    return tool_result;
+    cJSON *msg = cJSON_CreateObject();
+
+    if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        /* Responses API: function_call_output item */
+        cJSON_AddStringToObject(msg, "type", "function_call_output");
+        cJSON_AddStringToObject(msg, "call_id", tool_use_id);
+        cJSON_AddStringToObject(msg, "output", result_content);
+    }
+    else
+    {
+        cJSON *content_array = cJSON_CreateArray();
+        cJSON *tool_result = cJSON_CreateObject();
+        cJSON_AddStringToObject(msg, "role", "user");
+        cJSON_AddStringToObject(tool_result, "type", "tool_result");
+        cJSON_AddStringToObject(tool_result, "tool_use_id", tool_use_id);
+        cJSON_AddStringToObject(tool_result, "content", result_content);
+        cJSON_AddItemToArray(content_array, tool_result);
+        cJSON_AddItemToObject(msg, "content", content_array);
+    }
+
+    cJSON_AddItemToArray(messages, msg);
+}
+
+/* Helper: build the tool input JSON for a history entry's tool_use */
+static cJSON *
+yo_build_history_tool_input(int idx)
+{
+    cJSON *input = cJSON_CreateObject();
+
+    if (yo_history[idx].response_type == YO_RESPONSE_COMMAND)
+    {
+        cJSON_AddStringToObject(input, "command", yo_history[idx].response);
+        cJSON_AddStringToObject(input, "explanation", "(from history)");
+        if (yo_history[idx].pending)
+            cJSON_AddTrueToObject(input, "pending");
+    }
+    else if (yo_history[idx].response_type == YO_RESPONSE_CHAT)
+    {
+        cJSON_AddStringToObject(input, "response", yo_history[idx].response);
+    }
+
+    return input;
+}
+
+/* Shared helper: add session history entries to a messages array.
+   Uses yo_msg_add_tool_use / yo_msg_add_tool_result, which produce
+   provider-native format based on yo_provider. */
+static void
+yo_add_history_to_messages(cJSON *messages)
+{
+    int i;
+    for (i = 0; i < yo_history_count; i++)
+    {
+        cJSON *msg;
+        cJSON *input;
+
+        /* User message with query */
+        msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(msg, "role", "user");
+        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
+        cJSON_AddItemToArray(messages, msg);
+
+        /* Assistant message with tool_use (provider-native) */
+        input = yo_build_history_tool_input(i);
+        yo_msg_add_tool_use(messages, yo_history[i].tool_use_id,
+                            yo_response_type_to_string(yo_history[i].response_type),
+                            input);
+        cJSON_Delete(input);
+
+        /* Tool result (provider-native) */
+        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
+        {
+            yo_msg_add_tool_result(messages, yo_history[i].tool_use_id,
+                yo_history[i].executed ? "User executed the command" : "User did not execute the command");
+        }
+        else
+        {
+            yo_msg_add_tool_result(messages, yo_history[i].tool_use_id, "Acknowledged");
+        }
+    }
 }
 
 static cJSON *
 yo_build_messages(const char *current_query)
 {
-    cJSON *messages;
+    cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
-    cJSON *content_array;
-    int i;
 
-    messages = cJSON_CreateArray();
-
-    /* Add history entries */
-    for (i = 0; i < yo_history_count; i++)
-    {
-        /* User message with query */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* Assistant message with tool_use */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "assistant");
-        content_array = cJSON_CreateArray();
-        cJSON_AddItemToArray(content_array,
-            yo_build_tool_use_block(yo_history[i].tool_use_id,
-                                    yo_history[i].response_type,
-                                    yo_history[i].response,
-                                    yo_history[i].pending));
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* User message with tool_result */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        content_array = cJSON_CreateArray();
-
-        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id,
-                    yo_history[i].executed ? "User executed the command" : "User did not execute the command"));
-        }
-        else
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id, "Acknowledged"));
-        }
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-    }
+    yo_add_history_to_messages(messages);
 
     /* Add current query */
     msg = cJSON_CreateObject();
@@ -2757,67 +3422,21 @@ yo_build_messages(const char *current_query)
     return messages;
 }
 
-/* Build messages array for a follow-up call after a scrollback request.
-   This adds the assistant's scrollback tool_use, user's tool_result with scrollback data,
-   and then expects assistant to give final response. */
+/* Build messages array for a follow-up call after a scrollback request. */
 static cJSON *
 yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
                                   const char *scrollback_data, const char *scrollback_tool_id)
 {
-    cJSON *messages;
+    cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
-    cJSON *content_array;
-    cJSON *tool_use;
-    cJSON *tool_input;
-    int i;
     char *scrollback_msg;
+    int lines_requested;
 
-    /* scrollback_request contains the lines count as a string */
-    int lines_requested = atoi(scrollback_request);
+    lines_requested = atoi(scrollback_request);
     if (lines_requested <= 0)
         lines_requested = 50;
 
-    messages = cJSON_CreateArray();
-
-    /* Add history entries (same as yo_build_messages) */
-    for (i = 0; i < yo_history_count; i++)
-    {
-        /* User message with query */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* Assistant message with tool_use */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "assistant");
-        content_array = cJSON_CreateArray();
-        cJSON_AddItemToArray(content_array,
-            yo_build_tool_use_block(yo_history[i].tool_use_id,
-                                    yo_history[i].response_type,
-                                    yo_history[i].response,
-                                    yo_history[i].pending));
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* User message with tool_result */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        content_array = cJSON_CreateArray();
-        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id,
-                    yo_history[i].executed ? "User executed the command" : "User did not execute the command"));
-        }
-        else
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id, "Acknowledged"));
-        }
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-    }
+    yo_add_history_to_messages(messages);
 
     /* Add current query */
     msg = cJSON_CreateObject();
@@ -2825,94 +3444,35 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
-    /* Add assistant's scrollback tool_use */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "assistant");
-    content_array = cJSON_CreateArray();
-    tool_use = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool_use, "type", "tool_use");
-    cJSON_AddStringToObject(tool_use, "id", scrollback_tool_id);
-    cJSON_AddStringToObject(tool_use, "name", "scrollback");
-    tool_input = cJSON_CreateObject();
-    cJSON_AddNumberToObject(tool_input, "lines", lines_requested);
-    cJSON_AddItemToObject(tool_use, "input", tool_input);
-    cJSON_AddItemToArray(content_array, tool_use);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
+    /* Add assistant's scrollback tool_use (provider-native) */
+    {
+        cJSON *input = cJSON_CreateObject();
+        cJSON_AddNumberToObject(input, "lines", lines_requested);
+        yo_msg_add_tool_use(messages, scrollback_tool_id, "scrollback", input);
+        cJSON_Delete(input);
+    }
 
-    /* Add user's tool_result with scrollback data */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "user");
-    content_array = cJSON_CreateArray();
+    /* Add tool_result with scrollback data (provider-native) */
     asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
              scrollback_data);
-    cJSON_AddItemToArray(content_array,
-        yo_build_tool_result_block(scrollback_tool_id, scrollback_msg));
+    yo_msg_add_tool_result(messages, scrollback_tool_id, scrollback_msg);
     free(scrollback_msg);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
 
     return messages;
 }
 
-/* Build messages array for a follow-up call after a docs request.
-   This adds the assistant's docs tool_use, user's tool_result with documentation,
-   and then expects assistant to give final response. */
+/* Build messages array for a follow-up call after a docs request. */
 static cJSON *
 yo_build_messages_with_docs(const char *current_query, const char *docs_request,
                             const char *docs_tool_id)
 {
-    cJSON *messages;
+    cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
-    cJSON *content_array;
-    cJSON *tool_use;
-    cJSON *tool_input;
-    int i;
     char *docs_msg;
 
-    (void)docs_request;  /* unused with tool use - we just need the tool_id */
+    (void)docs_request;
 
-    messages = cJSON_CreateArray();
-
-    /* Add history entries (same as yo_build_messages) */
-    for (i = 0; i < yo_history_count; i++)
-    {
-        /* User message with query */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* Assistant message with tool_use */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "assistant");
-        content_array = cJSON_CreateArray();
-        cJSON_AddItemToArray(content_array,
-            yo_build_tool_use_block(yo_history[i].tool_use_id,
-                                    yo_history[i].response_type,
-                                    yo_history[i].response,
-                                    yo_history[i].pending));
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-
-        /* User message with tool_result */
-        msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "role", "user");
-        content_array = cJSON_CreateArray();
-        if (yo_history[i].response_type == YO_RESPONSE_COMMAND)
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id,
-                    yo_history[i].executed ? "User executed the command" : "User did not execute the command"));
-        }
-        else
-        {
-            cJSON_AddItemToArray(content_array,
-                yo_build_tool_result_block(yo_history[i].tool_use_id, "Acknowledged"));
-        }
-        cJSON_AddItemToObject(msg, "content", content_array);
-        cJSON_AddItemToArray(messages, msg);
-    }
+    yo_add_history_to_messages(messages);
 
     /* Add current query */
     msg = cJSON_CreateObject();
@@ -2920,41 +3480,28 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
-    /* Add assistant's docs tool_use */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "assistant");
-    content_array = cJSON_CreateArray();
-    tool_use = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool_use, "type", "tool_use");
-    cJSON_AddStringToObject(tool_use, "id", docs_tool_id);
-    cJSON_AddStringToObject(tool_use, "name", "docs");
-    tool_input = cJSON_CreateObject();
-    cJSON_AddItemToObject(tool_use, "input", tool_input);
-    cJSON_AddItemToArray(content_array, tool_use);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
+    /* Add assistant's docs tool_use (provider-native) */
+    {
+        cJSON *input = cJSON_CreateObject();
+        yo_msg_add_tool_use(messages, docs_tool_id, "docs", input);
+        cJSON_Delete(input);
+    }
 
-    /* Add user's tool_result with documentation */
-    msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "user");
-    content_array = cJSON_CreateArray();
+    /* Add tool_result with documentation (provider-native) */
     asprintf(&docs_msg, "Here is the yosh documentation:\n\n%s\n\n"
              "Now please answer the user's original question based on this documentation.",
              yo_documentation);
-    cJSON_AddItemToArray(content_array,
-        yo_build_tool_result_block(docs_tool_id, docs_msg));
+    yo_msg_add_tool_result(messages, docs_tool_id, docs_msg);
     free(docs_msg);
-    cJSON_AddItemToObject(msg, "content", content_array);
-    cJSON_AddItemToArray(messages, msg);
 
     return messages;
 }
 
 /* API call with docs context - for follow-up after docs request */
 static cJSON *
-yo_call_claude_with_docs(const char *api_key, const char *query, const char *docs_request,
+yo_call_api_with_docs(const char *api_key, const char *query, const char *docs_request,
                          const char *docs_tool_id)
 {
     cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id);
-    return yo_call_claude_with_messages(api_key, messages);
+    return yo_call_api_with_messages(api_key, messages);
 }

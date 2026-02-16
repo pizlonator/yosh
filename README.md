@@ -1,4 +1,4 @@
-# Yosh 0.1.1
+# Yosh 0.1.2
 
 Yosh is an LLM-enabled shell. It's a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, featuring built-in LLM integration for natural language command generation and assistance. It supports both **Anthropic Claude** and **OpenAI** as providers.
 

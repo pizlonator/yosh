@@ -560,6 +560,9 @@ yo_pump_loop(void)
         if (wpid > 0)
         {
             /* Child exited - drain any remaining output */
+            int flags = fcntl(yo_pty_master, F_GETFL);
+            if (flags >= 0)
+                fcntl(yo_pty_master, F_SETFL, flags | O_NONBLOCK);
             for (;;)
             {
                 n = read(yo_pty_master, buf, sizeof(buf));
@@ -1893,7 +1896,7 @@ yo_load_config(void)
     if (stat(path, &st) != 0)
     {
         yo_print_error("Create ~/.yoconf with your API key (mode 0600). "
-                       "See 'yo how do I configure yosh' for details.");
+                       "See 'yo how do I configure the LLM' for details.");
         return NULL;
     }
 
@@ -2041,7 +2044,7 @@ yo_build_tools(void)
     cJSON_AddItemToObject(tool, "input_schema", schema);
     cJSON_AddItemToArray(tools, tool);
 
-    /* Tool: docs - request yosh documentation */
+    /* Tool: docs - request documentation */
     tool = cJSON_CreateObject();
     cJSON_AddStringToObject(tool, "name", "docs");
     char *description;
@@ -3488,7 +3491,7 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     }
 
     /* Add tool_result with documentation (provider-native) */
-    asprintf(&docs_msg, "Here is the yosh documentation:\n\n%s\n\n"
+    asprintf(&docs_msg, "Here is the documentation:\n\n%s\n\n"
              "Now please answer the user's original question based on this documentation.",
              yo_documentation);
     yo_msg_add_tool_result(messages, docs_tool_id, docs_msg);

@@ -117,6 +117,31 @@ typedef struct {
 
 /* **************************************************************** */
 /*                                                                  */
+/*                    Tool Definition Types                         */
+/*                                                                  */
+/* **************************************************************** */
+
+#define YO_TOOL_MAX_PROPS 4
+#define YO_TOOL_MAX_REQUIRED 4
+
+typedef struct {
+    const char *name;
+    const char *type;        /* "string", "integer", "boolean" */
+    const char *description;
+} yo_tool_prop_t;
+
+typedef struct {
+    const char *name;
+    const char *description;
+    int description_allocated;  /* 1 if description was dynamically allocated */
+    yo_tool_prop_t props[YO_TOOL_MAX_PROPS];
+    int num_props;
+    const char *required[YO_TOOL_MAX_REQUIRED];
+    int num_required;
+} yo_tool_def_t;
+
+/* **************************************************************** */
+/*                                                                  */
 /*                      Static Variables                            */
 /*                                                                  */
 /* **************************************************************** */
@@ -191,6 +216,9 @@ static int yo_is_pump = 0;
 
 static void yo_reload_config(void);
 static char *yo_load_config(void);
+static yo_tool_def_t *yo_get_common_tools(int *count_out);
+static void yo_free_common_tools(yo_tool_def_t *tools, int count);
+static cJSON *yo_build_tools_anthropic(void);
 static cJSON *yo_build_tools_openai(void);
 static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                                 const char *tool_name, cJSON *input);
@@ -1965,105 +1993,134 @@ yo_load_config(void)
 /*                                                                  */
 /* **************************************************************** */
 
-/* Build the tools array for the API request */
-static cJSON *
-yo_build_tools(void)
+/* Build an array of common tool definitions as C structs.
+   These are the tools shared by both Anthropic and OpenAI providers.
+   Caller must free with yo_free_common_tools(). */
+static yo_tool_def_t *
+yo_get_common_tools(int *count_out)
 {
-    cJSON *tools = cJSON_CreateArray();
-    cJSON *tool, *schema, *props, *prop, *required;
+    yo_tool_def_t *tools = calloc(4, sizeof(yo_tool_def_t));
+    int n = 0;
 
     /* Tool: command - execute a shell command */
-    tool = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool, "name", "command");
-    cJSON_AddStringToObject(tool, "description",
+    tools[n].name = "command";
+    tools[n].description =
         "Generate a shell command for the user to review and execute. "
-        "The command will be prefilled at the prompt for the user to edit or run.");
-    schema = cJSON_CreateObject();
-    cJSON_AddStringToObject(schema, "type", "object");
-    props = cJSON_CreateObject();
-    prop = cJSON_CreateObject();
-    cJSON_AddStringToObject(prop, "type", "string");
-    cJSON_AddStringToObject(prop, "description", "The shell command to execute");
-    cJSON_AddItemToObject(props, "command", prop);
-    prop = cJSON_CreateObject();
-    cJSON_AddStringToObject(prop, "type", "string");
-    cJSON_AddStringToObject(prop, "description",
-        "Brief explanation of what this command does, shown to user before the command");
-    cJSON_AddItemToObject(props, "explanation", prop);
-    prop = cJSON_CreateObject();
-    cJSON_AddStringToObject(prop, "type", "boolean");
-    cJSON_AddStringToObject(prop, "description",
+        "The command will be prefilled at the prompt for the user to edit or run.";
+    tools[n].props[0] = (yo_tool_prop_t){
+        "command", "string", "The shell command to execute"};
+    tools[n].props[1] = (yo_tool_prop_t){
+        "explanation", "string",
+        "Brief explanation of what this command does, shown to user before the command"};
+    tools[n].props[2] = (yo_tool_prop_t){
+        "pending", "boolean",
         "Set to true if this is part of a multi-step sequence and you need to see "
         "the output before providing the next command. After the user executes this "
-        "command, you will automatically receive the terminal output.");
-    cJSON_AddItemToObject(props, "pending", prop);
-    cJSON_AddItemToObject(schema, "properties", props);
-    required = cJSON_CreateArray();
-    cJSON_AddItemToArray(required, cJSON_CreateString("command"));
-    cJSON_AddItemToArray(required, cJSON_CreateString("explanation"));
-    cJSON_AddItemToObject(schema, "required", required);
-    cJSON_AddItemToObject(tool, "input_schema", schema);
-    cJSON_AddItemToArray(tools, tool);
+        "command, you will automatically receive the terminal output."};
+    tools[n].num_props = 3;
+    tools[n].required[0] = "command";
+    tools[n].required[1] = "explanation";
+    tools[n].num_required = 2;
+    n++;
 
     /* Tool: chat - respond with text */
-    tool = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool, "name", "chat");
-    cJSON_AddStringToObject(tool, "description",
-        "Respond with a text message for questions and explanations; use ONLY when no command is needed.");
-    schema = cJSON_CreateObject();
-    cJSON_AddStringToObject(schema, "type", "object");
-    props = cJSON_CreateObject();
-    prop = cJSON_CreateObject();
-    cJSON_AddStringToObject(prop, "type", "string");
-    cJSON_AddStringToObject(prop, "description", "Your text response to the user");
-    cJSON_AddItemToObject(props, "response", prop);
-    cJSON_AddItemToObject(schema, "properties", props);
-    required = cJSON_CreateArray();
-    cJSON_AddItemToArray(required, cJSON_CreateString("response"));
-    cJSON_AddItemToObject(schema, "required", required);
-    cJSON_AddItemToObject(tool, "input_schema", schema);
-    cJSON_AddItemToArray(tools, tool);
+    tools[n].name = "chat";
+    tools[n].description =
+        "Respond with a text message for questions and explanations; use ONLY when no command is needed.";
+    tools[n].props[0] = (yo_tool_prop_t){
+        "response", "string", "Your text response to the user"};
+    tools[n].num_props = 1;
+    tools[n].required[0] = "response";
+    tools[n].num_required = 1;
+    n++;
 
     /* Tool: scrollback - request terminal output */
-    tool = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool, "name", "scrollback");
-    cJSON_AddStringToObject(tool, "description",
+    tools[n].name = "scrollback";
+    tools[n].description =
         "Request recent terminal output to see command results, error messages, or context. "
-        "Use this when you need to see what happened in the terminal.");
-    schema = cJSON_CreateObject();
-    cJSON_AddStringToObject(schema, "type", "object");
-    props = cJSON_CreateObject();
-    prop = cJSON_CreateObject();
-    cJSON_AddStringToObject(prop, "type", "integer");
-    cJSON_AddStringToObject(prop, "description", "Number of recent lines to retrieve (max 1000)");
-    cJSON_AddItemToObject(props, "lines", prop);
-    cJSON_AddItemToObject(schema, "properties", props);
-    required = cJSON_CreateArray();
-    cJSON_AddItemToArray(required, cJSON_CreateString("lines"));
-    cJSON_AddItemToObject(schema, "required", required);
-    cJSON_AddItemToObject(tool, "input_schema", schema);
-    cJSON_AddItemToArray(tools, tool);
+        "Use this when you need to see what happened in the terminal.";
+    tools[n].props[0] = (yo_tool_prop_t){
+        "lines", "integer", "Number of recent lines to retrieve (max 1000)"};
+    tools[n].num_props = 1;
+    tools[n].required[0] = "lines";
+    tools[n].num_required = 1;
+    n++;
 
     /* Tool: docs - request documentation */
-    tool = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool, "name", "docs");
-    char *description;
-    asprintf(&description,
-             "Request %s documentation to answer questions about %s features, configuration, "
-             "environment variables, API key setup, or usage.",
-             yo_name, yo_name);
-    cJSON_AddStringToObject(tool, "description", description);
-    free(description);
-    schema = cJSON_CreateObject();
-    cJSON_AddStringToObject(schema, "type", "object");
-    props = cJSON_CreateObject();
-    cJSON_AddItemToObject(schema, "properties", props);
-    required = cJSON_CreateArray();
-    cJSON_AddItemToObject(schema, "required", required);
-    cJSON_AddItemToObject(tool, "input_schema", schema);
-    cJSON_AddItemToArray(tools, tool);
+    {
+        char *desc;
+        asprintf(&desc,
+                 "Request %s documentation to answer questions about %s features, configuration, "
+                 "environment variables, LLM provider/model or API key setup, or usage.",
+                 yo_name, yo_name);
+        tools[n].name = "docs";
+        tools[n].description = desc;
+        tools[n].description_allocated = 1;
+        tools[n].num_props = 0;
+        tools[n].num_required = 0;
+        n++;
+    }
 
-    /* Server tools: web_search and web_fetch (conditionally enabled) */
+    *count_out = n;
+    return tools;
+}
+
+/* Free common tool definitions returned by yo_get_common_tools(). */
+static void
+yo_free_common_tools(yo_tool_def_t *tools, int count)
+{
+    int i;
+    for (i = 0; i < count; i++)
+    {
+        if (tools[i].description_allocated)
+            free((char *)tools[i].description);
+    }
+    free(tools);
+}
+
+/* Build the tools array for the Anthropic API request.
+   Converts common tool definitions to Anthropic JSON format and appends
+   Anthropic-specific server tools (web_search, web_fetch). */
+static cJSON *
+yo_build_tools_anthropic(void)
+{
+    cJSON *tools = cJSON_CreateArray();
+    cJSON *tool, *schema, *json_props, *prop, *required;
+    int i, j, num_common;
+
+    yo_tool_def_t *common = yo_get_common_tools(&num_common);
+
+    for (i = 0; i < num_common; i++)
+    {
+        tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "name", common[i].name);
+        cJSON_AddStringToObject(tool, "description", common[i].description);
+
+        schema = cJSON_CreateObject();
+        cJSON_AddStringToObject(schema, "type", "object");
+
+        json_props = cJSON_CreateObject();
+        for (j = 0; j < common[i].num_props; j++)
+        {
+            prop = cJSON_CreateObject();
+            cJSON_AddStringToObject(prop, "type", common[i].props[j].type);
+            cJSON_AddStringToObject(prop, "description", common[i].props[j].description);
+            cJSON_AddItemToObject(json_props, common[i].props[j].name, prop);
+        }
+        cJSON_AddItemToObject(schema, "properties", json_props);
+
+        required = cJSON_CreateArray();
+        for (j = 0; j < common[i].num_required; j++)
+            cJSON_AddItemToArray(required, cJSON_CreateString(common[i].required[j]));
+        cJSON_AddItemToObject(schema, "required", required);
+
+        cJSON_AddItemToObject(tool, "input_schema", schema);
+        cJSON_AddItemToArray(tools, tool);
+    }
+
+    yo_free_common_tools(common, num_common);
+
+    /* Anthropic-specific server tools: web_search and web_fetch */
     if (yo_server_web_enabled)
     {
         tool = cJSON_CreateObject();
@@ -2082,70 +2139,66 @@ yo_build_tools(void)
     return tools;
 }
 
-/* Build tools array in OpenAI function-calling format.
-   Converts from Anthropic tool format, skipping Anthropic-specific server tools. */
+/* Build tools array in OpenAI Responses API format.
+   Converts common tool definitions to OpenAI function format and appends
+   OpenAI-specific tools (web_search). */
 static cJSON *
 yo_build_tools_openai(void)
 {
-    cJSON *anthropic_tools = yo_build_tools();
-    cJSON *openai_tools = cJSON_CreateArray();
-    cJSON *item;
+    cJSON *tools = cJSON_CreateArray();
+    cJSON *tool, *params, *json_props, *prop, *required;
+    int i, j, num_common;
 
-    cJSON_ArrayForEach(item, anthropic_tools)
+    yo_tool_def_t *common = yo_get_common_tools(&num_common);
+
+    for (i = 0; i < num_common; i++)
     {
-        cJSON *type_item = cJSON_GetObjectItem(item, "type");
-        cJSON *name_item = cJSON_GetObjectItem(item, "name");
-        cJSON *desc_item = cJSON_GetObjectItem(item, "description");
-        cJSON *schema_item = cJSON_GetObjectItem(item, "input_schema");
+        tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "type", "function");
+        cJSON_AddStringToObject(tool, "name", common[i].name);
+        cJSON_AddStringToObject(tool, "description", common[i].description);
 
-        /* Skip Anthropic-specific server tools (web_search, web_fetch) */
-        if (type_item && cJSON_IsString(type_item)
-            && (strcmp(type_item->valuestring, "web_search_20250305") == 0
-                || strcmp(type_item->valuestring, "web_fetch_20250910") == 0))
-            continue;
+        params = cJSON_CreateObject();
+        cJSON_AddStringToObject(params, "type", "object");
 
+        json_props = cJSON_CreateObject();
+        for (j = 0; j < common[i].num_props; j++)
         {
-            /* Responses API: flat tool format (no function wrapper) */
-            cJSON *tool = cJSON_CreateObject();
-
-            cJSON_AddStringToObject(tool, "type", "function");
-
-            if (name_item && cJSON_IsString(name_item))
-                cJSON_AddStringToObject(tool, "name", name_item->valuestring);
-            if (desc_item && cJSON_IsString(desc_item))
-                cJSON_AddStringToObject(tool, "description", desc_item->valuestring);
-            if (schema_item)
-            {
-                cJSON *params = cJSON_Duplicate(schema_item, 1);
-                /* OpenAI strict mode requires additionalProperties: false */
-                cJSON_AddFalseToObject(params, "additionalProperties");
-                /* For the command tool, make pending required so the model
-                   always explicitly decides whether to continue */
-                if (name_item && cJSON_IsString(name_item)
-                    && strcmp(name_item->valuestring, "command") == 0)
-                {
-                    cJSON *req = cJSON_GetObjectItem(params, "required");
-                    if (req && cJSON_IsArray(req))
-                        cJSON_AddItemToArray(req, cJSON_CreateString("pending"));
-                }
-                cJSON_AddItemToObject(tool, "parameters", params);
-            }
-            cJSON_AddTrueToObject(tool, "strict");
-
-            cJSON_AddItemToArray(openai_tools, tool);
+            prop = cJSON_CreateObject();
+            cJSON_AddStringToObject(prop, "type", common[i].props[j].type);
+            cJSON_AddStringToObject(prop, "description", common[i].props[j].description);
+            cJSON_AddItemToObject(json_props, common[i].props[j].name, prop);
         }
+        cJSON_AddItemToObject(params, "properties", json_props);
+
+        required = cJSON_CreateArray();
+        for (j = 0; j < common[i].num_required; j++)
+            cJSON_AddItemToArray(required, cJSON_CreateString(common[i].required[j]));
+        /* OpenAI strict mode: for the command tool, make pending required
+           so the model always explicitly decides whether to continue */
+        if (strcmp(common[i].name, "command") == 0)
+            cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
+        cJSON_AddItemToObject(params, "required", required);
+
+        /* OpenAI strict mode requires additionalProperties: false */
+        cJSON_AddFalseToObject(params, "additionalProperties");
+        cJSON_AddItemToObject(tool, "parameters", params);
+        cJSON_AddTrueToObject(tool, "strict");
+
+        cJSON_AddItemToArray(tools, tool);
     }
 
-    /* Add web_search tool when server-side web is enabled */
+    yo_free_common_tools(common, num_common);
+
+    /* OpenAI-specific: web_search tool */
     if (yo_server_web_enabled)
     {
         cJSON *ws = cJSON_CreateObject();
         cJSON_AddStringToObject(ws, "type", "web_search");
-        cJSON_AddItemToArray(openai_tools, ws);
+        cJSON_AddItemToArray(tools, ws);
     }
 
-    cJSON_Delete(anthropic_tools);
-    return openai_tools;
+    return tools;
 }
 
 /* **************************************************************** */
@@ -2371,7 +2424,7 @@ yo_build_anthropic_request(const char *api_key, cJSON *messages,
     int web_enabled = yo_server_web_enabled;
 
     /* Build tools array */
-    tools = yo_build_tools();
+    tools = yo_build_tools_anthropic();
 
     /* Build request JSON */
     request_json = cJSON_CreateObject();
@@ -2607,6 +2660,12 @@ yo_build_openai_request(const char *api_key, cJSON *messages,
         "- 'what ports are open' -> command: ss -tlnp\n"
         "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
         "\n"
+        "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+        "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+        "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+        "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+        "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+        "\n"
         "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
         "output before deciding the next action, you MUST use pending=true and issue ONE\n"
         "command at a time. NEVER combine steps into a single compound command (no && chains\n"
@@ -2620,7 +2679,7 @@ yo_build_openai_request(const char *api_key, cJSON *messages,
         "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
         "  (pending=true), then decide based on output"
         "%s",
-        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt,
+        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt, yo_name,
         yo_server_web_enabled
             ? "\n\nYou have web search available. When you find the answer to the user's question "
               "via web search (weather, news, sports scores, prices, current events, etc.), "

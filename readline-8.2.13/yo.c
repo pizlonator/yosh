@@ -1749,9 +1749,85 @@ yo_trim(char *s)
     return s;
 }
 
-/* Load configuration from ~/.yoconf (preferred) or ~/.yoshkey (legacy fallback).
+/* Read an API key from a single-line key file (e.g. ~/.anthropickey, ~/.yoshkey).
+   Checks that the file has mode 0600.
+   Returns malloc'd key string on success, NULL on not-found or error.
+   Sets *found_out to 1 if the file exists (even if there's an error reading it),
+   0 if the file simply doesn't exist.  This lets the caller distinguish
+   "not found, try next" from "found but broken, stop".
+   display_name is used in error messages (e.g. "~/.anthropickey"). */
+static char *
+yo_read_keyfile(const char *path, const char *display_name, int *found_out)
+{
+    struct stat st;
+    FILE *fp;
+    char *key;
+    size_t len;
+    char *end;
+
+    if (stat(path, &st) != 0)
+    {
+        *found_out = 0;
+        return NULL;
+    }
+
+    *found_out = 1;
+
+    if ((st.st_mode & 0777) != 0600)
+    {
+        yo_print_error("%s must have mode 0600 (current: %04o)", display_name, st.st_mode & 0777);
+        return NULL;
+    }
+
+    fp = fopen(path, "r");
+    if (!fp)
+    {
+        yo_print_error("Cannot read %s: %s", display_name, strerror(errno));
+        return NULL;
+    }
+
+    key = malloc(256);
+    if (!fgets(key, 256, fp))
+    {
+        fclose(fp);
+        free(key);
+        yo_print_error("%s is empty", display_name);
+        return NULL;
+    }
+
+    fclose(fp);
+
+    /* Trim whitespace */
+    len = strlen(key);
+    while (len > 0 && (key[len-1] == '\n' || key[len-1] == '\r' || key[len-1] == ' ' || key[len-1] == '\t'))
+        key[--len] = '\0';
+
+    end = key;
+    while (*end == ' ' || *end == '\t')
+        end++;
+
+    if (end != key)
+        memmove(key, end, strlen(end) + 1);
+
+    if (strlen(key) == 0)
+    {
+        free(key);
+        yo_print_error("%s is empty", display_name);
+        return NULL;
+    }
+
+    return key;
+}
+
+/* Load configuration from ~/.yoconf and/or provider-specific key files.
    Sets yo_provider and yo_config_model as side effects.
-   Returns malloc'd API key string on success, NULL on error (error already printed). */
+   Returns malloc'd API key string on success, NULL on error (error already printed).
+
+   Key resolution order:
+   1. ~/.yoconf (all fields optional: provider, model, key)
+   2. If key missing and provider known: ~/.anthropickey or ~/.openaikey
+   3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey
+   4. YO_MODEL env overrides model (handled by yo_reload_config). */
 static char *
 yo_load_config(void)
 {
@@ -1759,6 +1835,8 @@ yo_load_config(void)
     char path[1024];
     struct stat st;
     FILE *fp;
+    char *parsed_key = NULL;
+    int have_provider = 0;
 
     /* Get home directory */
     home = getenv("HOME");
@@ -1775,16 +1853,21 @@ yo_load_config(void)
         return NULL;
     }
 
-    /* Try ~/.yoconf first */
+    /* Reset config model */
+    if (yo_config_model)
+    {
+        free(yo_config_model);
+        yo_config_model = NULL;
+    }
+
+    /* Step 1: Try ~/.yoconf — all fields optional */
     snprintf(path, sizeof(path), "%s/.yoconf", home);
 
     if (stat(path, &st) == 0)
     {
-        /* ~/.yoconf exists - parse it */
         char line[1024];
         char *parsed_provider = NULL;
         char *parsed_model = NULL;
-        char *parsed_key = NULL;
         int line_num = 0;
         int had_error = 0;
 
@@ -1876,115 +1959,121 @@ yo_load_config(void)
             return NULL;
         }
 
-        if (!parsed_key)
-        {
-            yo_print_error("~/.yoconf: missing 'key' directive");
-            if (parsed_provider) free(parsed_provider);
-            if (parsed_model) free(parsed_model);
-            return NULL;
-        }
-
-        /* Apply provider */
+        /* Apply provider if specified */
         if (parsed_provider)
         {
             if (strcmp(parsed_provider, "anthropic") == 0)
+            {
                 yo_provider = YO_PROVIDER_ANTHROPIC;
+                have_provider = 1;
+            }
             else if (strcmp(parsed_provider, "openai") == 0)
+            {
                 yo_provider = YO_PROVIDER_OPENAI;
+                have_provider = 1;
+            }
             else
             {
                 yo_print_error("~/.yoconf: unknown provider '%s' (expected 'anthropic' or 'openai')",
                                parsed_provider);
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
-                free(parsed_key);
+                if (parsed_key) free(parsed_key);
                 return NULL;
             }
             free(parsed_provider);
         }
-        else
-        {
-            yo_provider = YO_PROVIDER_ANTHROPIC;
-        }
 
         /* Apply model from config */
-        if (yo_config_model)
-        {
-            free(yo_config_model);
-            yo_config_model = NULL;
-        }
         yo_config_model = parsed_model;  /* may be NULL, that's fine */
 
-        return parsed_key;
-    }
-
-    /* Fall back to ~/.yoshkey (deprecated) */
-    snprintf(path, sizeof(path), "%s/.yoshkey", home);
-
-    if (stat(path, &st) != 0)
-    {
-        yo_print_error("Create ~/.yoconf with your API key (mode 0600). "
-                       "See 'yo how do I configure the LLM' for details.");
-        return NULL;
-    }
-
-    if ((st.st_mode & 0777) != 0600)
-    {
-        yo_print_error("~/.yoshkey must have mode 0600 (current: %04o)", st.st_mode & 0777);
-        return NULL;
-    }
-
-    fp = fopen(path, "r");
-    if (!fp)
-    {
-        yo_print_error("Cannot read ~/.yoshkey: %s", strerror(errno));
-        return NULL;
-    }
-
-    {
-        char *key = malloc(256);
-        size_t len;
-        char *end;
-
-        if (!fgets(key, 256, fp))
+        /* If we got the key from yoconf, we're done */
+        if (parsed_key)
         {
-            fclose(fp);
-            free(key);
-            yo_print_error("~/.yoshkey is empty");
+            /* Default provider to Anthropic if not specified */
+            if (!have_provider)
+            {
+                yo_provider = YO_PROVIDER_ANTHROPIC;
+                have_provider = 1;
+            }
+            return parsed_key;
+        }
+    }
+
+    /* Step 2: Key not found in yoconf (or yoconf doesn't exist).
+       Try provider-specific key files. */
+
+    if (have_provider)
+    {
+        int found = 0;
+
+        /* Provider was set by yoconf — check the matching key file */
+        if (yo_provider == YO_PROVIDER_ANTHROPIC)
+        {
+            snprintf(path, sizeof(path), "%s/.anthropickey", home);
+            parsed_key = yo_read_keyfile(path, "~/.anthropickey", &found);
+        }
+        else
+        {
+            snprintf(path, sizeof(path), "%s/.openaikey", home);
+            parsed_key = yo_read_keyfile(path, "~/.openaikey", &found);
+        }
+
+        if (parsed_key)
+            return parsed_key;
+
+        if (found)
+            return NULL;  /* File existed but had an error — already printed */
+
+        yo_print_error("~/.yoconf specifies provider '%s' but no key. "
+                       "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
+                       yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
+                       yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
+        return NULL;
+    }
+
+    /* Step 3: Neither key nor provider known — try the fallback chain.
+       ~/.anthropickey -> ~/.yoshkey -> ~/.openaikey
+       If a file exists but has an error, stop immediately. */
+
+    {
+        int found = 0;
+
+        snprintf(path, sizeof(path), "%s/.anthropickey", home);
+        parsed_key = yo_read_keyfile(path, "~/.anthropickey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_ANTHROPIC;
+            return parsed_key;
+        }
+        if (found)
             return NULL;
-        }
 
-        fclose(fp);
-
-        /* Trim whitespace */
-        len = strlen(key);
-        while (len > 0 && (key[len-1] == '\n' || key[len-1] == '\r' || key[len-1] == ' ' || key[len-1] == '\t'))
-            key[--len] = '\0';
-
-        end = key;
-        while (*end == ' ' || *end == '\t')
-            end++;
-
-        if (end != key)
-            memmove(key, end, strlen(end) + 1);
-
-        if (strlen(key) == 0)
+        snprintf(path, sizeof(path), "%s/.yoshkey", home);
+        parsed_key = yo_read_keyfile(path, "~/.yoshkey", &found);
+        if (parsed_key)
         {
-            free(key);
-            yo_print_error("~/.yoshkey is empty");
+            yo_provider = YO_PROVIDER_ANTHROPIC;
+            return parsed_key;
+        }
+        if (found)
             return NULL;
-        }
 
-        /* Legacy file is always Anthropic */
-        yo_provider = YO_PROVIDER_ANTHROPIC;
-        if (yo_config_model)
+        snprintf(path, sizeof(path), "%s/.openaikey", home);
+        parsed_key = yo_read_keyfile(path, "~/.openaikey", &found);
+        if (parsed_key)
         {
-            free(yo_config_model);
-            yo_config_model = NULL;
+            yo_provider = YO_PROVIDER_OPENAI;
+            return parsed_key;
         }
-
-        return key;
+        if (found)
+            return NULL;
     }
+
+    yo_print_error("No API key found. Create ~/.yoconf with your API key (mode 0600), "
+                   "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
+                   "See 'yo how do I configure the LLM' for details.");
+    return NULL;
 }
 
 /* **************************************************************** */

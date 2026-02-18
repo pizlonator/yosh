@@ -34,7 +34,18 @@ If you have a pre-built `yosh` binary:
    chsh -s /usr/local/bin/yosh
    ```
 
-4. **Configure your LLM provider**:
+4. **Configure your API key** (pick one method):
+
+   **Option A: Key file (simplest)**
+   ```bash
+   # For Anthropic:
+   echo 'your-anthropic-api-key' > ~/.anthropickey && chmod 600 ~/.anthropickey
+
+   # For OpenAI:
+   echo 'your-openai-api-key' > ~/.openaikey && chmod 600 ~/.openaikey
+   ```
+
+   **Option B: Config file (more control)**
    ```bash
    cat > ~/.yoconf << 'EOF'
    # Provider: "anthropic" (default) or "openai"
@@ -43,7 +54,7 @@ If you have a pre-built `yosh` binary:
    # Model (optional, uses provider default if omitted)
    # model claude-sonnet-4-20250514
 
-   # API key
+   # API key (optional here if using a key file)
    key your-api-key-here
    EOF
    chmod 600 ~/.yoconf
@@ -80,7 +91,7 @@ The built binary will be at `./prefix/bin/yosh`.
 
 ### Config File (`~/.yoconf`)
 
-Create `~/.yoconf` to configure your LLM provider, model, and API key:
+Optionally create `~/.yoconf` to configure your LLM provider, model, and/or API key. All directives are optional:
 
 ```bash
 # Provider: "anthropic" (default) or "openai"
@@ -91,11 +102,17 @@ provider anthropic
 # OpenAI default: gpt-4o-mini
 model claude-sonnet-4-20250514
 
-# API key
+# API key (optional if using a key file instead)
 key sk-ant-api03-...
 ```
 
-**Legacy fallback**: If `~/.yoconf` doesn't exist but `~/.yoshkey` does, the key is read from `~/.yoshkey` and the provider defaults to Anthropic. `~/.yoshkey` is deprecated.
+### API Key Files
+
+If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the API key in a standalone key file (mode 0600, single line with the key):
+
+- If `provider` is set in `~/.yoconf`: checks `~/.anthropickey` or `~/.openaikey` (matching the provider).
+- If no provider is set: checks `~/.anthropickey`, then `~/.yoshkey` (legacy), then `~/.openaikey`. The provider is set automatically based on which file is found.
+- If no provider is determined from any source, it defaults to Anthropic.
 
 ### Environment Variables
 

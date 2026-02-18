@@ -57,19 +57,22 @@ Response types from the LLM:
 
 ### Configuration
 
-**Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments and three directives:
+**Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments and three directives (all optional):
 ```
-# Provider: "anthropic" (default) or "openai"
+# Provider: "anthropic" or "openai"
 provider anthropic
 
 # Model name (provider-specific)
 model claude-sonnet-4-20250514
 
-# API key
+# API key (optional if using a key file instead)
 key sk-ant-api03-...
 ```
 
-**Legacy fallback**: If `~/.yoconf` doesn't exist but `~/.yoshkey` does, the key is read from `~/.yoshkey` and provider defaults to `anthropic`. `~/.yoshkey` is deprecated.
+**API key files** — If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the key in standalone files (mode 0600, single line):
+- If provider is set in `~/.yoconf`: checks `~/.anthropickey` or `~/.openaikey` (matching the provider).
+- If no provider is set: checks `~/.anthropickey` → `~/.yoshkey` (legacy) → `~/.openaikey`. Provider is set automatically based on which file is found.
+- If no provider is determined from any source, defaults to Anthropic.
 
 **Provider defaults**:
 - Anthropic: model defaults to `claude-sonnet-4-20250514`

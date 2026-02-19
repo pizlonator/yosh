@@ -158,6 +158,7 @@ static const char *yo_name = NULL;
 static const char *yo_documentation = NULL;
 static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
+static char *yo_api_key = NULL;
 static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
 
 /* Track if last command from yo was executed */
@@ -214,8 +215,7 @@ static int yo_is_pump = 0;
 /*                                                                  */
 /* **************************************************************** */
 
-static void yo_reload_config(void);
-static char *yo_load_config(void);
+static bool yo_load_config(void);
 static yo_tool_def_t *yo_get_common_tools(int *count_out);
 static void yo_free_common_tools(yo_tool_def_t *tools, int count);
 static cJSON *yo_build_tools_anthropic(void);
@@ -226,12 +226,12 @@ static void yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                                    const char *result_content);
 static cJSON *yo_build_history_tool_input(int idx);
 static const char *yo_response_type_to_string(yo_response_type_t type);
-static cJSON *yo_call_api(const char *api_key, const char *query);
-static cJSON *yo_call_api_with_scrollback(const char *api_key, const char *query,
-                                             const char *scrollback_request, const char *scrollback_data,
-                                             const char *scrollback_tool_id);
-static cJSON *yo_call_api_with_docs(const char *api_key, const char *query, const char *docs_request,
-                                       const char *docs_tool_id);
+static cJSON *yo_call_api(const char *query);
+static cJSON *yo_call_api_with_scrollback(const char *query,
+                                          const char *scrollback_request, const char *scrollback_data,
+                                          const char *scrollback_tool_id);
+static cJSON *yo_call_api_with_docs(const char *query, const char *docs_request,
+                                    const char *docs_tool_id);
 static int yo_parse_response(cJSON *tool_use, yo_response_t *resp);
 static void yo_display_chat(const char *response);
 static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending);
@@ -255,7 +255,7 @@ static int yo_continuation_hook(void);
 static void yo_continuation_sigcleanup(int, void *);
 
 /* Explanation retry - re-prompts LLM when command response is missing explanation */
-static cJSON *yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original_tool_use);
+static cJSON *yo_retry_for_explanation(const char *query, cJSON *original_tool_use);
 
 /* Response type helpers */
 static const char *yo_response_type_to_string(yo_response_type_t type);
@@ -263,12 +263,12 @@ static yo_response_type_t yo_response_type_from_string(const char *str);
 static void yo_response_free(yo_response_t *resp);
 
 /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
-static int yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *resp);
+static int yo_call_llm(const char *query, int flags, yo_response_t *resp);
 
 /* Request handling helpers (shared by yo_call_llm internals) */
-static int yo_handle_requests(const char *api_key, const char *query,
+static int yo_handle_requests(const char *query,
                               yo_response_t *resp, int max_turns);
-static int yo_handle_explanation_retry(const char *api_key, const char *query,
+static int yo_handle_explanation_retry(const char *query,
                                        yo_response_t *resp);
 
 /* PTY proxy functions */
@@ -372,75 +372,6 @@ static size_t yo_curl_write_callback(void *contents, size_t size, size_t nmemb, 
     mem->data[mem->size] = '\0';
 
     return realsize;
-}
-
-/* **************************************************************** */
-/*                                                                  */
-/*                   Configuration Reload                           */
-/*                                                                  */
-/* **************************************************************** */
-
-static void
-yo_reload_config(void)
-{
-    const char *env_val;
-
-    /* Reload model setting: YO_MODEL env > config file model > provider default */
-    if (yo_model)
-    {
-        free(yo_model);
-        yo_model = NULL;
-    }
-    env_val = getenv("YO_MODEL");
-    if (env_val && *env_val)
-    {
-        yo_model = strdup(env_val);
-    }
-    else if (yo_config_model)
-    {
-        yo_model = strdup(yo_config_model);
-    }
-    else if (yo_provider == YO_PROVIDER_OPENAI)
-    {
-        yo_model = strdup(YO_DEFAULT_OPENAI_MODEL);
-    }
-    else
-    {
-        yo_model = strdup(YO_DEFAULT_MODEL);
-    }
-
-    /* Reload history limit */
-    env_val = getenv("YO_HISTORY_LIMIT");
-    if (env_val && *env_val)
-    {
-        yo_history_limit = atoi(env_val);
-        if (yo_history_limit < 1)
-            yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
-    }
-    else
-    {
-        yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
-    }
-
-    /* Reload token budget */
-    env_val = getenv("YO_TOKEN_BUDGET");
-    if (env_val && *env_val)
-    {
-        yo_token_budget = atoi(env_val);
-        if (yo_token_budget < 100)
-            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
-    }
-    else
-    {
-        yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
-    }
-
-    /* Reload server web setting */
-    env_val = getenv("YO_SERVER_WEB");
-    if (env_val && *env_val == '0')
-        yo_server_web_enabled = 0;
-    else
-        yo_server_web_enabled = 1;
 }
 
 /* **************************************************************** */
@@ -1203,7 +1134,7 @@ yo_install_continuation_sigcleanup(void)
    received or max_turns is exhausted.  Updates resp in place.
    Returns 1 on success, 0 on failure (error already printed, resp zeroed). */
 static int
-yo_handle_requests(const char *api_key, const char *query,
+yo_handle_requests(const char *query,
                    yo_response_t *resp, int max_turns)
 {
     while (max_turns > 0)
@@ -1237,8 +1168,8 @@ yo_handle_requests(const char *api_key, const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_api_with_scrollback(api_key, query,
-                                                          saved_content, scrollback_data, saved_tool_id);
+            new_tool_use = yo_call_api_with_scrollback(
+                query, saved_content, scrollback_data, saved_tool_id);
             free(saved_tool_id);
             free(saved_content);
             free(scrollback_data);
@@ -1276,7 +1207,7 @@ yo_handle_requests(const char *api_key, const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_api_with_docs(api_key, query, "", saved_tool_id);
+            new_tool_use = yo_call_api_with_docs(query, "", saved_tool_id);
             free(saved_tool_id);
 
             if (!new_tool_use)
@@ -1312,7 +1243,7 @@ yo_handle_requests(const char *api_key, const char *query,
    the LLM to include it.  Updates resp in place if the retry succeeds.
    Returns 1 to continue normally, 0 if the user cancelled (caller should abort). */
 static int
-yo_handle_explanation_retry(const char *api_key, const char *query,
+yo_handle_explanation_retry(const char *query,
                             yo_response_t *resp)
 {
     cJSON *retry_tool_use;
@@ -1320,7 +1251,7 @@ yo_handle_explanation_retry(const char *api_key, const char *query,
     if (resp->type != YO_RESPONSE_COMMAND || (resp->explanation && *resp->explanation))
         return 1;  /* No retry needed */
 
-    retry_tool_use = yo_retry_for_explanation(api_key, query, resp->raw_tool_use);
+    retry_tool_use = yo_retry_for_explanation(query, resp->raw_tool_use);
     if (retry_tool_use)
     {
         yo_response_t r;
@@ -1368,14 +1299,14 @@ yo_handle_explanation_retry(const char *api_key, const char *query,
      YO_LLM_RETRY_EXPLANATION            — always retry if explanation missing
      YO_LLM_RETRY_EXPLANATION_IF_PENDING  — retry only if resp->pending */
 static int
-yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *resp)
+yo_call_llm(const char *query, int flags, yo_response_t *resp)
 {
     cJSON *tool_use;
 
     memset(resp, 0, sizeof(*resp));
 
     /* Step 1: Call LLM API */
-    tool_use = yo_call_api(api_key, query);
+    tool_use = yo_call_api(query);
     if (!tool_use)
         return 0;  /* Error/cancellation already printed */
 
@@ -1390,7 +1321,7 @@ yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *re
     resp->raw_tool_use = tool_use;  /* Transfer ownership */
 
     /* Step 3: Handle scrollback/docs requests */
-    if (!yo_handle_requests(api_key, query, resp, 3))
+    if (!yo_handle_requests(query, resp, 3))
     {
         memset(resp, 0, sizeof(*resp));
         return 0;
@@ -1406,7 +1337,7 @@ yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *re
 
         if (do_retry)
         {
-            if (!yo_handle_explanation_retry(api_key, query, resp))
+            if (!yo_handle_explanation_retry(query, resp))
             {
                 /* User cancelled during retry */
                 yo_response_free(resp);
@@ -1425,7 +1356,6 @@ yo_call_llm(const char *api_key, const char *query, int flags, yo_response_t *re
 static int
 yo_continuation_hook(void)
 {
-    char *api_key = NULL;
     char *scrollback = NULL;
     char *cont_query = NULL;
     yo_response_t resp;
@@ -1441,13 +1371,11 @@ yo_continuation_hook(void)
         return 0;
 
     /* Load config and API key */
-    api_key = yo_load_config();
-    if (!api_key)
+    if (!yo_load_config()) 
     {
         yo_continuation_active = 0;
         return 0;
     }
-    yo_reload_config();
 
     yo_print_thinking();
 
@@ -1488,15 +1416,13 @@ yo_continuation_hook(void)
     {
         yo_clear_thinking();
         yo_continuation_active = 0;
-        free(api_key);
         return 0;
     }
 
     /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
-    if (!yo_call_llm(api_key, cont_query, YO_LLM_RETRY_EXPLANATION, &resp))
+    if (!yo_call_llm(cont_query, YO_LLM_RETRY_EXPLANATION, &resp))
     {
         yo_continuation_active = 0;
-        free(api_key);
         free(cont_query);
         return 0;
     }
@@ -1539,7 +1465,6 @@ yo_continuation_hook(void)
 
     /* Cleanup */
     yo_response_free(&resp);
-    free(api_key);
     free(cont_query);
 
     return 0;
@@ -1554,7 +1479,6 @@ yo_continuation_hook(void)
 int
 rl_yo_accept_line(int count, int key)
 {
-    char *api_key = NULL;
     char *saved_query = NULL;
     yo_response_t resp;
 
@@ -1627,8 +1551,7 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Load config file fresh each time (sets provider, config_model, returns key) */
-    api_key = yo_load_config();
-    if (!api_key)
+    if (!yo_load_config())
     {
         /* Error already printed by yo_load_config */
         rl_replace_line("", 0);
@@ -1637,25 +1560,20 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    /* Reload env overrides (uses yo_provider and yo_config_model from above) */
-    yo_reload_config();
-
     /* Show thinking indicator after a newline */
     fprintf(rl_outstream, "\n");
     yo_print_thinking();
 
     /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
     memset(&resp, 0, sizeof(resp));
-    if (!yo_call_llm(api_key, saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
+    if (!yo_call_llm(saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
     {
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
-        free(api_key);
         free(saved_query);
         return 0;
     }
-    free(api_key);
 
     /* Clear thinking indicator on success */
     yo_clear_thinking();
@@ -1819,6 +1737,73 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
     return key;
 }
 
+static void
+yo_finish_config(char* parsed_key)
+{
+    const char *env_val;
+
+    if (yo_api_key)
+        free(yo_api_key);
+    yo_api_key = parsed_key;
+
+    /* Reload model setting: YO_MODEL env > config file model > provider default */
+    if (yo_model)
+    {
+        free(yo_model);
+        yo_model = NULL;
+    }
+    env_val = getenv("YO_MODEL");
+    if (env_val && *env_val)
+    {
+        yo_model = strdup(env_val);
+    }
+    else if (yo_config_model)
+    {
+        yo_model = strdup(yo_config_model);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        yo_model = strdup(YO_DEFAULT_OPENAI_MODEL);
+    }
+    else
+    {
+        yo_model = strdup(YO_DEFAULT_MODEL);
+    }
+
+    /* Reload history limit */
+    env_val = getenv("YO_HISTORY_LIMIT");
+    if (env_val && *env_val)
+    {
+        yo_history_limit = atoi(env_val);
+        if (yo_history_limit < 1)
+            yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+    }
+    else
+    {
+        yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+    }
+
+    /* Reload token budget */
+    env_val = getenv("YO_TOKEN_BUDGET");
+    if (env_val && *env_val)
+    {
+        yo_token_budget = atoi(env_val);
+        if (yo_token_budget < 100)
+            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    }
+    else
+    {
+        yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    }
+
+    /* Reload server web setting */
+    env_val = getenv("YO_SERVER_WEB");
+    if (env_val && *env_val == '0')
+        yo_server_web_enabled = 0;
+    else
+        yo_server_web_enabled = 1;
+}
+
 /* Load configuration from ~/.yoconf and/or provider-specific key files.
    Sets yo_provider and yo_config_model as side effects.
    Returns malloc'd API key string on success, NULL on error (error already printed).
@@ -1827,8 +1812,8 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
    1. ~/.yoconf (all fields optional: provider, model, key)
    2. If key missing and provider known: ~/.anthropickey or ~/.openaikey
    3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey
-   4. YO_MODEL env overrides model (handled by yo_reload_config). */
-static char *
+   4. YO_MODEL env overrides model. */
+static bool
 yo_load_config(void)
 {
     char *home;
@@ -1850,7 +1835,7 @@ yo_load_config(void)
     if (!home)
     {
         yo_print_error("Cannot determine home directory");
-        return NULL;
+        return false;
     }
 
     /* Reset config model */
@@ -1874,14 +1859,14 @@ yo_load_config(void)
         if ((st.st_mode & 0777) != 0600)
         {
             yo_print_error("~/.yoconf must have mode 0600 (current: %04o)", st.st_mode & 0777);
-            return NULL;
+            return false;
         }
 
         fp = fopen(path, "r");
         if (!fp)
         {
             yo_print_error("Cannot read ~/.yoconf: %s", strerror(errno));
-            return NULL;
+            return false;
         }
 
         while (fgets(line, sizeof(line), fp))
@@ -1956,7 +1941,7 @@ yo_load_config(void)
             if (parsed_provider) free(parsed_provider);
             if (parsed_model) free(parsed_model);
             if (parsed_key) free(parsed_key);
-            return NULL;
+            return false;
         }
 
         /* Apply provider if specified */
@@ -1979,7 +1964,7 @@ yo_load_config(void)
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
                 if (parsed_key) free(parsed_key);
-                return NULL;
+                return false;
             }
             free(parsed_provider);
         }
@@ -1996,7 +1981,8 @@ yo_load_config(void)
                 yo_provider = YO_PROVIDER_ANTHROPIC;
                 have_provider = 1;
             }
-            return parsed_key;
+            yo_finish_config(parsed_key);
+            return true;
         }
     }
 
@@ -2023,13 +2009,13 @@ yo_load_config(void)
             return parsed_key;
 
         if (found)
-            return NULL;  /* File existed but had an error — already printed */
+            return false;  /* File existed but had an error — already printed */
 
         yo_print_error("~/.yoconf specifies provider '%s' but no key. "
                        "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
                        yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
                        yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
-        return NULL;
+        return false;
     }
 
     /* Step 3: Neither key nor provider known — try the fallback chain.
@@ -2044,20 +2030,22 @@ yo_load_config(void)
         if (parsed_key)
         {
             yo_provider = YO_PROVIDER_ANTHROPIC;
-            return parsed_key;
+            yo_finish_config(parsed_key);
+            return true;
         }
         if (found)
-            return NULL;
+            return false;
 
         snprintf(path, sizeof(path), "%s/.yoshkey", home);
         parsed_key = yo_read_keyfile(path, "~/.yoshkey", &found);
         if (parsed_key)
         {
             yo_provider = YO_PROVIDER_ANTHROPIC;
-            return parsed_key;
+            yo_finish_config(parsed_key);
+            return true;
         }
         if (found)
-            return NULL;
+            return false;
 
         snprintf(path, sizeof(path), "%s/.openaikey", home);
         parsed_key = yo_read_keyfile(path, "~/.openaikey", &found);
@@ -2067,13 +2055,13 @@ yo_load_config(void)
             return parsed_key;
         }
         if (found)
-            return NULL;
+            return false;
     }
 
     yo_print_error("No API key found. Create ~/.yoconf with your API key (mode 0600), "
                    "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
                    "See 'yo how do I configure the LLM' for details.");
-    return NULL;
+    return false;
 }
 
 /* **************************************************************** */
@@ -2500,7 +2488,7 @@ http_error:
    Returns malloc'd request body string.  Sets *url_out and *headers_out.
    Caller must free the request body and the headers (via curl_slist_free_all). */
 static char *
-yo_build_anthropic_request(const char *api_key, cJSON *messages,
+yo_build_anthropic_request(cJSON *messages,
                            const char **url_out, struct curl_slist **headers_out,
                            long *timeout_out)
 {
@@ -2562,7 +2550,7 @@ yo_build_anthropic_request(const char *api_key, cJSON *messages,
     cJSON_Delete(request_json);
 
     /* Set up headers */
-    snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
+    snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", yo_api_key);
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
@@ -2714,7 +2702,7 @@ yo_parse_anthropic_response(const char *response_data, int is_retry,
    Returns malloc'd request body string.  Sets *url_out and *headers_out.
    Caller must free the request body and the headers. */
 static char *
-yo_build_openai_request(const char *api_key, cJSON *messages,
+yo_build_openai_request(cJSON *messages,
                         const char **url_out, struct curl_slist **headers_out,
                         long *timeout_out)
 {
@@ -2807,7 +2795,7 @@ yo_build_openai_request(const char *api_key, cJSON *messages,
     cJSON_Delete(request_json);
 
     /* Set up headers */
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
@@ -2960,20 +2948,20 @@ yo_parse_openai_response(const char *response_data)
 /* **************************************************************** */
 
 /* Forward declaration for retry logic */
-static cJSON *yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_retry);
+static cJSON *yo_call_api_with_messages_internal(cJSON *messages, int is_retry);
 
 /* Internal function to call LLM API with pre-built messages array.
    Messages must be in the current provider's native format.
    The messages array is consumed (freed internally).
    Returns a normalized tool_use cJSON object (caller must free with cJSON_Delete). */
 static cJSON *
-yo_call_api_with_messages(const char *api_key, cJSON *messages)
+yo_call_api_with_messages(cJSON *messages)
 {
-    return yo_call_api_with_messages_internal(api_key, messages, 0);
+    return yo_call_api_with_messages_internal(messages, 0);
 }
 
 static cJSON *
-yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_retry)
+yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
 {
     const char *url;
     struct curl_slist *headers = NULL;
@@ -2985,11 +2973,11 @@ yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_
     /* Provider-specific request building */
     if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        request_body = yo_build_openai_request(api_key, messages, &url, &headers, &timeout);
+        request_body = yo_build_openai_request(messages, &url, &headers, &timeout);
     }
     else
     {
-        request_body = yo_build_anthropic_request(api_key, messages, &url, &headers, &timeout);
+        request_body = yo_build_anthropic_request(messages, &url, &headers, &timeout);
     }
     /* Note: messages is now owned by the request JSON and freed with it */
 
@@ -3040,7 +3028,7 @@ yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_
                 "the most appropriate one for the user's request.");
             cJSON_AddItemToArray(retry_messages, user_msg);
 
-            return yo_call_api_with_messages_internal(api_key, retry_messages, 1);
+            return yo_call_api_with_messages_internal(retry_messages, 1);
         }
 
         return result;
@@ -3049,21 +3037,21 @@ yo_call_api_with_messages_internal(const char *api_key, cJSON *messages, int is_
 
 /* Main API call function - builds messages from query and calls API */
 static cJSON *
-yo_call_api(const char *api_key, const char *query)
+yo_call_api(const char *query)
 {
     cJSON *messages = yo_build_messages(query);
-    return yo_call_api_with_messages(api_key, messages);
+    return yo_call_api_with_messages(messages);
 }
 
 /* API call with scrollback context - for follow-up after scrollback request */
 static cJSON *
-yo_call_api_with_scrollback(const char *api_key, const char *query,
-                               const char *scrollback_request, const char *scrollback_data,
-                               const char *scrollback_tool_id)
+yo_call_api_with_scrollback(const char *query,
+                            const char *scrollback_request, const char *scrollback_data,
+                            const char *scrollback_tool_id)
 {
     cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request,
                                                         scrollback_data, scrollback_tool_id);
-    return yo_call_api_with_messages(api_key, messages);
+    return yo_call_api_with_messages(messages);
 }
 
 /* **************************************************************** */
@@ -3079,7 +3067,7 @@ yo_call_api_with_scrollback(const char *api_key, const char *query,
    The original_tool_use is in normalized (internal) format; the retry
    messages are built in the current provider's native format. */
 static cJSON *
-yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original_tool_use)
+yo_retry_for_explanation(const char *query, cJSON *original_tool_use)
 {
     cJSON *messages;
     cJSON *id_item;
@@ -3116,7 +3104,7 @@ yo_retry_for_explanation(const char *api_key, const char *query, cJSON *original
         "The explanation is shown to the user before the command and is essential "
         "for them to understand what the command does.");
 
-    return yo_call_api_with_messages(api_key, messages);
+    return yo_call_api_with_messages(messages);
 }
 
 /* **************************************************************** */
@@ -3650,9 +3638,9 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 
 /* API call with docs context - for follow-up after docs request */
 static cJSON *
-yo_call_api_with_docs(const char *api_key, const char *query, const char *docs_request,
-                         const char *docs_tool_id)
+yo_call_api_with_docs(const char *query, const char *docs_request,
+                      const char *docs_tool_id)
 {
     cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id);
-    return yo_call_api_with_messages(api_key, messages);
+    return yo_call_api_with_messages(messages);
 }

@@ -104,7 +104,13 @@ model claude-sonnet-4-20250514
 
 # API key (optional if using a key file instead)
 key sk-ant-api03-...
+
+# Chat display prefix/reset (optional, supports C-style escapes)
+# chat_prefix \033[3;36m
+# chat_reset \033[0m
 ```
+
+Values for `chat_prefix` and `chat_reset` support C-style escape sequences (`\033`, `\n`, `\t`, `\\`) and optional quoting with `"` or `'` to preserve whitespace.
 
 ### API Key Files
 

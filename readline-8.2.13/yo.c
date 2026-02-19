@@ -160,6 +160,8 @@ static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
 static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
+static char *yo_chat_prefix = NULL;  /* from ~/.yoconf chat_prefix, default: cyan italic */
+static char *yo_chat_reset = NULL;   /* from ~/.yoconf chat_reset, default: reset */
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -248,7 +250,8 @@ static void yo_print_error(const char *msg, ...);
 static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static void yo_report_parse_error(cJSON *tool_use);
-static const char *yo_get_chat_color(void);
+static const char *yo_get_chat_prefix(void);
+static const char *yo_get_chat_reset(void);
 
 /* Continuation hook and signal cleanup */
 static int yo_continuation_hook(void);
@@ -1542,13 +1545,15 @@ rl_yo_accept_line(int count, int key)
         yo_scrollback_clear();
         yo_continuation_active = 0;
         yo_last_was_command = 0;
-        fprintf(rl_outstream, "%sContext reset%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fprintf(rl_outstream, "%sContext reset%s\n", yo_get_chat_prefix(), yo_get_chat_reset());
         fflush(rl_outstream);
         rl_replace_line("", 0);
         rl_on_new_line();
         rl_redisplay();
         return 0;
     }
+
+    fprintf(rl_outstream, "\n");
 
     /* Load config file fresh each time (sets provider, config_model, returns key) */
     if (!yo_load_config())
@@ -1560,8 +1565,6 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    /* Show thinking indicator after a newline */
-    fprintf(rl_outstream, "\n");
     yo_print_thinking();
 
     /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
@@ -1665,6 +1668,115 @@ yo_trim(char *s)
     *end = '\0';
 
     return s;
+}
+
+/* Parse a config value with C-string escape processing and optional quoting.
+   Input: pointer to the value portion of a config line (after directive + whitespace).
+   - If the value starts with " or ', everything up to the matching closing quote
+     is the raw value (quotes are not included in the result).
+   - If unquoted, the value extends to the first # comment or end of line,
+     with leading and trailing whitespace stripped.
+   - In both cases, C-style escape sequences are processed: \n, \t, \\, \0NNN (octal).
+   Returns a malloc'd string, or NULL on error.
+   On error, sets *error_msg to a static string describing the problem. */
+static char *
+yo_parse_config_string(const char *input, const char **error_msg)
+{
+    const char *src;
+    const char *end;
+    char *result;
+    char *dst;
+    int quoted = 0;
+    char quote_char = 0;
+
+    *error_msg = NULL;
+
+    /* Skip leading whitespace (already done by caller, but be safe) */
+    while (*input == ' ' || *input == '\t')
+        input++;
+
+    if (*input == '"' || *input == '\'')
+    {
+        quoted = 1;
+        quote_char = *input;
+        input++;  /* skip opening quote */
+
+        /* Find closing quote */
+        end = input;
+        while (*end && *end != quote_char)
+        {
+            if (*end == '\\' && end[1])
+                end++;  /* skip escaped char */
+            end++;
+        }
+
+        if (*end != quote_char)
+        {
+            *error_msg = "unterminated quoted string";
+            return NULL;
+        }
+        /* end points at closing quote */
+    }
+    else
+    {
+        /* Unquoted: value extends to # comment or end of line */
+        end = input;
+        while (*end && *end != '#' && *end != '\n' && *end != '\r')
+            end++;
+
+        /* Trim trailing whitespace */
+        while (end > input && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+    }
+
+    /* Allocate result (at most end - input bytes, escapes only shrink) */
+    result = malloc((size_t)(end - input) + 1);
+    dst = result;
+    src = input;
+
+    while (src < end)
+    {
+        if (*src == '\\' && src + 1 < end)
+        {
+            src++;
+            switch (*src)
+            {
+            case 'n':  *dst++ = '\n'; src++; break;
+            case 't':  *dst++ = '\t'; src++; break;
+            case 'r':  *dst++ = '\r'; src++; break;
+            case '\\': *dst++ = '\\'; src++; break;
+            case '"':  *dst++ = '"';  src++; break;
+            case '\'': *dst++ = '\''; src++; break;
+            case '0':
+                /* Octal: \0, \0N, \0NN, \0NNN */
+                {
+                    unsigned int val = 0;
+                    int digits = 0;
+                    src++;  /* skip the '0' */
+                    while (digits < 3 && src < end && *src >= '0' && *src <= '7')
+                    {
+                        val = val * 8 + (unsigned int)(*src - '0');
+                        src++;
+                        digits++;
+                    }
+                    *dst++ = (char)val;
+                }
+                break;
+            default:
+                /* Unknown escape — keep the backslash and character */
+                *dst++ = '\\';
+                *dst++ = *src++;
+                break;
+            }
+        }
+        else
+        {
+            *dst++ = *src++;
+        }
+    }
+
+    *dst = '\0';
+    return result;
 }
 
 /* Read an API key from a single-line key file (e.g. ~/.anthropickey, ~/.yoshkey).
@@ -1834,15 +1946,25 @@ yo_load_config(void)
 
     if (!home)
     {
-        yo_print_error("Cannot determine home directory");
+        yo_print_error_no_newline("Cannot determine home directory");
         return false;
     }
 
-    /* Reset config model */
+    /* Reset config state */
     if (yo_config_model)
     {
         free(yo_config_model);
         yo_config_model = NULL;
+    }
+    if (yo_chat_prefix)
+    {
+        free(yo_chat_prefix);
+        yo_chat_prefix = NULL;
+    }
+    if (yo_chat_reset)
+    {
+        free(yo_chat_reset);
+        yo_chat_reset = NULL;
     }
 
     /* Step 1: Try ~/.yoconf — all fields optional */
@@ -1858,14 +1980,15 @@ yo_load_config(void)
 
         if ((st.st_mode & 0777) != 0600)
         {
-            yo_print_error("~/.yoconf must have mode 0600 (current: %04o)", st.st_mode & 0777);
+            yo_print_error_no_newline("~/.yoconf must have mode 0600 (current: %04o)",
+                                      st.st_mode & 0777);
             return false;
         }
 
         fp = fopen(path, "r");
         if (!fp)
         {
-            yo_print_error("Cannot read ~/.yoconf: %s", strerror(errno));
+            yo_print_error_no_newline("Cannot read ~/.yoconf: %s", strerror(errno));
             return false;
         }
 
@@ -1897,7 +2020,8 @@ yo_load_config(void)
             {
                 if (!*value)
                 {
-                    yo_print_error("~/.yoconf:%d: 'provider' requires a value (anthropic or openai)", line_num);
+                    yo_print_error_no_newline(
+                        "~/.yoconf:%d: 'provider' requires a value (anthropic or openai)", line_num);
                     had_error = 1;
                     break;
                 }
@@ -1908,7 +2032,7 @@ yo_load_config(void)
             {
                 if (!*value)
                 {
-                    yo_print_error("~/.yoconf:%d: 'model' requires a value", line_num);
+                    yo_print_error_no_newline("~/.yoconf:%d: 'model' requires a value", line_num);
                     had_error = 1;
                     break;
                 }
@@ -1919,16 +2043,43 @@ yo_load_config(void)
             {
                 if (!*value)
                 {
-                    yo_print_error("~/.yoconf:%d: 'key' requires a value", line_num);
+                    yo_print_error_no_newline("~/.yoconf:%d: 'key' requires a value", line_num);
                     had_error = 1;
                     break;
                 }
                 if (parsed_key) free(parsed_key);
                 parsed_key = strdup(value);
             }
+            else if (strcmp(directive, "chat_prefix") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: chat_prefix: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_chat_prefix) free(yo_chat_prefix);
+                yo_chat_prefix = parsed;
+            }
+            else if (strcmp(directive, "chat_reset") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: chat_reset: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_chat_reset) free(yo_chat_reset);
+                yo_chat_reset = parsed;
+            }
             else
             {
-                yo_print_error("~/.yoconf:%d: unknown directive '%s'", line_num, directive);
+                yo_print_error_no_newline(
+                    "~/.yoconf:%d: unknown directive '%s'", line_num, directive);
                 had_error = 1;
                 break;
             }
@@ -1941,6 +2092,8 @@ yo_load_config(void)
             if (parsed_provider) free(parsed_provider);
             if (parsed_model) free(parsed_model);
             if (parsed_key) free(parsed_key);
+            if (yo_chat_prefix) { free(yo_chat_prefix); yo_chat_prefix = NULL; }
+            if (yo_chat_reset) { free(yo_chat_reset); yo_chat_reset = NULL; }
             return false;
         }
 
@@ -1959,8 +2112,9 @@ yo_load_config(void)
             }
             else
             {
-                yo_print_error("~/.yoconf: unknown provider '%s' (expected 'anthropic' or 'openai')",
-                               parsed_provider);
+                yo_print_error_no_newline(
+                    "~/.yoconf: unknown provider '%s' (expected 'anthropic' or 'openai')",
+                    parsed_provider);
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
                 if (parsed_key) free(parsed_key);
@@ -2011,10 +2165,11 @@ yo_load_config(void)
         if (found)
             return false;  /* File existed but had an error — already printed */
 
-        yo_print_error("~/.yoconf specifies provider '%s' but no key. "
-                       "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
-                       yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
-                       yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
+        yo_print_error_no_newline(
+            "~/.yoconf specifies provider '%s' but no key. "
+            "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
+            yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
+            yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
         return false;
     }
 
@@ -2058,9 +2213,9 @@ yo_load_config(void)
             return false;
     }
 
-    yo_print_error("No API key found. Create ~/.yoconf with your API key (mode 0600), "
-                   "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
-                   "See 'yo how do I configure the LLM' for details.");
+    yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
+                              "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
+                              "See 'yo how do I configure the LLM' for details.");
     return false;
 }
 
@@ -2411,7 +2566,7 @@ yo_http_post(const char *url, struct curl_slist *headers,
     if (cancelled)
     {
         yo_clear_thinking();
-        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_color(), YO_COLOR_RESET);
+        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_prefix(), yo_get_chat_reset());
         fflush(rl_outstream);
         goto http_error;
     }
@@ -2602,7 +2757,7 @@ yo_parse_anthropic_response(const char *response_data, int is_retry,
             if (msg && cJSON_IsString(msg))
             {
                 fprintf(rl_outstream, "%sAPI error: %s%s\n",
-                        yo_get_chat_color(), msg->valuestring, YO_COLOR_RESET);
+                        yo_get_chat_prefix(), msg->valuestring, yo_get_chat_reset());
                 fflush(rl_outstream);
             }
             else
@@ -2835,7 +2990,7 @@ yo_parse_openai_response(const char *response_data)
             if (msg && cJSON_IsString(msg))
             {
                 fprintf(rl_outstream, "%sAPI error: %s%s\n",
-                        yo_get_chat_color(), msg->valuestring, YO_COLOR_RESET);
+                        yo_get_chat_prefix(), msg->valuestring, yo_get_chat_reset());
                 fflush(rl_outstream);
             }
             else
@@ -3263,27 +3418,30 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
 /* **************************************************************** */
 
 static const char *
-yo_get_chat_color(void)
+yo_get_chat_prefix(void)
 {
-    const char *env_val = getenv("YO_CHAT_COLOR");
-    if (env_val && *env_val)
-        return env_val;
-    return YO_DEFAULT_CHAT_COLOR;
+    return yo_chat_prefix ? yo_chat_prefix : YO_DEFAULT_CHAT_COLOR;
+}
+
+static const char *
+yo_get_chat_reset(void)
+{
+    return yo_chat_reset ? yo_chat_reset : YO_COLOR_RESET;
 }
 
 static void
 yo_display_chat(const char *response)
 {
-    fprintf(rl_outstream, "%s%s%s\n", yo_get_chat_color(), response, YO_COLOR_RESET);
+    fprintf(rl_outstream, "%s%s%s\n", yo_get_chat_prefix(), response, yo_get_chat_reset());
     fflush(rl_outstream);
 }
 
 static void
 yo_print_error_no_newlinev(const char *msg, va_list args)
 {
-    fprintf(rl_outstream, "%sError: ", yo_get_chat_color());
+    fprintf(rl_outstream, "%sError: ", yo_get_chat_prefix());
     vfprintf(rl_outstream, msg, args);
-    fprintf(rl_outstream, "%s\n", YO_COLOR_RESET);
+    fprintf(rl_outstream, "%s\n", yo_get_chat_reset());
     fflush(rl_outstream);
 }
 
@@ -3309,7 +3467,7 @@ yo_print_error(const char *msg, ...)
 static void
 yo_print_thinking(void)
 {
-    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_color(), YO_COLOR_RESET);
+    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_prefix(), yo_get_chat_reset());
     fflush(rl_outstream);
 }
 

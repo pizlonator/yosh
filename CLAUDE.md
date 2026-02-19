@@ -57,7 +57,7 @@ Response types from the LLM:
 
 ### Configuration
 
-**Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments and three directives (all optional):
+**Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments. All directives are optional:
 ```
 # Provider: "anthropic" or "openai"
 provider anthropic
@@ -67,6 +67,10 @@ model claude-sonnet-4-20250514
 
 # API key (optional if using a key file instead)
 key sk-ant-api03-...
+
+# Chat display prefix/reset (C-style escapes supported, optional quoting with " or ')
+# chat_prefix \033[3;36m
+# chat_reset \033[0m
 ```
 
 **API key files** — If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the key in standalone files (mode 0600, single line):

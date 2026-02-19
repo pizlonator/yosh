@@ -120,17 +120,20 @@ If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks 
 - If no provider is set: checks `~/.anthropickey`, then `~/.yoshkey` (legacy), then `~/.openaikey`. The provider is set automatically based on which file is found.
 - If no provider is determined from any source, it defaults to Anthropic.
 
-### Environment Variables
+### Additional Directives
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `YO_MODEL` | Provider default | Override the model from `~/.yoconf` |
-| `YO_HISTORY_LIMIT` | `10` | Max conversation exchanges to remember |
-| `YO_TOKEN_BUDGET` | `4096` | Max tokens for history context |
-| `YO_SCROLLBACK_ENABLED` | `1` | Set to `0` to disable terminal scrollback capture |
-| `YO_SCROLLBACK_BYTES` | `1048576` | Max scrollback buffer size (1MB) |
-| `YO_SCROLLBACK_LINES` | `1000` | Max lines to return to the LLM |
-| `YO_SERVER_WEB` | `1` | Set to `0` to disable server-side web search |
+All settings are configured in `~/.yoconf`. The file is re-read on each `yo` command, so most changes take effect immediately. Scrollback settings are read once at startup.
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `history_limit` | `10` | Max conversation exchanges to remember |
+| `token_budget` | `4096` | Max tokens for history context |
+| `scrollback_enabled` | `1` | Set to `0` to disable terminal scrollback capture (startup only) |
+| `scrollback_bytes` | `1048576` | Max scrollback buffer size in bytes (startup only) |
+| `scrollback_lines` | `1000` | Max lines to return to the LLM (startup only) |
+| `server_web` | `1` | Set to `0` to disable server-side web search |
+| `chat_prefix` | `\033[3;36m` | String printed before chat output (supports C escapes) |
+| `chat_reset` | `\033[0m` | String printed after chat output (supports C escapes) |
 
 ## Usage
 

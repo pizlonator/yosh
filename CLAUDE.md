@@ -82,14 +82,15 @@ key sk-ant-api03-...
 - Anthropic: model defaults to `claude-sonnet-4-20250514`
 - OpenAI: model defaults to `gpt-4o-mini`
 
-**Environment variables**:
-- **YO_MODEL**: Overrides the model from `~/.yoconf` or the provider default
-- **YO_HISTORY_LIMIT**: Max conversation exchanges to remember (default 10)
-- **YO_TOKEN_BUDGET**: Max tokens for history context (default 4096)
-- **YO_SCROLLBACK_ENABLED**: Set to `0` to disable PTY proxy / scrollback capture
-- **YO_SCROLLBACK_BYTES**: Max scrollback buffer size (default 1MB)
-- **YO_SCROLLBACK_LINES**: Max lines to return to LLM (default 1000)
-- **YO_SERVER_WEB**: Set to `0` to disable server-side web search and fetch (both providers, default: enabled)
+**Additional config directives** (all in `~/.yoconf`, re-read on each yo command unless noted):
+- **history_limit**: Max conversation exchanges to remember (default 10)
+- **token_budget**: Max tokens for history context (default 4096)
+- **scrollback_enabled**: Set to `0` to disable PTY proxy / scrollback capture (startup only)
+- **scrollback_bytes**: Max scrollback buffer size (default 1MB, startup only)
+- **scrollback_lines**: Max lines to return to LLM (default 1000, startup only)
+- **server_web**: Set to `0` to disable server-side web search and fetch (both providers, default: enabled)
+- **chat_prefix**: String printed before chat output (default: `\033[3;36m`, supports C escapes)
+- **chat_reset**: String printed after chat output (default: `\033[0m`, supports C escapes)
 - **Distro detection**: `rl_yo_enable()` reads `/etc/os-release` and appends it to the system prompt.
 
 ### Session Memory

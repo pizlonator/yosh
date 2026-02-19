@@ -160,8 +160,11 @@ static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
 static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
-static char *yo_chat_prefix = NULL;  /* from ~/.yoconf chat_prefix, default: cyan italic */
-static char *yo_chat_reset = NULL;   /* from ~/.yoconf chat_reset, default: reset */
+static char *yo_chat_prefix = NULL;   /* from ~/.yoconf chat_prefix, default: cyan italic */
+static char *yo_chat_reset = NULL;    /* from ~/.yoconf chat_reset, default: reset */
+static int yo_config_scrollback_enabled = -1; /* -1 = not set (use default: enabled) */
+static long yo_config_scrollback_bytes = -1;  /* -1 = not set (use default) */
+static int yo_config_scrollback_lines = -1;   /* -1 = not set (use default) */
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -195,7 +198,7 @@ static pid_t yo_child_pid = -1;
 /* Scrollback buffer - allocated with mmap for sharing between pump and shell */
 typedef struct {
     pthread_mutex_t lock;
-    size_t capacity;        /* max buffer size (from YO_SCROLLBACK_BYTES) */
+    size_t capacity;        /* max buffer size (from scrollback_bytes config) */
     size_t write_pos;       /* circular write position */
     size_t data_size;       /* current amount of data (up to capacity) */
     int max_lines;          /* max lines to track */
@@ -641,15 +644,22 @@ yo_pty_init(void)
 {
     struct winsize ws;
     struct termios term;
-    const char *env_val;
     size_t scrollback_bytes = YO_DEFAULT_SCROLLBACK_BYTES;
     int scrollback_lines = YO_DEFAULT_SCROLLBACK_LINES;
     pthread_mutexattr_t mutex_attr;
     pid_t pid;
 
+    /* Load config early so scrollback settings from ~/.yoconf are available.
+       If config loading fails, disable scrollback rather than aborting init. */
+    if (!yo_load_config())
+    {
+        yo_display_chat("Disabling scrollback because of ~/.yoconf error");
+        yo_scrollback_enabled = 0;
+        return 0;
+    }
+
     /* Check if scrollback is disabled */
-    env_val = getenv("YO_SCROLLBACK_ENABLED");
-    if (env_val && *env_val == '0')
+    if (yo_config_scrollback_enabled == 0)
     {
         yo_scrollback_enabled = 0;
         return 0;  /* Not an error, just disabled */
@@ -662,22 +672,12 @@ yo_pty_init(void)
         return 0;  /* Not a terminal, can't use PTY */
     }
 
-    /* Read scrollback configuration */
-    env_val = getenv("YO_SCROLLBACK_BYTES");
-    if (env_val && *env_val)
-    {
-        long val = atol(env_val);
-        if (val > 0)
-            scrollback_bytes = (size_t)val;
-    }
+    /* Read scrollback configuration from config statics */
+    if (yo_config_scrollback_bytes > 0)
+        scrollback_bytes = (size_t)yo_config_scrollback_bytes;
 
-    env_val = getenv("YO_SCROLLBACK_LINES");
-    if (env_val && *env_val)
-    {
-        int val = atoi(env_val);
-        if (val > 0)
-            scrollback_lines = val;
-    }
+    if (yo_config_scrollback_lines > 0)
+        scrollback_lines = yo_config_scrollback_lines;
 
     /* Save original terminal settings */
     if (tcgetattr(STDIN_FILENO, &yo_orig_termios) == 0)
@@ -1849,27 +1849,22 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
     return key;
 }
 
+/* Apply final config after yo_load_config has parsed ~/.yoconf and resolved the key.
+   Sets yo_api_key and resolves the model (config model > provider default). */
 static void
-yo_finish_config(char* parsed_key)
+yo_finish_config(char *parsed_key)
 {
-    const char *env_val;
-
     if (yo_api_key)
         free(yo_api_key);
     yo_api_key = parsed_key;
 
-    /* Reload model setting: YO_MODEL env > config file model > provider default */
+    /* Resolve model: config file model > provider default */
     if (yo_model)
     {
         free(yo_model);
         yo_model = NULL;
     }
-    env_val = getenv("YO_MODEL");
-    if (env_val && *env_val)
-    {
-        yo_model = strdup(env_val);
-    }
-    else if (yo_config_model)
+    if (yo_config_model)
     {
         yo_model = strdup(yo_config_model);
     }
@@ -1881,39 +1876,6 @@ yo_finish_config(char* parsed_key)
     {
         yo_model = strdup(YO_DEFAULT_MODEL);
     }
-
-    /* Reload history limit */
-    env_val = getenv("YO_HISTORY_LIMIT");
-    if (env_val && *env_val)
-    {
-        yo_history_limit = atoi(env_val);
-        if (yo_history_limit < 1)
-            yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
-    }
-    else
-    {
-        yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
-    }
-
-    /* Reload token budget */
-    env_val = getenv("YO_TOKEN_BUDGET");
-    if (env_val && *env_val)
-    {
-        yo_token_budget = atoi(env_val);
-        if (yo_token_budget < 100)
-            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
-    }
-    else
-    {
-        yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
-    }
-
-    /* Reload server web setting */
-    env_val = getenv("YO_SERVER_WEB");
-    if (env_val && *env_val == '0')
-        yo_server_web_enabled = 0;
-    else
-        yo_server_web_enabled = 1;
 }
 
 /* Load configuration from ~/.yoconf and/or provider-specific key files.
@@ -1924,7 +1886,7 @@ yo_finish_config(char* parsed_key)
    1. ~/.yoconf (all fields optional: provider, model, key)
    2. If key missing and provider known: ~/.anthropickey or ~/.openaikey
    3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey
-   4. YO_MODEL env overrides model. */
+   4. Model defaults applied by yo_finish_config. */
 static bool
 yo_load_config(void)
 {
@@ -1966,6 +1928,12 @@ yo_load_config(void)
         free(yo_chat_reset);
         yo_chat_reset = NULL;
     }
+    yo_config_scrollback_enabled = -1;
+    yo_config_scrollback_bytes = -1;
+    yo_config_scrollback_lines = -1;
+    yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+    yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    yo_server_web_enabled = 1;
 
     /* Step 1: Try ~/.yoconf — all fields optional */
     snprintf(path, sizeof(path), "%s/.yoconf", home);
@@ -2076,6 +2044,74 @@ yo_load_config(void)
                 if (yo_chat_reset) free(yo_chat_reset);
                 yo_chat_reset = parsed;
             }
+            else if (strcmp(directive, "scrollback_enabled") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'scrollback_enabled' requires a value (0 or 1)", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_config_scrollback_enabled = (*value == '0') ? 0 : 1;
+            }
+            else if (strcmp(directive, "scrollback_bytes") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'scrollback_bytes' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_config_scrollback_bytes = atol(value);
+                if (yo_config_scrollback_bytes <= 0)
+                    yo_config_scrollback_bytes = YO_DEFAULT_SCROLLBACK_BYTES;
+            }
+            else if (strcmp(directive, "scrollback_lines") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'scrollback_lines' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_config_scrollback_lines = atoi(value);
+                if (yo_config_scrollback_lines <= 0)
+                    yo_config_scrollback_lines = YO_DEFAULT_SCROLLBACK_LINES;
+            }
+            else if (strcmp(directive, "history_limit") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'history_limit' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_history_limit = atoi(value);
+                if (yo_history_limit < 1)
+                    yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
+            }
+            else if (strcmp(directive, "token_budget") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'token_budget' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_token_budget = atoi(value);
+                if (yo_token_budget < 100)
+                    yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+            }
+            else if (strcmp(directive, "server_web") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'server_web' requires a value (0 or 1)", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_server_web_enabled = (*value == '0') ? 0 : 1;
+            }
             else
             {
                 yo_print_error_no_newline(
@@ -2160,7 +2196,10 @@ yo_load_config(void)
         }
 
         if (parsed_key)
-            return parsed_key;
+        {
+            yo_finish_config(parsed_key);
+            return true;
+        }
 
         if (found)
             return false;  /* File existed but had an error — already printed */
@@ -2207,7 +2246,8 @@ yo_load_config(void)
         if (parsed_key)
         {
             yo_provider = YO_PROVIDER_OPENAI;
-            return parsed_key;
+            yo_finish_config(parsed_key);
+            return true;
         }
         if (found)
             return false;

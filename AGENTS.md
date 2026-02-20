@@ -48,6 +48,8 @@ The yo feature is an **opt-in readline extension** (like history). Readline prov
 - The Responses API always returns `"error": null` on success — error checking must use `cJSON_IsNull()` to avoid false positives
 - OpenAI Responses API uses flat items in `input[]` (`{"type":"function_call",...}`, `{"type":"function_call_output",...}`) rather than role-based messages for tool interactions
 - OpenAI Responses API uses `"instructions"` for system prompt (not a system message in the input array), `"input"` instead of `"messages"`, `"max_output_tokens"` instead of `"max_completion_tokens"`, and `"output[]"` instead of `"choices[].message"`
+- Tool definitions are built separately per provider. OpenAI tools are stricter (e.g., `command.pending` is required and descriptions strongly bias toward command/tool use).
+- OpenAI scrollback is sanitized (ANSI/escape sequences stripped) before sending it to the model; Anthropic receives raw scrollback.
 
 Response types from the LLM:
 - **command** — `{"type":"command","command":"...","explanation":"..."}` — prefills the command in the prompt for the user to review/edit/execute.
@@ -63,7 +65,7 @@ Response types from the LLM:
 provider anthropic
 
 # Model name (provider-specific)
-model claude-sonnet-4-20250514
+model claude-sonnet-4-5-20250929
 
 # API key (optional if using a key file instead)
 key sk-ant-api03-...
@@ -79,8 +81,8 @@ key sk-ant-api03-...
 - If no provider is determined from any source, defaults to Anthropic.
 
 **Provider defaults**:
-- Anthropic: model defaults to `claude-sonnet-4-20250514`
-- OpenAI: model defaults to `gpt-4o-mini`
+- Anthropic: model defaults to `claude-sonnet-4-5-20250929`
+- OpenAI: model defaults to `gpt-5`
 
 **Additional config directives** (all in `~/.yoconf`, re-read on each yo command unless noted):
 - **history_limit**: Max conversation exchanges to remember (default 10)
@@ -133,7 +135,7 @@ bash <---> PTY slave | PTY master <---> pump process <---> real terminal
 
 ### Ctrl-C Cancellation
 
-Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches both curl sockets and the signal pipe for near-instantaneous cancellation during API calls.
+Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches both curl sockets and the signal pipe for near-instantaneous cancellation during API calls. There is no API timeout; Ctrl-C is the user-controlled cancel path.
 
 ### Key Files
 

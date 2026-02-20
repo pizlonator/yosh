@@ -67,18 +67,19 @@
 #define YO_MAX_TOKENS 1024
 #define YO_DEFAULT_OPENAI_MODEL "gpt-4o-mini"
 
-/* Default styling.  Base text is italic cyan.  Style prefixes are always
-   emitted after a full SGR reset (\033[0m), so they must set all desired
-   attributes from scratch.
-   - color_prefix:       italic + cyan  (the base "chat" look)
-   - italic_prefix:      cyan only      (*italic* toggles italic OFF since base is italic)
-   - bold_prefix:        bold + italic + cyan  (**bold** adds bold, keeps italic)
-   - bold_italic_prefix: bold + cyan    (***both*** — bold kept, italic toggled off) */
+/* Default styling.  Base text is italic cyan (color_prefix).
+   Since base is already italic, markdown *italic* toggles italic OFF;
+   leaving *italic* toggles it back ON.  Bold is straightforward on/off.
+   These are individual SGR toggles — they compose with existing state. */
 #define YO_DEFAULT_COLOR_PREFIX "\033[3;36m"
 #define YO_DEFAULT_COLOR_RESET "\033[0m"
-#define YO_DEFAULT_ITALIC_PREFIX "\033[36m"
-#define YO_DEFAULT_BOLD_PREFIX "\033[1;3;36m"
-#define YO_DEFAULT_BOLD_ITALIC_PREFIX "\033[1;36m"
+#define YO_DEFAULT_ENABLE_ITALIC "\033[23m"   /* disable terminal italic (toggle off from italic base) */
+#define YO_DEFAULT_DISABLE_ITALIC "\033[3m"   /* re-enable terminal italic (back to base) */
+#define YO_DEFAULT_ENABLE_BOLD "\033[1m"      /* turn bold on */
+#define YO_DEFAULT_DISABLE_BOLD "\033[22m"    /* turn bold off */
+#define YO_DEFAULT_ENABLE_STRIKETHROUGH "\033[9m"   /* turn strikethrough on */
+#define YO_DEFAULT_DISABLE_STRIKETHROUGH "\033[29m" /* turn strikethrough off */
+#define YO_DEFAULT_CODE_DELIMITER "\033[0;3;38;5;23m" /* reset, italic, dark cyan (256-color #23) */
 
 /* Scrollback defaults */
 #define YO_DEFAULT_SCROLLBACK_LINES 1000
@@ -172,9 +173,13 @@ static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env overri
 static char *yo_chat_prefix = NULL;   /* from ~/.yoconf chat_prefix, default: empty */
 static char *yo_color_prefix = NULL;  /* from ~/.yoconf color_prefix, default: cyan italic */
 static char *yo_color_reset = NULL;   /* from ~/.yoconf color_reset, default: reset */
-static char *yo_italic_prefix = NULL;      /* from ~/.yoconf italic_prefix, default: cyan */
-static char *yo_bold_prefix = NULL;        /* from ~/.yoconf bold_prefix, default: bold+italic+cyan */
-static char *yo_bold_italic_prefix = NULL; /* from ~/.yoconf bold_italic_prefix, default: bold+cyan */
+static char *yo_enable_italic = NULL;   /* from ~/.yoconf enable_italic */
+static char *yo_disable_italic = NULL;  /* from ~/.yoconf disable_italic */
+static char *yo_enable_bold = NULL;     /* from ~/.yoconf enable_bold */
+static char *yo_disable_bold = NULL;    /* from ~/.yoconf disable_bold */
+static char *yo_enable_strikethrough = NULL;  /* from ~/.yoconf enable_strikethrough */
+static char *yo_disable_strikethrough = NULL; /* from ~/.yoconf disable_strikethrough */
+static char *yo_code_delimiter = NULL;  /* from ~/.yoconf code_delimiter */
 static int yo_config_scrollback_enabled = -1; /* -1 = not set (use default: enabled) */
 static long yo_config_scrollback_bytes = -1;  /* -1 = not set (use default) */
 static int yo_config_scrollback_lines = -1;   /* -1 = not set (use default) */
@@ -269,9 +274,13 @@ static void yo_report_parse_error(cJSON *tool_use);
 static const char *yo_get_chat_prefix(void);
 static const char *yo_get_color_prefix(void);
 static const char *yo_get_color_reset(void);
-static const char *yo_get_italic_prefix(void);
-static const char *yo_get_bold_prefix(void);
-static const char *yo_get_bold_italic_prefix(void);
+static const char *yo_get_enable_italic(void);
+static const char *yo_get_disable_italic(void);
+static const char *yo_get_enable_bold(void);
+static const char *yo_get_disable_bold(void);
+static const char *yo_get_enable_strikethrough(void);
+static const char *yo_get_disable_strikethrough(void);
+static const char *yo_get_code_delimiter(void);
 
 /* Continuation hook and signal cleanup */
 static int yo_continuation_hook(void);
@@ -1950,20 +1959,40 @@ yo_load_config(void)
         free(yo_color_reset);
         yo_color_reset = NULL;
     }
-    if (yo_italic_prefix)
+    if (yo_enable_italic)
     {
-        free(yo_italic_prefix);
-        yo_italic_prefix = NULL;
+        free(yo_enable_italic);
+        yo_enable_italic = NULL;
     }
-    if (yo_bold_prefix)
+    if (yo_disable_italic)
     {
-        free(yo_bold_prefix);
-        yo_bold_prefix = NULL;
+        free(yo_disable_italic);
+        yo_disable_italic = NULL;
     }
-    if (yo_bold_italic_prefix)
+    if (yo_enable_bold)
     {
-        free(yo_bold_italic_prefix);
-        yo_bold_italic_prefix = NULL;
+        free(yo_enable_bold);
+        yo_enable_bold = NULL;
+    }
+    if (yo_disable_bold)
+    {
+        free(yo_disable_bold);
+        yo_disable_bold = NULL;
+    }
+    if (yo_enable_strikethrough)
+    {
+        free(yo_enable_strikethrough);
+        yo_enable_strikethrough = NULL;
+    }
+    if (yo_disable_strikethrough)
+    {
+        free(yo_disable_strikethrough);
+        yo_disable_strikethrough = NULL;
+    }
+    if (yo_code_delimiter)
+    {
+        free(yo_code_delimiter);
+        yo_code_delimiter = NULL;
     }
     yo_config_scrollback_enabled = -1;
     yo_config_scrollback_bytes = -1;
@@ -2094,44 +2123,96 @@ yo_load_config(void)
                 if (yo_color_reset) free(yo_color_reset);
                 yo_color_reset = parsed;
             }
-            else if (strcmp(directive, "italic_prefix") == 0)
+            else if (strcmp(directive, "enable_italic") == 0)
             {
                 const char *parse_error;
                 char *parsed = yo_parse_config_string(value, &parse_error);
                 if (!parsed)
                 {
-                    yo_print_error_no_newline("~/.yoconf:%d: italic_prefix: %s", line_num, parse_error);
+                    yo_print_error_no_newline("~/.yoconf:%d: enable_italic: %s", line_num, parse_error);
                     had_error = 1;
                     break;
                 }
-                if (yo_italic_prefix) free(yo_italic_prefix);
-                yo_italic_prefix = parsed;
+                if (yo_enable_italic) free(yo_enable_italic);
+                yo_enable_italic = parsed;
             }
-            else if (strcmp(directive, "bold_prefix") == 0)
+            else if (strcmp(directive, "disable_italic") == 0)
             {
                 const char *parse_error;
                 char *parsed = yo_parse_config_string(value, &parse_error);
                 if (!parsed)
                 {
-                    yo_print_error_no_newline("~/.yoconf:%d: bold_prefix: %s", line_num, parse_error);
+                    yo_print_error_no_newline("~/.yoconf:%d: disable_italic: %s", line_num, parse_error);
                     had_error = 1;
                     break;
                 }
-                if (yo_bold_prefix) free(yo_bold_prefix);
-                yo_bold_prefix = parsed;
+                if (yo_disable_italic) free(yo_disable_italic);
+                yo_disable_italic = parsed;
             }
-            else if (strcmp(directive, "bold_italic_prefix") == 0)
+            else if (strcmp(directive, "enable_bold") == 0)
             {
                 const char *parse_error;
                 char *parsed = yo_parse_config_string(value, &parse_error);
                 if (!parsed)
                 {
-                    yo_print_error_no_newline("~/.yoconf:%d: bold_italic_prefix: %s", line_num, parse_error);
+                    yo_print_error_no_newline("~/.yoconf:%d: enable_bold: %s", line_num, parse_error);
                     had_error = 1;
                     break;
                 }
-                if (yo_bold_italic_prefix) free(yo_bold_italic_prefix);
-                yo_bold_italic_prefix = parsed;
+                if (yo_enable_bold) free(yo_enable_bold);
+                yo_enable_bold = parsed;
+            }
+            else if (strcmp(directive, "disable_bold") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: disable_bold: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_disable_bold) free(yo_disable_bold);
+                yo_disable_bold = parsed;
+            }
+            else if (strcmp(directive, "enable_strikethrough") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: enable_strikethrough: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_enable_strikethrough) free(yo_enable_strikethrough);
+                yo_enable_strikethrough = parsed;
+            }
+            else if (strcmp(directive, "disable_strikethrough") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: disable_strikethrough: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_disable_strikethrough) free(yo_disable_strikethrough);
+                yo_disable_strikethrough = parsed;
+            }
+            else if (strcmp(directive, "code_delimiter") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: code_delimiter: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_code_delimiter) free(yo_code_delimiter);
+                yo_code_delimiter = parsed;
             }
             else if (strcmp(directive, "scrollback_enabled") == 0)
             {
@@ -2220,9 +2301,13 @@ yo_load_config(void)
             if (yo_chat_prefix) { free(yo_chat_prefix); yo_chat_prefix = NULL; }
             if (yo_color_prefix) { free(yo_color_prefix); yo_color_prefix = NULL; }
             if (yo_color_reset) { free(yo_color_reset); yo_color_reset = NULL; }
-            if (yo_italic_prefix) { free(yo_italic_prefix); yo_italic_prefix = NULL; }
-            if (yo_bold_prefix) { free(yo_bold_prefix); yo_bold_prefix = NULL; }
-            if (yo_bold_italic_prefix) { free(yo_bold_italic_prefix); yo_bold_italic_prefix = NULL; }
+            if (yo_enable_italic) { free(yo_enable_italic); yo_enable_italic = NULL; }
+            if (yo_disable_italic) { free(yo_disable_italic); yo_disable_italic = NULL; }
+            if (yo_enable_bold) { free(yo_enable_bold); yo_enable_bold = NULL; }
+            if (yo_disable_bold) { free(yo_disable_bold); yo_disable_bold = NULL; }
+            if (yo_enable_strikethrough) { free(yo_enable_strikethrough); yo_enable_strikethrough = NULL; }
+            if (yo_disable_strikethrough) { free(yo_disable_strikethrough); yo_disable_strikethrough = NULL; }
+            if (yo_code_delimiter) { free(yo_code_delimiter); yo_code_delimiter = NULL; }
             return false;
         }
 
@@ -3278,6 +3363,22 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
 
     /* Shared HTTP call */
     response_data = yo_http_post(url, headers, request_body, timeout);
+
+    /* Log request/response if YO_LOG_CALLS is set */
+    {
+        const char *log_path = getenv("YO_LOG_CALLS");
+        if (log_path && *log_path)
+        {
+            FILE *logfp = fopen(log_path, "a");
+            if (logfp)
+            {
+                fprintf(logfp, "=== REQUEST ===\n%s\n", request_body);
+                fprintf(logfp, "=== RESPONSE ===\n%s\n\n", response_data ? response_data : "(null)");
+                fclose(logfp);
+            }
+        }
+    }
+
     free(request_body);
 
     if (!response_data)
@@ -3569,21 +3670,45 @@ yo_get_color_reset(void)
 }
 
 static const char *
-yo_get_italic_prefix(void)
+yo_get_enable_italic(void)
 {
-    return yo_italic_prefix ? yo_italic_prefix : YO_DEFAULT_ITALIC_PREFIX;
+    return yo_enable_italic ? yo_enable_italic : YO_DEFAULT_ENABLE_ITALIC;
 }
 
 static const char *
-yo_get_bold_prefix(void)
+yo_get_disable_italic(void)
 {
-    return yo_bold_prefix ? yo_bold_prefix : YO_DEFAULT_BOLD_PREFIX;
+    return yo_disable_italic ? yo_disable_italic : YO_DEFAULT_DISABLE_ITALIC;
 }
 
 static const char *
-yo_get_bold_italic_prefix(void)
+yo_get_enable_bold(void)
 {
-    return yo_bold_italic_prefix ? yo_bold_italic_prefix : YO_DEFAULT_BOLD_ITALIC_PREFIX;
+    return yo_enable_bold ? yo_enable_bold : YO_DEFAULT_ENABLE_BOLD;
+}
+
+static const char *
+yo_get_disable_bold(void)
+{
+    return yo_disable_bold ? yo_disable_bold : YO_DEFAULT_DISABLE_BOLD;
+}
+
+static const char *
+yo_get_enable_strikethrough(void)
+{
+    return yo_enable_strikethrough ? yo_enable_strikethrough : YO_DEFAULT_ENABLE_STRIKETHROUGH;
+}
+
+static const char *
+yo_get_disable_strikethrough(void)
+{
+    return yo_disable_strikethrough ? yo_disable_strikethrough : YO_DEFAULT_DISABLE_STRIKETHROUGH;
+}
+
+static const char *
+yo_get_code_delimiter(void)
+{
+    return yo_code_delimiter ? yo_code_delimiter : YO_DEFAULT_CODE_DELIMITER;
 }
 
 /* Markdown rendering state for yo_display_chat */
@@ -3591,33 +3716,37 @@ typedef struct {
     FILE *out;
     const char *color_prefix;
     const char *color_reset;
-    const char *italic_prefix;
-    const char *bold_prefix;
-    const char *bold_italic_prefix;
-    int in_italic;       /* inside *...* */
-    int in_bold;         /* inside **...** */
-    int in_code_span;    /* inside `...` */
-    int in_code_block;   /* inside ``` or indented code block */
+    const char *enable_italic;
+    const char *disable_italic;
+    const char *enable_bold;
+    const char *disable_bold;
+    const char *enable_strikethrough;
+    const char *disable_strikethrough;
+    const char *code_delimiter;
+    int in_italic;          /* inside *...* */
+    int in_bold;            /* inside **...** */
+    int in_strikethrough;   /* inside ~~...~~ */
+    int in_code_span;       /* inside `...` */
+    int in_code_block;      /* inside ``` or indented code block */
 } yo_md_state_t;
 
-/* Emit the appropriate style escape for the current markdown nesting context.
-   Always resets first so that attributes like bold are properly cleared. */
+/* Re-apply current bold/italic/strikethrough state from scratch.
+   Resets all attributes first, then emits color_prefix + any active toggles. */
 static void
-yo_md_emit_style(yo_md_state_t *st)
+yo_md_reapply_style(yo_md_state_t *st)
 {
     fputs(st->color_reset, st->out);
-    if (st->in_bold && st->in_italic)
-        fputs(st->bold_italic_prefix, st->out);
-    else if (st->in_bold)
-        fputs(st->bold_prefix, st->out);
-    else if (st->in_italic)
-        fputs(st->italic_prefix, st->out);
-    else
-        fputs(st->color_prefix, st->out);
+    fputs(st->color_prefix, st->out);
+    if (st->in_italic)
+        fputs(st->enable_italic, st->out);
+    if (st->in_bold)
+        fputs(st->enable_bold, st->out);
+    if (st->in_strikethrough)
+        fputs(st->enable_strikethrough, st->out);
 }
 
 /* Render a single line of markdown (without the trailing newline).
-   Handles inline: **bold**, *italic*, `code`, and their nesting. */
+   Handles inline: **bold**, *italic*, ~~strikethrough~~, `code`, and their nesting. */
 static void
 yo_md_render_line(yo_md_state_t *st, const char *line, int len)
 {
@@ -3636,9 +3765,9 @@ yo_md_render_line(yo_md_state_t *st, const char *line, int len)
         }
         if (line[i] == '`' && st->in_code_span)
         {
-            /* Exit inline code — restore current style */
+            /* Exit inline code — restore current style (color_prefix + toggles) */
             st->in_code_span = 0;
-            yo_md_emit_style(st);
+            yo_md_reapply_style(st);
             i++;
             continue;
         }
@@ -3654,8 +3783,33 @@ yo_md_render_line(yo_md_state_t *st, const char *line, int len)
         /* Bold: ** */
         if (i + 1 < len && line[i] == '*' && line[i + 1] == '*')
         {
-            st->in_bold = !st->in_bold;
-            yo_md_emit_style(st);
+            if (st->in_bold)
+            {
+                st->in_bold = 0;
+                fputs(st->disable_bold, st->out);
+            }
+            else
+            {
+                st->in_bold = 1;
+                fputs(st->enable_bold, st->out);
+            }
+            i += 2;
+            continue;
+        }
+
+        /* Strikethrough: ~~ */
+        if (i + 1 < len && line[i] == '~' && line[i + 1] == '~')
+        {
+            if (st->in_strikethrough)
+            {
+                st->in_strikethrough = 0;
+                fputs(st->disable_strikethrough, st->out);
+            }
+            else
+            {
+                st->in_strikethrough = 1;
+                fputs(st->enable_strikethrough, st->out);
+            }
             i += 2;
             continue;
         }
@@ -3663,8 +3817,16 @@ yo_md_render_line(yo_md_state_t *st, const char *line, int len)
         /* Italic: * (single) */
         if (line[i] == '*')
         {
-            st->in_italic = !st->in_italic;
-            yo_md_emit_style(st);
+            if (st->in_italic)
+            {
+                st->in_italic = 0;
+                fputs(st->disable_italic, st->out);
+            }
+            else
+            {
+                st->in_italic = 1;
+                fputs(st->enable_italic, st->out);
+            }
             i++;
             continue;
         }
@@ -3675,21 +3837,70 @@ yo_md_render_line(yo_md_state_t *st, const char *line, int len)
     }
 }
 
+/* Check if a line is a list item: optional whitespace then a marker (-, +, *)
+   followed by space, or digit(s) followed by . and space. */
+static int
+yo_md_is_list_item(const char *line, int len)
+{
+    int i = 0;
+
+    /* Skip leading whitespace */
+    while (i < len && (line[i] == ' ' || line[i] == '\t'))
+        i++;
+    if (i >= len)
+        return 0;
+
+    /* -, +, * followed by space */
+    if ((line[i] == '-' || line[i] == '+' || line[i] == '*')
+        && i + 1 < len && line[i + 1] == ' ')
+        return 1;
+
+    /* digit(s) followed by . and space */
+    if (line[i] >= '0' && line[i] <= '9')
+    {
+        while (i < len && line[i] >= '0' && line[i] <= '9')
+            i++;
+        if (i < len && line[i] == '.' && i + 1 < len && line[i + 1] == ' ')
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Check if a line is indented (4+ spaces or starts with tab) */
+static int
+yo_md_is_indented(const char *line, int len)
+{
+    if (len >= 4 && line[0] == ' ' && line[1] == ' ' && line[2] == ' ' && line[3] == ' ')
+        return 1;
+    if (len >= 1 && line[0] == '\t')
+        return 1;
+    return 0;
+}
+
 static void
 yo_display_chat(const char *response)
 {
     yo_md_state_t st;
     const char *p, *line_start;
     int in_fenced_block = 0;
+    int in_list = 0;          /* inside a list context */
+    int prev_blank = 1;       /* previous line was blank (or start of response) */
+    int in_indented_code = 0; /* inside a run of indented code block lines */
 
     st.out = rl_outstream;
     st.color_prefix = yo_get_color_prefix();
     st.color_reset = yo_get_color_reset();
-    st.italic_prefix = yo_get_italic_prefix();
-    st.bold_prefix = yo_get_bold_prefix();
-    st.bold_italic_prefix = yo_get_bold_italic_prefix();
+    st.enable_italic = yo_get_enable_italic();
+    st.disable_italic = yo_get_disable_italic();
+    st.enable_bold = yo_get_enable_bold();
+    st.disable_bold = yo_get_disable_bold();
+    st.enable_strikethrough = yo_get_enable_strikethrough();
+    st.disable_strikethrough = yo_get_disable_strikethrough();
+    st.code_delimiter = yo_get_code_delimiter();
     st.in_italic = 0;
     st.in_bold = 0;
+    st.in_strikethrough = 0;
     st.in_code_span = 0;
     st.in_code_block = 0;
 
@@ -3708,29 +3919,61 @@ yo_display_chat(const char *response)
             p++;
 
         int line_len = (int)(p - line_start);
+        int is_blank = (line_len == 0);
+        int is_indented = yo_md_is_indented(line_start, line_len);
+        int is_list_item = yo_md_is_list_item(line_start, line_len);
+        int is_fenced_fence = 0;
 
-        /* Check for fenced code block toggle: ``` at start of line */
-        if (line_len >= 3 && line_start[0] == '`' && line_start[1] == '`' && line_start[2] == '`')
+        /* Check for fenced code block toggle: ``` possibly with leading whitespace */
+        {
+            const char *fence_check = line_start;
+            int fence_remaining = line_len;
+            while (fence_remaining > 0 && (*fence_check == ' ' || *fence_check == '\t'))
+            {
+                fence_check++;
+                fence_remaining--;
+            }
+            is_fenced_fence = (fence_remaining >= 3
+                               && fence_check[0] == '`' && fence_check[1] == '`' && fence_check[2] == '`');
+        }
+        if (is_fenced_fence)
         {
             if (!in_fenced_block)
             {
                 in_fenced_block = 1;
                 st.in_code_block = 1;
-                /* Reset style for code block */
-                fputs(st.color_reset, st.out);
-                /* Print the ``` line itself (may have language tag) */
+                /* Reset all inline state — don't let stray * or ~~ leak into code */
+                st.in_italic = 0;
+                st.in_bold = 0;
+                st.in_strikethrough = 0;
+                st.in_code_span = 0;
+                /* Print opening ``` in code_delimiter style */
+                fputs(st.code_delimiter, st.out);
                 fwrite(line_start, 1, line_len, st.out);
+                /* Switch to reset for code block content */
+                fputs(st.color_reset, st.out);
             }
             else
             {
-                /* Print closing ``` */
+                /* Print closing ``` in code_delimiter style */
+                fputs(st.code_delimiter, st.out);
                 fwrite(line_start, 1, line_len, st.out);
                 in_fenced_block = 0;
                 st.in_code_block = 0;
-                /* Restore color — reset then re-apply */
-                fputs(st.color_reset, st.out);
-                fputs(st.color_prefix, st.out);
+                /* Reset inline state coming out of code block */
+                st.in_italic = 0;
+                st.in_bold = 0;
+                st.in_strikethrough = 0;
+                st.in_code_span = 0;
+                /* Restore base style */
+                yo_md_reapply_style(&st);
             }
+
+            in_indented_code = 0;
+            prev_blank = 0;
+            /* Fenced blocks at left margin end list context */
+            if (!is_indented)
+                in_list = 0;
 
             if (*p == '\n')
             {
@@ -3752,14 +3995,25 @@ yo_display_chat(const char *response)
             continue;
         }
 
-        /* Check for indented code block (4 spaces or 1 tab) */
-        if (line_len >= 4 && line_start[0] == ' ' && line_start[1] == ' '
-            && line_start[2] == ' ' && line_start[3] == ' ')
+        /* Track list context.
+           - A list item (at any indent) enters/stays in list context.
+           - A blank line preserves list context (loose lists).
+           - A non-blank, non-indented, non-list line ends list context. */
+        if (is_list_item)
+            in_list = 1;
+        else if (!is_blank && !is_indented)
+            in_list = 0;
+
+        /* Indented code block: only when NOT in a list, and either preceded
+           by a blank line or continuing an existing indented code run.
+           Per Markdown spec, indented code cannot interrupt a paragraph or list. */
+        if (is_indented && !in_list && (prev_blank || in_indented_code))
         {
+            in_indented_code = 1;
             fputs(st.color_reset, st.out);
             fwrite(line_start, 1, line_len, st.out);
-            fputs(st.color_reset, st.out);
-            fputs(st.color_prefix, st.out);
+            yo_md_reapply_style(&st);
+            prev_blank = 0;
             if (*p == '\n')
             {
                 fputc('\n', st.out);
@@ -3767,12 +4021,13 @@ yo_display_chat(const char *response)
             }
             continue;
         }
-        if (line_len >= 1 && line_start[0] == '\t')
+
+        in_indented_code = 0;
+
+        /* Blank line */
+        if (is_blank)
         {
-            fputs(st.color_reset, st.out);
-            fwrite(line_start, 1, line_len, st.out);
-            fputs(st.color_reset, st.out);
-            fputs(st.color_prefix, st.out);
+            prev_blank = 1;
             if (*p == '\n')
             {
                 fputc('\n', st.out);
@@ -3780,6 +4035,8 @@ yo_display_chat(const char *response)
             }
             continue;
         }
+
+        prev_blank = 0;
 
         /* Check for headings: # at start of line */
         if (line_len >= 2 && line_start[0] == '#')
@@ -3794,28 +4051,39 @@ yo_display_chat(const char *response)
             /* Must be followed by space (or end of line) to be a heading */
             if (hi < line_len && line_start[hi] == ' ')
             {
-                fputs(st.color_reset, st.out);
                 if (heading_level == 1)
                 {
-                    /* # Heading: bold_italic (bold, no italic — stands out from italic base) */
-                    fputs(st.bold_italic_prefix, st.out);
+                    /* # Heading: bold + enable_italic (bold non-italic — stands out) */
+                    fputs(st.enable_bold, st.out);
+                    fputs(st.enable_italic, st.out);
                 }
                 else if (heading_level == 2)
                 {
-                    /* ## Heading: bold */
-                    fputs(st.bold_prefix, st.out);
+                    /* ## Heading: bold (keeps base italic) */
+                    fputs(st.enable_bold, st.out);
                 }
                 else
                 {
-                    /* ### and deeper: italic (i.e. non-italic — lighter emphasis) */
-                    fputs(st.italic_prefix, st.out);
+                    /* ### and deeper: enable_italic (non-italic — lighter emphasis) */
+                    fputs(st.enable_italic, st.out);
                 }
 
                 fwrite(line_start, 1, line_len, st.out);
 
-                /* Restore normal color */
-                fputs(st.color_reset, st.out);
-                fputs(st.color_prefix, st.out);
+                /* Restore normal style */
+                if (heading_level == 1)
+                {
+                    fputs(st.disable_bold, st.out);
+                    fputs(st.disable_italic, st.out);
+                }
+                else if (heading_level == 2)
+                {
+                    fputs(st.disable_bold, st.out);
+                }
+                else
+                {
+                    fputs(st.disable_italic, st.out);
+                }
 
                 if (*p == '\n')
                 {

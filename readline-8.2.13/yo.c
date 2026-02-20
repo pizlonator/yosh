@@ -169,6 +169,7 @@ static const char *yo_documentation = NULL;
 static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
+static char *yo_base_url = NULL;  /* from ~/.yoconf base_url, for ollama etc. */
 static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
 static char *yo_chat_prefix = NULL;   /* from ~/.yoconf chat_prefix, default: empty */
 static char *yo_color_prefix = NULL;  /* from ~/.yoconf color_prefix, default: cyan italic */
@@ -1994,6 +1995,11 @@ yo_load_config(void)
         free(yo_code_delimiter);
         yo_code_delimiter = NULL;
     }
+    if (yo_base_url)
+    {
+        free(yo_base_url);
+        yo_base_url = NULL;
+    }
     yo_config_scrollback_enabled = -1;
     yo_config_scrollback_bytes = -1;
     yo_config_scrollback_lines = -1;
@@ -2282,6 +2288,17 @@ yo_load_config(void)
                 }
                 yo_server_web_enabled = (*value == '0') ? 0 : 1;
             }
+            else if (strcmp(directive, "base_url") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'base_url' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_base_url) free(yo_base_url);
+                yo_base_url = strdup(value);
+            }
             else
             {
                 yo_print_error_no_newline(
@@ -2308,6 +2325,7 @@ yo_load_config(void)
             if (yo_enable_strikethrough) { free(yo_enable_strikethrough); yo_enable_strikethrough = NULL; }
             if (yo_disable_strikethrough) { free(yo_disable_strikethrough); yo_disable_strikethrough = NULL; }
             if (yo_code_delimiter) { free(yo_code_delimiter); yo_code_delimiter = NULL; }
+            if (yo_base_url) { free(yo_base_url); yo_base_url = NULL; }
             return false;
         }
 
@@ -2384,7 +2402,8 @@ yo_load_config(void)
 
         yo_print_error_no_newline(
             "~/.yoconf specifies provider '%s' but no key. "
-            "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
+            "Add 'key' to ~/.yoconf or create ~/%s (mode 0600). "
+            "For local LLMs (ollama, etc.), use 'key dummy'.",
             yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
             yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
         return false;
@@ -2433,6 +2452,7 @@ yo_load_config(void)
 
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
                               "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
+                              "For local LLMs (ollama, etc.), use 'key dummy'. "
                               "See 'yo how do I configure the LLM' for details.");
     return false;
 }
@@ -2603,10 +2623,10 @@ yo_build_tools_openai(void)
 
     for (i = 0; i < num_common; i++)
     {
-        tool = cJSON_CreateObject();
-        cJSON_AddStringToObject(tool, "type", "function");
-        cJSON_AddStringToObject(tool, "name", common[i].name);
-        cJSON_AddStringToObject(tool, "description", common[i].description);
+        /* Build the function definition */
+        cJSON *func_def = cJSON_CreateObject();
+        cJSON_AddStringToObject(func_def, "name", common[i].name);
+        cJSON_AddStringToObject(func_def, "description", common[i].description);
 
         params = cJSON_CreateObject();
         cJSON_AddStringToObject(params, "type", "object");
@@ -2624,24 +2644,45 @@ yo_build_tools_openai(void)
         required = cJSON_CreateArray();
         for (j = 0; j < common[i].num_required; j++)
             cJSON_AddItemToArray(required, cJSON_CreateString(common[i].required[j]));
-        /* OpenAI strict mode: for the command tool, make pending required
-           so the model always explicitly decides whether to continue */
-        if (strcmp(common[i].name, "command") == 0)
-            cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
+        if (!yo_base_url)
+        {
+            /* OpenAI strict mode: for the command tool, make pending required
+               so the model always explicitly decides whether to continue */
+            if (strcmp(common[i].name, "command") == 0)
+                cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
+        }
         cJSON_AddItemToObject(params, "required", required);
 
-        /* OpenAI strict mode requires additionalProperties: false */
-        cJSON_AddFalseToObject(params, "additionalProperties");
-        cJSON_AddItemToObject(tool, "parameters", params);
-        cJSON_AddTrueToObject(tool, "strict");
+        if (!yo_base_url)
+        {
+            /* OpenAI strict mode requires additionalProperties: false */
+            cJSON_AddFalseToObject(params, "additionalProperties");
+        }
+        cJSON_AddItemToObject(func_def, "parameters", params);
+        if (!yo_base_url)
+            cJSON_AddTrueToObject(func_def, "strict");
+
+        if (yo_base_url)
+        {
+            /* Chat Completions format: {"type": "function", "function": {...}} */
+            tool = cJSON_CreateObject();
+            cJSON_AddStringToObject(tool, "type", "function");
+            cJSON_AddItemToObject(tool, "function", func_def);
+        }
+        else
+        {
+            /* Responses API format: flat {"type": "function", "name": ..., ...} */
+            tool = func_def;
+            cJSON_AddStringToObject(tool, "type", "function");
+        }
 
         cJSON_AddItemToArray(tools, tool);
     }
 
     yo_free_common_tools(common, num_common);
 
-    /* OpenAI-specific: web_search tool */
-    if (yo_server_web_enabled)
+    /* OpenAI-specific: web_search tool (only for Responses API, not compat) */
+    if (yo_server_web_enabled && !yo_base_url)
     {
         cJSON *ws = cJSON_CreateObject();
         cJSON_AddStringToObject(ws, "type", "web_search");
@@ -2923,14 +2964,27 @@ yo_build_anthropic_request(cJSON *messages,
     cJSON_Delete(request_json);
 
     /* Set up headers */
-    snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", yo_api_key);
-    headers = curl_slist_append(headers, auth_header);
+    if (yo_api_key)
+    {
+        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", yo_api_key);
+        headers = curl_slist_append(headers, auth_header);
+    }
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
     if (web_enabled)
         headers = curl_slist_append(headers, "anthropic-beta: web-fetch-2025-09-10");
 
-    *url_out = "https://api.anthropic.com/v1/messages";
+    if (yo_base_url)
+    {
+        static char yo_anthropic_url_buf[1024];
+        snprintf(yo_anthropic_url_buf, sizeof(yo_anthropic_url_buf),
+                 "%s/v1/messages", yo_base_url);
+        *url_out = yo_anthropic_url_buf;
+    }
+    else
+    {
+        *url_out = "https://api.anthropic.com/v1/messages";
+    }
     *headers_out = headers;
     *timeout_out = web_enabled ? 120L : YO_API_TIMEOUT;
 
@@ -3143,40 +3197,198 @@ yo_build_openai_request(cJSON *messages,
     if (yo_server_web_enabled)
         max_tokens = 4096;
 
-    /* Build Responses API request JSON */
     request_json = cJSON_CreateObject();
     cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL);
-    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
 
-    /* System prompt goes in top-level "instructions" field */
-    cJSON_AddStringToObject(request_json, "instructions", openai_prompt);
+    if (yo_base_url)
+    {
+        /* Chat Completions API format (for ollama and compatible endpoints) */
+        static char yo_openai_url_buf[1024];
+        cJSON *system_msg;
+        cJSON *new_messages;
+        cJSON *item;
+
+        cJSON_AddNumberToObject(request_json, "max_tokens", max_tokens);
+
+        /* System prompt as first message */
+        new_messages = cJSON_CreateArray();
+        system_msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(system_msg, "role", "system");
+        cJSON_AddStringToObject(system_msg, "content", openai_prompt);
+        cJSON_AddItemToArray(new_messages, system_msg);
+
+        /* Move existing messages over */
+        while ((item = cJSON_DetachItemFromArray(messages, 0)) != NULL)
+            cJSON_AddItemToArray(new_messages, item);
+        cJSON_Delete(messages);
+
+        cJSON_AddItemToObject(request_json, "messages", new_messages);
+        cJSON_AddItemToObject(request_json, "tools", tools);
+
+        /* Force tool use */
+        cJSON_AddStringToObject(request_json, "tool_choice", "required");
+
+        snprintf(yo_openai_url_buf, sizeof(yo_openai_url_buf),
+                 "%s/v1/chat/completions", yo_base_url);
+        *url_out = yo_openai_url_buf;
+    }
+    else
+    {
+        /* OpenAI Responses API format */
+        cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
+
+        /* System prompt goes in top-level "instructions" field */
+        cJSON_AddStringToObject(request_json, "instructions", openai_prompt);
+
+        /* Add input array (conversation messages — takes ownership) */
+        cJSON_AddItemToObject(request_json, "input", messages);
+
+        /* Add tools array (takes ownership) */
+        cJSON_AddItemToObject(request_json, "tools", tools);
+
+        /* Force tool use */
+        cJSON_AddStringToObject(request_json, "tool_choice", "required");
+
+        /* Privacy: don't store responses */
+        cJSON_AddFalseToObject(request_json, "store");
+
+        *url_out = "https://api.openai.com/v1/responses";
+    }
+
     free(openai_prompt);
-
-    /* Add input array (conversation messages — takes ownership) */
-    cJSON_AddItemToObject(request_json, "input", messages);
-
-    /* Add tools array (takes ownership) */
-    cJSON_AddItemToObject(request_json, "tools", tools);
-
-    /* Force tool use */
-    cJSON_AddStringToObject(request_json, "tool_choice", "required");
-
-    /* Privacy: don't store responses */
-    cJSON_AddFalseToObject(request_json, "store");
 
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
 
     /* Set up headers */
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
-    headers = curl_slist_append(headers, auth_header);
+    if (yo_api_key)
+    {
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+        headers = curl_slist_append(headers, auth_header);
+    }
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    *url_out = "https://api.openai.com/v1/responses";
     *headers_out = headers;
     *timeout_out = YO_API_TIMEOUT;
 
     return request_body;
+}
+
+/* Parse Chat Completions API response → normalized tool_use cJSON.
+   Extracts tool_calls from choices[0].message.
+   Falls back to message content for text responses.
+   Caller must free the returned cJSON with cJSON_Delete. */
+static cJSON *
+yo_parse_chat_completions_response(const char *response_data)
+{
+    cJSON *response_json;
+    cJSON *choices, *first_choice, *message;
+    cJSON *result = NULL;
+
+    response_json = cJSON_Parse(response_data);
+    if (!response_json)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Failed to parse API response");
+        return NULL;
+    }
+
+    /* Check for error response */
+    {
+        cJSON *error = cJSON_GetObjectItem(response_json, "error");
+        if (error && !cJSON_IsNull(error))
+        {
+            cJSON *msg = cJSON_GetObjectItem(error, "message");
+            yo_clear_thinking();
+            if (msg && cJSON_IsString(msg))
+            {
+                fprintf(rl_outstream, "%s%sAPI error: %s%s\n",
+                        yo_get_chat_prefix(), yo_get_color_prefix(), msg->valuestring, yo_get_color_reset());
+                fflush(rl_outstream);
+            }
+            else
+            {
+                yo_print_error_no_newline("API returned an error: %s", response_data);
+            }
+            cJSON_Delete(response_json);
+            return NULL;
+        }
+    }
+
+    /* Extract choices[0].message */
+    choices = cJSON_GetObjectItem(response_json, "choices");
+    if (!choices || !cJSON_IsArray(choices) || cJSON_GetArraySize(choices) == 0)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Unexpected API response format: %s",
+                                  cJSON_PrintUnformatted(response_json));
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    first_choice = cJSON_GetArrayItem(choices, 0);
+    message = first_choice ? cJSON_GetObjectItem(first_choice, "message") : NULL;
+    if (!message)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Unexpected API response format: %s",
+                                  cJSON_PrintUnformatted(response_json));
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    /* Check for tool_calls */
+    {
+        cJSON *tool_calls = cJSON_GetObjectItem(message, "tool_calls");
+        if (tool_calls && cJSON_IsArray(tool_calls) && cJSON_GetArraySize(tool_calls) > 0)
+        {
+            cJSON *first_call = cJSON_GetArrayItem(tool_calls, 0);
+            cJSON *call_id = cJSON_GetObjectItem(first_call, "id");
+            cJSON *function = cJSON_GetObjectItem(first_call, "function");
+
+            if (function)
+            {
+                cJSON *name = cJSON_GetObjectItem(function, "name");
+                cJSON *arguments = cJSON_GetObjectItem(function, "arguments");
+                cJSON *input;
+
+                result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "type", "tool_use");
+                cJSON_AddStringToObject(result, "id",
+                    (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "cc_call");
+                cJSON_AddStringToObject(result, "name",
+                    (name && cJSON_IsString(name)) ? name->valuestring : "chat");
+
+                /* Parse arguments JSON string into an object */
+                input = (arguments && cJSON_IsString(arguments))
+                    ? cJSON_Parse(arguments->valuestring) : NULL;
+                if (!input)
+                    input = cJSON_CreateObject();
+                cJSON_AddItemToObject(result, "input", input);
+            }
+        }
+    }
+
+    if (!result)
+    {
+        /* No tool_calls — fall back to message content */
+        cJSON *content = cJSON_GetObjectItem(message, "content");
+        const char *text_content = (content && cJSON_IsString(content))
+            ? content->valuestring : "(empty response)";
+
+        result = cJSON_CreateObject();
+        cJSON_AddStringToObject(result, "type", "tool_use");
+        cJSON_AddStringToObject(result, "id", "synthetic_text_response");
+        cJSON_AddStringToObject(result, "name", "chat");
+        {
+            cJSON *input = cJSON_CreateObject();
+            cJSON_AddStringToObject(input, "response", text_content);
+            cJSON_AddItemToObject(result, "input", input);
+        }
+    }
+
+    cJSON_Delete(response_json);
+    return result;
 }
 
 /* Parse OpenAI Responses API output → normalized tool_use cJSON.
@@ -3189,6 +3401,10 @@ yo_parse_openai_response(const char *response_data)
     cJSON *response_json;
     cJSON *output_array;
     cJSON *result = NULL;
+
+    /* Dispatch to Chat Completions parser when using custom base_url */
+    if (yo_base_url)
+        return yo_parse_chat_completions_response(response_data);
 
     response_json = cJSON_Parse(response_data);
     if (!response_json)
@@ -4259,7 +4475,28 @@ static void
 yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                     const char *tool_name, cJSON *input)
 {
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider == YO_PROVIDER_OPENAI && yo_base_url)
+    {
+        /* Chat Completions format: assistant message with tool_calls array */
+        cJSON *msg = cJSON_CreateObject();
+        cJSON *tool_calls = cJSON_CreateArray();
+        cJSON *call = cJSON_CreateObject();
+        cJSON *function = cJSON_CreateObject();
+        char *args;
+
+        cJSON_AddStringToObject(msg, "role", "assistant");
+        cJSON_AddStringToObject(call, "id", tool_use_id);
+        cJSON_AddStringToObject(call, "type", "function");
+        cJSON_AddStringToObject(function, "name", tool_name);
+        args = cJSON_PrintUnformatted(input);
+        cJSON_AddStringToObject(function, "arguments", args);
+        free(args);
+        cJSON_AddItemToObject(call, "function", function);
+        cJSON_AddItemToArray(tool_calls, call);
+        cJSON_AddItemToObject(msg, "tool_calls", tool_calls);
+        cJSON_AddItemToArray(messages, msg);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         /* Responses API: flat function_call item, no role wrapper */
         cJSON *msg = cJSON_CreateObject();
@@ -4291,14 +4528,22 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
 
 /* Add a tool result message to the messages array.
    For Anthropic: user message with tool_result content block.
-   For OpenAI: tool message with tool_call_id. */
+   For OpenAI Chat Completions: tool message with tool_call_id.
+   For OpenAI Responses API: function_call_output item. */
 static void
 yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                        const char *result_content)
 {
     cJSON *msg = cJSON_CreateObject();
 
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider == YO_PROVIDER_OPENAI && yo_base_url)
+    {
+        /* Chat Completions format: tool message */
+        cJSON_AddStringToObject(msg, "role", "tool");
+        cJSON_AddStringToObject(msg, "tool_call_id", tool_use_id);
+        cJSON_AddStringToObject(msg, "content", result_content);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         /* Responses API: function_call_output item */
         cJSON_AddStringToObject(msg, "type", "function_call_output");

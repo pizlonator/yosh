@@ -60,6 +60,17 @@ If you have a pre-built `yosh` binary:
    chmod 600 ~/.yoconf
    ```
 
+   **Option C: Local LLM with ollama**
+   ```bash
+   cat > ~/.yoconf << 'EOF'
+   provider openai
+   model llama3.2
+   base_url http://localhost:11434
+   key dummy
+   EOF
+   chmod 600 ~/.yoconf
+   ```
+
 ## Building from Source
 
 ### Prerequisites
@@ -102,8 +113,12 @@ provider anthropic
 # OpenAI default: gpt-4o-mini
 model claude-sonnet-4-20250514
 
-# API key (optional if using a key file instead)
+# API key (optional if using a key file; use "dummy" for local LLMs like ollama)
 key sk-ant-api03-...
+
+# Custom API base URL (optional, for ollama/vLLM/other compatible endpoints)
+# When set with "provider openai", uses Chat Completions API format
+# base_url http://localhost:11434
 
 # Chat display prefix/reset (optional, supports C-style escapes)
 # chat_prefix \033[3;36m
@@ -126,6 +141,7 @@ All settings are configured in `~/.yoconf`. The file is re-read on each `yo` com
 
 | Directive | Default | Description |
 |-----------|---------|-------------|
+| `base_url` | *(none)* | Custom API base URL for compatible endpoints (e.g. `http://localhost:11434` for ollama). When set with `provider openai`, uses Chat Completions API format (`/v1/chat/completions`) |
 | `history_limit` | `10` | Max conversation exchanges to remember |
 | `token_budget` | `4096` | Max tokens for history context |
 | `scrollback_enabled` | `1` | Set to `0` to disable terminal scrollback capture (startup only) |

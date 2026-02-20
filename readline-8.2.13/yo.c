@@ -65,7 +65,7 @@
 #define YO_DEFAULT_TOKEN_BUDGET 4096
 #define YO_API_TIMEOUT 30L
 #define YO_MAX_TOKENS 1024
-#define YO_DEFAULT_OPENAI_MODEL "gpt-4o-mini"
+#define YO_DEFAULT_OPENAI_MODEL "gpt-5"
 
 /* Default styling.  Base text is italic cyan (color_prefix).
    Since base is already italic, markdown *italic* toggles italic OFF;
@@ -130,25 +130,6 @@ typedef struct {
 /*                    Tool Definition Types                         */
 /*                                                                  */
 /* **************************************************************** */
-
-#define YO_TOOL_MAX_PROPS 4
-#define YO_TOOL_MAX_REQUIRED 4
-
-typedef struct {
-    const char *name;
-    const char *type;        /* "string", "integer", "boolean" */
-    const char *description;
-} yo_tool_prop_t;
-
-typedef struct {
-    const char *name;
-    const char *description;
-    int description_allocated;  /* 1 if description was dynamically allocated */
-    yo_tool_prop_t props[YO_TOOL_MAX_PROPS];
-    int num_props;
-    const char *required[YO_TOOL_MAX_REQUIRED];
-    int num_required;
-} yo_tool_def_t;
 
 /* **************************************************************** */
 /*                                                                  */
@@ -239,10 +220,9 @@ static int yo_is_pump = 0;
 /* **************************************************************** */
 
 static bool yo_load_config(void);
-static yo_tool_def_t *yo_get_common_tools(int *count_out);
-static void yo_free_common_tools(yo_tool_def_t *tools, int count);
 static cJSON *yo_build_tools_anthropic(void);
 static cJSON *yo_build_tools_openai(void);
+static char *yo_sanitize_scrollback_openai(const char *input);
 static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                                 const char *tool_name, cJSON *input);
 static void yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
@@ -2443,91 +2423,6 @@ yo_load_config(void)
 /*                                                                  */
 /* **************************************************************** */
 
-/* Build an array of common tool definitions as C structs.
-   These are the tools shared by both Anthropic and OpenAI providers.
-   Caller must free with yo_free_common_tools(). */
-static yo_tool_def_t *
-yo_get_common_tools(int *count_out)
-{
-    yo_tool_def_t *tools = calloc(4, sizeof(yo_tool_def_t));
-    int n = 0;
-
-    /* Tool: command - execute a shell command */
-    tools[n].name = "command";
-    tools[n].description =
-        "Generate a shell command for the user to review and execute. "
-        "The command will be prefilled at the prompt for the user to edit or run.";
-    tools[n].props[0] = (yo_tool_prop_t){
-        "command", "string", "The shell command to execute"};
-    tools[n].props[1] = (yo_tool_prop_t){
-        "explanation", "string",
-        "Brief explanation of what this command does, shown to user before the command"};
-    tools[n].props[2] = (yo_tool_prop_t){
-        "pending", "boolean",
-        "Set to true if this is part of a multi-step sequence and you need to see "
-        "the output before providing the next command. After the user executes this "
-        "command, you will automatically receive the terminal output."};
-    tools[n].num_props = 3;
-    tools[n].required[0] = "command";
-    tools[n].required[1] = "explanation";
-    tools[n].num_required = 2;
-    n++;
-
-    /* Tool: chat - respond with text */
-    tools[n].name = "chat";
-    tools[n].description =
-        "Respond with a text message for questions and explanations; use ONLY when no command is needed.";
-    tools[n].props[0] = (yo_tool_prop_t){
-        "response", "string", "Your text response to the user"};
-    tools[n].num_props = 1;
-    tools[n].required[0] = "response";
-    tools[n].num_required = 1;
-    n++;
-
-    /* Tool: scrollback - request terminal output */
-    tools[n].name = "scrollback";
-    tools[n].description =
-        "Request recent terminal output to see command results, error messages, or context. "
-        "Use this when you need to see what happened in the terminal.";
-    tools[n].props[0] = (yo_tool_prop_t){
-        "lines", "integer", "Number of recent lines to retrieve (max 1000)"};
-    tools[n].num_props = 1;
-    tools[n].required[0] = "lines";
-    tools[n].num_required = 1;
-    n++;
-
-    /* Tool: docs - request documentation */
-    {
-        char *desc;
-        asprintf(&desc,
-                 "Request %s documentation to answer questions about %s features, configuration, "
-                 "environment variables, LLM provider/model or API key setup, or usage.",
-                 yo_name, yo_name);
-        tools[n].name = "docs";
-        tools[n].description = desc;
-        tools[n].description_allocated = 1;
-        tools[n].num_props = 0;
-        tools[n].num_required = 0;
-        n++;
-    }
-
-    *count_out = n;
-    return tools;
-}
-
-/* Free common tool definitions returned by yo_get_common_tools(). */
-static void
-yo_free_common_tools(yo_tool_def_t *tools, int count)
-{
-    int i;
-    for (i = 0; i < count; i++)
-    {
-        if (tools[i].description_allocated)
-            free((char *)tools[i].description);
-    }
-    free(tools);
-}
-
 /* Build the tools array for the Anthropic API request.
    Converts common tool definitions to Anthropic JSON format and appends
    Anthropic-specific server tools (web_search, web_fetch). */
@@ -2536,39 +2431,97 @@ yo_build_tools_anthropic(void)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *schema, *json_props, *prop, *required;
-    int i, j, num_common;
+    char *docs_desc;
 
-    yo_tool_def_t *common = yo_get_common_tools(&num_common);
+    /* Tool: command */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "name", "command");
+    cJSON_AddStringToObject(tool, "description",
+        "Generate a shell command for the user to review and execute. "
+        "The command will be prefilled at the prompt for the user to edit or run.");
+    schema = cJSON_CreateObject();
+    cJSON_AddStringToObject(schema, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "The shell command to execute");
+    cJSON_AddItemToObject(json_props, "command", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description",
+        "Brief explanation of what this command does, shown to user before the command");
+    cJSON_AddItemToObject(json_props, "explanation", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "boolean");
+    cJSON_AddStringToObject(prop, "description",
+        "Set to true if this is part of a multi-step sequence and you need to see "
+        "the output before providing the next command. After the user executes this "
+        "command, you will automatically receive the terminal output.");
+    cJSON_AddItemToObject(json_props, "pending", prop);
+    cJSON_AddItemToObject(schema, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("command"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("explanation"));
+    cJSON_AddItemToObject(schema, "required", required);
+    cJSON_AddItemToObject(tool, "input_schema", schema);
+    cJSON_AddItemToArray(tools, tool);
 
-    for (i = 0; i < num_common; i++)
-    {
-        tool = cJSON_CreateObject();
-        cJSON_AddStringToObject(tool, "name", common[i].name);
-        cJSON_AddStringToObject(tool, "description", common[i].description);
+    /* Tool: chat */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "name", "chat");
+    cJSON_AddStringToObject(tool, "description",
+        "Respond with a text message for questions and explanations; use ONLY when no command is needed.");
+    schema = cJSON_CreateObject();
+    cJSON_AddStringToObject(schema, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "Your text response to the user");
+    cJSON_AddItemToObject(json_props, "response", prop);
+    cJSON_AddItemToObject(schema, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("response"));
+    cJSON_AddItemToObject(schema, "required", required);
+    cJSON_AddItemToObject(tool, "input_schema", schema);
+    cJSON_AddItemToArray(tools, tool);
 
-        schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
+    /* Tool: scrollback */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "name", "scrollback");
+    cJSON_AddStringToObject(tool, "description",
+        "Request recent terminal output to see command results, error messages, or context. "
+        "Use this when you need to see what happened in the terminal.");
+    schema = cJSON_CreateObject();
+    cJSON_AddStringToObject(schema, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "integer");
+    cJSON_AddStringToObject(prop, "description", "Number of recent lines to retrieve (max 1000)");
+    cJSON_AddItemToObject(json_props, "lines", prop);
+    cJSON_AddItemToObject(schema, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("lines"));
+    cJSON_AddItemToObject(schema, "required", required);
+    cJSON_AddItemToObject(tool, "input_schema", schema);
+    cJSON_AddItemToArray(tools, tool);
 
-        json_props = cJSON_CreateObject();
-        for (j = 0; j < common[i].num_props; j++)
-        {
-            prop = cJSON_CreateObject();
-            cJSON_AddStringToObject(prop, "type", common[i].props[j].type);
-            cJSON_AddStringToObject(prop, "description", common[i].props[j].description);
-            cJSON_AddItemToObject(json_props, common[i].props[j].name, prop);
-        }
-        cJSON_AddItemToObject(schema, "properties", json_props);
-
-        required = cJSON_CreateArray();
-        for (j = 0; j < common[i].num_required; j++)
-            cJSON_AddItemToArray(required, cJSON_CreateString(common[i].required[j]));
-        cJSON_AddItemToObject(schema, "required", required);
-
-        cJSON_AddItemToObject(tool, "input_schema", schema);
-        cJSON_AddItemToArray(tools, tool);
-    }
-
-    yo_free_common_tools(common, num_common);
+    /* Tool: docs */
+    tool = cJSON_CreateObject();
+    asprintf(&docs_desc,
+             "Request %s documentation to answer questions about %s features, configuration, "
+             "environment variables, LLM provider/model or API key setup, or usage.",
+             yo_name, yo_name);
+    cJSON_AddStringToObject(tool, "name", "docs");
+    cJSON_AddStringToObject(tool, "description", docs_desc);
+    free(docs_desc);
+    schema = cJSON_CreateObject();
+    cJSON_AddStringToObject(schema, "type", "object");
+    json_props = cJSON_CreateObject();
+    cJSON_AddItemToObject(schema, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToObject(schema, "required", required);
+    cJSON_AddItemToObject(tool, "input_schema", schema);
+    cJSON_AddItemToArray(tools, tool);
 
     /* Anthropic-specific server tools: web_search and web_fetch */
     if (yo_server_web_enabled)
@@ -2597,48 +2550,117 @@ yo_build_tools_openai(void)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *params, *json_props, *prop, *required;
-    int i, j, num_common;
+    char *docs_desc;
 
-    yo_tool_def_t *common = yo_get_common_tools(&num_common);
+    /* Tool: command */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    cJSON_AddStringToObject(tool, "name", "command");
+    cJSON_AddStringToObject(tool, "description",
+        "Generate a shell command for the user to review and execute. "
+        "The command will be prefilled at the prompt for the user to edit or run. "
+        "CRITICAL: If you recommend any command, you MUST use this tool. "
+        "Do NOT respond with chat that suggests a command. "
+        "Keep commands short and readable (prefer single-line commands). "
+        "Do NOT emit large here-docs or long multi-line scripts. "
+        "If a solution would be long, split into multiple steps using pending=true.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "The shell command to execute");
+    cJSON_AddItemToObject(json_props, "command", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description",
+        "Brief explanation of what this command does, shown to user before the command");
+    cJSON_AddItemToObject(json_props, "explanation", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "boolean");
+    cJSON_AddStringToObject(prop, "description",
+        "Set to true if this is part of a multi-step sequence and you need to see "
+        "the output before providing the next command. After the user executes this "
+        "command, you will automatically receive the terminal output.");
+    cJSON_AddItemToObject(json_props, "pending", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("command"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("explanation"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddFalseToObject(params, "additionalProperties");
+    cJSON_AddItemToObject(tool, "parameters", params);
+    cJSON_AddTrueToObject(tool, "strict");
+    cJSON_AddItemToArray(tools, tool);
 
-    for (i = 0; i < num_common; i++)
-    {
-        tool = cJSON_CreateObject();
-        cJSON_AddStringToObject(tool, "type", "function");
-        cJSON_AddStringToObject(tool, "name", common[i].name);
-        cJSON_AddStringToObject(tool, "description", common[i].description);
+    /* Tool: chat */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    cJSON_AddStringToObject(tool, "name", "chat");
+    cJSON_AddStringToObject(tool, "description",
+        "Respond with a text message for questions and explanations; use ONLY when no command is needed. "
+        "Do NOT include command suggestions here; if a command is appropriate, use the command tool.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "Your text response to the user");
+    cJSON_AddItemToObject(json_props, "response", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("response"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddFalseToObject(params, "additionalProperties");
+    cJSON_AddItemToObject(tool, "parameters", params);
+    cJSON_AddTrueToObject(tool, "strict");
+    cJSON_AddItemToArray(tools, tool);
 
-        params = cJSON_CreateObject();
-        cJSON_AddStringToObject(params, "type", "object");
+    /* Tool: scrollback */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    cJSON_AddStringToObject(tool, "name", "scrollback");
+    cJSON_AddStringToObject(tool, "description",
+        "Request recent terminal output to see command results, error messages, or context. "
+        "Use this when you need to see what happened in the terminal. "
+        "If you need output, use this tool. Never ask the user to paste output manually.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "integer");
+    cJSON_AddStringToObject(prop, "description", "Number of recent lines to retrieve (max 1000)");
+    cJSON_AddItemToObject(json_props, "lines", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("lines"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddFalseToObject(params, "additionalProperties");
+    cJSON_AddItemToObject(tool, "parameters", params);
+    cJSON_AddTrueToObject(tool, "strict");
+    cJSON_AddItemToArray(tools, tool);
 
-        json_props = cJSON_CreateObject();
-        for (j = 0; j < common[i].num_props; j++)
-        {
-            prop = cJSON_CreateObject();
-            cJSON_AddStringToObject(prop, "type", common[i].props[j].type);
-            cJSON_AddStringToObject(prop, "description", common[i].props[j].description);
-            cJSON_AddItemToObject(json_props, common[i].props[j].name, prop);
-        }
-        cJSON_AddItemToObject(params, "properties", json_props);
-
-        required = cJSON_CreateArray();
-        for (j = 0; j < common[i].num_required; j++)
-            cJSON_AddItemToArray(required, cJSON_CreateString(common[i].required[j]));
-        /* OpenAI strict mode: for the command tool, make pending required
-           so the model always explicitly decides whether to continue */
-        if (strcmp(common[i].name, "command") == 0)
-            cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
-        cJSON_AddItemToObject(params, "required", required);
-
-        /* OpenAI strict mode requires additionalProperties: false */
-        cJSON_AddFalseToObject(params, "additionalProperties");
-        cJSON_AddItemToObject(tool, "parameters", params);
-        cJSON_AddTrueToObject(tool, "strict");
-
-        cJSON_AddItemToArray(tools, tool);
-    }
-
-    yo_free_common_tools(common, num_common);
+    /* Tool: docs */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    cJSON_AddStringToObject(tool, "name", "docs");
+    asprintf(&docs_desc,
+             "Request %s documentation to answer questions about %s features, configuration, "
+             "environment variables, LLM provider/model or API key setup, or usage.",
+             yo_name, yo_name);
+    cJSON_AddStringToObject(tool, "description", docs_desc);
+    free(docs_desc);
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddFalseToObject(params, "additionalProperties");
+    cJSON_AddItemToObject(tool, "parameters", params);
+    cJSON_AddTrueToObject(tool, "strict");
+    cJSON_AddItemToArray(tools, tool);
 
     /* OpenAI-specific: web_search tool */
     if (yo_server_web_enabled)
@@ -2649,6 +2671,110 @@ yo_build_tools_openai(void)
     }
 
     return tools;
+}
+
+/* Remove ANSI escape sequences and other control characters from scrollback
+   before sending it to OpenAI (Anthropic already handles raw scrollback well). */
+static char *
+yo_sanitize_scrollback_openai(const char *input)
+{
+    size_t in_len, out_len = 0;
+    char *out;
+    size_t i = 0;
+
+    if (!input)
+        return strdup("");
+
+    in_len = strlen(input);
+    out = malloc(in_len + 1);
+    if (!out)
+        return strdup(input);
+
+    while (i < in_len)
+    {
+        unsigned char c = (unsigned char)input[i];
+
+        if (c == 0x1b) /* ESC */
+        {
+            size_t j = i + 1;
+            if (j < in_len)
+            {
+                unsigned char next = (unsigned char)input[j];
+                if (next == '[') /* CSI */
+                {
+                    j++;
+                    while (j < in_len)
+                    {
+                        unsigned char ch = (unsigned char)input[j];
+                        if (ch >= 0x40 && ch <= 0x7e)
+                        {
+                            j++;
+                            break;
+                        }
+                        j++;
+                    }
+                    i = j;
+                    continue;
+                }
+                else if (next == ']') /* OSC */
+                {
+                    j++;
+                    while (j < in_len)
+                    {
+                        unsigned char ch = (unsigned char)input[j];
+                        if (ch == 0x07) /* BEL */
+                        {
+                            j++;
+                            break;
+                        }
+                        if (ch == 0x1b && (j + 1) < in_len && input[j + 1] == '\\')
+                        {
+                            j += 2;
+                            break;
+                        }
+                        j++;
+                    }
+                    i = j;
+                    continue;
+                }
+                else if (next == 'P' || next == '^' || next == '_') /* DCS, PM, APC */
+                {
+                    j++;
+                    while (j < in_len)
+                    {
+                        unsigned char ch = (unsigned char)input[j];
+                        if (ch == 0x1b && (j + 1) < in_len && input[j + 1] == '\\')
+                        {
+                            j += 2;
+                            break;
+                        }
+                        j++;
+                    }
+                    i = j;
+                    continue;
+                }
+                else
+                {
+                    /* Skip simple ESC sequences (ESC + one char) */
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        /* Strip other control chars except \n and \t */
+        if (c < 0x20 && c != '\n' && c != '\t')
+        {
+            i++;
+            continue;
+        }
+
+        out[out_len++] = (char)c;
+        i++;
+    }
+
+    out[out_len] = '\0';
+    return out;
 }
 
 /* **************************************************************** */
@@ -3121,6 +3247,12 @@ yo_build_openai_request(cJSON *messages,
         "command at a time. NEVER combine steps into a single compound command (no && chains\n"
         "or semicolons to merge steps). Each step should be its own command with pending=true\n"
         "(except the last step, which should have pending=false).\n"
+        "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+        "with the scrollback tool and continue after you receive it.\n"
+        "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+        "Ignore escape-code garbage and focus on actual command output.\n"
+        "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+        "scripts. If it would be long, split into multiple steps using pending=true.\n"
         "Examples that MUST use pending=true (one command at a time):\n"
         "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
         "  then after seeing output: echo world (pending=false)\n"
@@ -4427,8 +4559,19 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     }
 
     /* Add tool_result with scrollback data (provider-native) */
-    asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
-             scrollback_data);
+    if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        char *clean = yo_sanitize_scrollback_openai(scrollback_data);
+        asprintf(&scrollback_msg,
+                 "Here is the recent terminal output you requested (ANSI escapes stripped):\n```\n%s\n```",
+                 clean);
+        free(clean);
+    }
+    else
+    {
+        asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
+                 scrollback_data ? scrollback_data : "");
+    }
     yo_msg_add_tool_result(messages, scrollback_tool_id, scrollback_msg);
     free(scrollback_msg);
 

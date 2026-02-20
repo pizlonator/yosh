@@ -63,7 +63,6 @@
 #define YO_DEFAULT_MODEL "claude-sonnet-4-5-20250929"
 #define YO_DEFAULT_HISTORY_LIMIT 10
 #define YO_DEFAULT_TOKEN_BUDGET 4096
-#define YO_API_TIMEOUT 30L
 #define YO_MAX_TOKENS 1024
 #define YO_DEFAULT_OPENAI_MODEL "gpt-5"
 
@@ -2836,7 +2835,8 @@ yo_http_post(const char *url, struct curl_slist *headers,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, yo_curl_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+    if (timeout > 0)
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 
     /* Add easy handle to multi handle */
     curl_multi_add_handle(multi, curl);
@@ -3058,7 +3058,7 @@ yo_build_anthropic_request(cJSON *messages,
 
     *url_out = "https://api.anthropic.com/v1/messages";
     *headers_out = headers;
-    *timeout_out = web_enabled ? 120L : YO_API_TIMEOUT;
+    *timeout_out = 0;
 
     return request_body;
 }
@@ -3271,7 +3271,7 @@ yo_build_openai_request(cJSON *messages,
               "or markdown link syntax in citations."
             : "");
 
-    /* When web search is enabled, bump max tokens to accommodate citations */
+    /* When web search is enabled, bump max tokens and timeout */
     if (yo_server_web_enabled)
         max_tokens = 4096;
 
@@ -3306,7 +3306,7 @@ yo_build_openai_request(cJSON *messages,
 
     *url_out = "https://api.openai.com/v1/responses";
     *headers_out = headers;
-    *timeout_out = YO_API_TIMEOUT;
+    *timeout_out = 0;
 
     return request_body;
 }

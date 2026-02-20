@@ -67,9 +67,18 @@
 #define YO_MAX_TOKENS 1024
 #define YO_DEFAULT_OPENAI_MODEL "gpt-4o-mini"
 
-/* Default color: red italics */
-#define YO_DEFAULT_CHAT_COLOR "\033[3;36m"
-#define YO_COLOR_RESET "\033[0m"
+/* Default styling.  Base text is italic cyan.  Style prefixes are always
+   emitted after a full SGR reset (\033[0m), so they must set all desired
+   attributes from scratch.
+   - color_prefix:       italic + cyan  (the base "chat" look)
+   - italic_prefix:      cyan only      (*italic* toggles italic OFF since base is italic)
+   - bold_prefix:        bold + italic + cyan  (**bold** adds bold, keeps italic)
+   - bold_italic_prefix: bold + cyan    (***both*** — bold kept, italic toggled off) */
+#define YO_DEFAULT_COLOR_PREFIX "\033[3;36m"
+#define YO_DEFAULT_COLOR_RESET "\033[0m"
+#define YO_DEFAULT_ITALIC_PREFIX "\033[36m"
+#define YO_DEFAULT_BOLD_PREFIX "\033[1;3;36m"
+#define YO_DEFAULT_BOLD_ITALIC_PREFIX "\033[1;36m"
 
 /* Scrollback defaults */
 #define YO_DEFAULT_SCROLLBACK_LINES 1000
@@ -160,8 +169,12 @@ static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
 static char *yo_config_model = NULL;  /* model from ~/.yoconf, before env override */
-static char *yo_chat_prefix = NULL;   /* from ~/.yoconf chat_prefix, default: cyan italic */
-static char *yo_chat_reset = NULL;    /* from ~/.yoconf chat_reset, default: reset */
+static char *yo_chat_prefix = NULL;   /* from ~/.yoconf chat_prefix, default: empty */
+static char *yo_color_prefix = NULL;  /* from ~/.yoconf color_prefix, default: cyan italic */
+static char *yo_color_reset = NULL;   /* from ~/.yoconf color_reset, default: reset */
+static char *yo_italic_prefix = NULL;      /* from ~/.yoconf italic_prefix, default: cyan */
+static char *yo_bold_prefix = NULL;        /* from ~/.yoconf bold_prefix, default: bold+italic+cyan */
+static char *yo_bold_italic_prefix = NULL; /* from ~/.yoconf bold_italic_prefix, default: bold+cyan */
 static int yo_config_scrollback_enabled = -1; /* -1 = not set (use default: enabled) */
 static long yo_config_scrollback_bytes = -1;  /* -1 = not set (use default) */
 static int yo_config_scrollback_lines = -1;   /* -1 = not set (use default) */
@@ -254,7 +267,11 @@ static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static void yo_report_parse_error(cJSON *tool_use);
 static const char *yo_get_chat_prefix(void);
-static const char *yo_get_chat_reset(void);
+static const char *yo_get_color_prefix(void);
+static const char *yo_get_color_reset(void);
+static const char *yo_get_italic_prefix(void);
+static const char *yo_get_bold_prefix(void);
+static const char *yo_get_bold_italic_prefix(void);
 
 /* Continuation hook and signal cleanup */
 static int yo_continuation_hook(void);
@@ -1545,7 +1562,7 @@ rl_yo_accept_line(int count, int key)
         yo_scrollback_clear();
         yo_continuation_active = 0;
         yo_last_was_command = 0;
-        fprintf(rl_outstream, "%sContext reset%s\n", yo_get_chat_prefix(), yo_get_chat_reset());
+        fprintf(rl_outstream, "%s%sContext reset%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
         fflush(rl_outstream);
         rl_replace_line("", 0);
         rl_on_new_line();
@@ -1923,10 +1940,30 @@ yo_load_config(void)
         free(yo_chat_prefix);
         yo_chat_prefix = NULL;
     }
-    if (yo_chat_reset)
+    if (yo_color_prefix)
     {
-        free(yo_chat_reset);
-        yo_chat_reset = NULL;
+        free(yo_color_prefix);
+        yo_color_prefix = NULL;
+    }
+    if (yo_color_reset)
+    {
+        free(yo_color_reset);
+        yo_color_reset = NULL;
+    }
+    if (yo_italic_prefix)
+    {
+        free(yo_italic_prefix);
+        yo_italic_prefix = NULL;
+    }
+    if (yo_bold_prefix)
+    {
+        free(yo_bold_prefix);
+        yo_bold_prefix = NULL;
+    }
+    if (yo_bold_italic_prefix)
+    {
+        free(yo_bold_italic_prefix);
+        yo_bold_italic_prefix = NULL;
     }
     yo_config_scrollback_enabled = -1;
     yo_config_scrollback_bytes = -1;
@@ -2031,18 +2068,70 @@ yo_load_config(void)
                 if (yo_chat_prefix) free(yo_chat_prefix);
                 yo_chat_prefix = parsed;
             }
-            else if (strcmp(directive, "chat_reset") == 0)
+            else if (strcmp(directive, "color_prefix") == 0)
             {
                 const char *parse_error;
                 char *parsed = yo_parse_config_string(value, &parse_error);
                 if (!parsed)
                 {
-                    yo_print_error_no_newline("~/.yoconf:%d: chat_reset: %s", line_num, parse_error);
+                    yo_print_error_no_newline("~/.yoconf:%d: color_prefix: %s", line_num, parse_error);
                     had_error = 1;
                     break;
                 }
-                if (yo_chat_reset) free(yo_chat_reset);
-                yo_chat_reset = parsed;
+                if (yo_color_prefix) free(yo_color_prefix);
+                yo_color_prefix = parsed;
+            }
+            else if (strcmp(directive, "color_reset") == 0 || strcmp(directive, "chat_reset") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: %s: %s", line_num, directive, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_color_reset) free(yo_color_reset);
+                yo_color_reset = parsed;
+            }
+            else if (strcmp(directive, "italic_prefix") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: italic_prefix: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_italic_prefix) free(yo_italic_prefix);
+                yo_italic_prefix = parsed;
+            }
+            else if (strcmp(directive, "bold_prefix") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: bold_prefix: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_bold_prefix) free(yo_bold_prefix);
+                yo_bold_prefix = parsed;
+            }
+            else if (strcmp(directive, "bold_italic_prefix") == 0)
+            {
+                const char *parse_error;
+                char *parsed = yo_parse_config_string(value, &parse_error);
+                if (!parsed)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: bold_italic_prefix: %s", line_num, parse_error);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_bold_italic_prefix) free(yo_bold_italic_prefix);
+                yo_bold_italic_prefix = parsed;
             }
             else if (strcmp(directive, "scrollback_enabled") == 0)
             {
@@ -2129,7 +2218,11 @@ yo_load_config(void)
             if (parsed_model) free(parsed_model);
             if (parsed_key) free(parsed_key);
             if (yo_chat_prefix) { free(yo_chat_prefix); yo_chat_prefix = NULL; }
-            if (yo_chat_reset) { free(yo_chat_reset); yo_chat_reset = NULL; }
+            if (yo_color_prefix) { free(yo_color_prefix); yo_color_prefix = NULL; }
+            if (yo_color_reset) { free(yo_color_reset); yo_color_reset = NULL; }
+            if (yo_italic_prefix) { free(yo_italic_prefix); yo_italic_prefix = NULL; }
+            if (yo_bold_prefix) { free(yo_bold_prefix); yo_bold_prefix = NULL; }
+            if (yo_bold_italic_prefix) { free(yo_bold_italic_prefix); yo_bold_italic_prefix = NULL; }
             return false;
         }
 
@@ -2606,7 +2699,7 @@ yo_http_post(const char *url, struct curl_slist *headers,
     if (cancelled)
     {
         yo_clear_thinking();
-        fprintf(rl_outstream, "%sCancelled%s\n", yo_get_chat_prefix(), yo_get_chat_reset());
+        fprintf(rl_outstream, "%s%sCancelled%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
         fflush(rl_outstream);
         goto http_error;
     }
@@ -2796,8 +2889,8 @@ yo_parse_anthropic_response(const char *response_data, int is_retry,
             cJSON *msg = cJSON_GetObjectItem(error, "message");
             if (msg && cJSON_IsString(msg))
             {
-                fprintf(rl_outstream, "%sAPI error: %s%s\n",
-                        yo_get_chat_prefix(), msg->valuestring, yo_get_chat_reset());
+                fprintf(rl_outstream, "%s%sAPI error: %s%s\n",
+                        yo_get_chat_prefix(), yo_get_color_prefix(), msg->valuestring, yo_get_color_reset());
                 fflush(rl_outstream);
             }
             else
@@ -3029,8 +3122,8 @@ yo_parse_openai_response(const char *response_data)
             yo_clear_thinking();
             if (msg && cJSON_IsString(msg))
             {
-                fprintf(rl_outstream, "%sAPI error: %s%s\n",
-                        yo_get_chat_prefix(), msg->valuestring, yo_get_chat_reset());
+                fprintf(rl_outstream, "%s%sAPI error: %s%s\n",
+                        yo_get_chat_prefix(), yo_get_color_prefix(), msg->valuestring, yo_get_color_reset());
                 fflush(rl_outstream);
             }
             else
@@ -3460,28 +3553,304 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
 static const char *
 yo_get_chat_prefix(void)
 {
-    return yo_chat_prefix ? yo_chat_prefix : YO_DEFAULT_CHAT_COLOR;
+    return yo_chat_prefix ? yo_chat_prefix : "";
 }
 
 static const char *
-yo_get_chat_reset(void)
+yo_get_color_prefix(void)
 {
-    return yo_chat_reset ? yo_chat_reset : YO_COLOR_RESET;
+    return yo_color_prefix ? yo_color_prefix : YO_DEFAULT_COLOR_PREFIX;
+}
+
+static const char *
+yo_get_color_reset(void)
+{
+    return yo_color_reset ? yo_color_reset : YO_DEFAULT_COLOR_RESET;
+}
+
+static const char *
+yo_get_italic_prefix(void)
+{
+    return yo_italic_prefix ? yo_italic_prefix : YO_DEFAULT_ITALIC_PREFIX;
+}
+
+static const char *
+yo_get_bold_prefix(void)
+{
+    return yo_bold_prefix ? yo_bold_prefix : YO_DEFAULT_BOLD_PREFIX;
+}
+
+static const char *
+yo_get_bold_italic_prefix(void)
+{
+    return yo_bold_italic_prefix ? yo_bold_italic_prefix : YO_DEFAULT_BOLD_ITALIC_PREFIX;
+}
+
+/* Markdown rendering state for yo_display_chat */
+typedef struct {
+    FILE *out;
+    const char *color_prefix;
+    const char *color_reset;
+    const char *italic_prefix;
+    const char *bold_prefix;
+    const char *bold_italic_prefix;
+    int in_italic;       /* inside *...* */
+    int in_bold;         /* inside **...** */
+    int in_code_span;    /* inside `...` */
+    int in_code_block;   /* inside ``` or indented code block */
+} yo_md_state_t;
+
+/* Emit the appropriate style escape for the current markdown nesting context.
+   Always resets first so that attributes like bold are properly cleared. */
+static void
+yo_md_emit_style(yo_md_state_t *st)
+{
+    fputs(st->color_reset, st->out);
+    if (st->in_bold && st->in_italic)
+        fputs(st->bold_italic_prefix, st->out);
+    else if (st->in_bold)
+        fputs(st->bold_prefix, st->out);
+    else if (st->in_italic)
+        fputs(st->italic_prefix, st->out);
+    else
+        fputs(st->color_prefix, st->out);
+}
+
+/* Render a single line of markdown (without the trailing newline).
+   Handles inline: **bold**, *italic*, `code`, and their nesting. */
+static void
+yo_md_render_line(yo_md_state_t *st, const char *line, int len)
+{
+    int i = 0;
+
+    while (i < len)
+    {
+        /* Backtick: inline code */
+        if (line[i] == '`' && !st->in_code_span)
+        {
+            /* Enter inline code — reset to terminal default */
+            st->in_code_span = 1;
+            fputs(st->color_reset, st->out);
+            i++;
+            continue;
+        }
+        if (line[i] == '`' && st->in_code_span)
+        {
+            /* Exit inline code — restore current style */
+            st->in_code_span = 0;
+            yo_md_emit_style(st);
+            i++;
+            continue;
+        }
+
+        /* Inside code span: emit literally */
+        if (st->in_code_span)
+        {
+            fputc(line[i], st->out);
+            i++;
+            continue;
+        }
+
+        /* Bold: ** */
+        if (i + 1 < len && line[i] == '*' && line[i + 1] == '*')
+        {
+            st->in_bold = !st->in_bold;
+            yo_md_emit_style(st);
+            i += 2;
+            continue;
+        }
+
+        /* Italic: * (single) */
+        if (line[i] == '*')
+        {
+            st->in_italic = !st->in_italic;
+            yo_md_emit_style(st);
+            i++;
+            continue;
+        }
+
+        /* Normal character */
+        fputc(line[i], st->out);
+        i++;
+    }
 }
 
 static void
 yo_display_chat(const char *response)
 {
-    fprintf(rl_outstream, "%s%s%s\n", yo_get_chat_prefix(), response, yo_get_chat_reset());
-    fflush(rl_outstream);
+    yo_md_state_t st;
+    const char *p, *line_start;
+    int in_fenced_block = 0;
+
+    st.out = rl_outstream;
+    st.color_prefix = yo_get_color_prefix();
+    st.color_reset = yo_get_color_reset();
+    st.italic_prefix = yo_get_italic_prefix();
+    st.bold_prefix = yo_get_bold_prefix();
+    st.bold_italic_prefix = yo_get_bold_italic_prefix();
+    st.in_italic = 0;
+    st.in_bold = 0;
+    st.in_code_span = 0;
+    st.in_code_block = 0;
+
+    /* Print chat_prefix (user-defined text prefix, empty by default) */
+    fputs(yo_get_chat_prefix(), st.out);
+
+    /* Start with default chat color */
+    fputs(st.color_prefix, st.out);
+
+    p = response;
+    while (*p)
+    {
+        /* Find end of current line */
+        line_start = p;
+        while (*p && *p != '\n')
+            p++;
+
+        int line_len = (int)(p - line_start);
+
+        /* Check for fenced code block toggle: ``` at start of line */
+        if (line_len >= 3 && line_start[0] == '`' && line_start[1] == '`' && line_start[2] == '`')
+        {
+            if (!in_fenced_block)
+            {
+                in_fenced_block = 1;
+                st.in_code_block = 1;
+                /* Reset style for code block */
+                fputs(st.color_reset, st.out);
+                /* Print the ``` line itself (may have language tag) */
+                fwrite(line_start, 1, line_len, st.out);
+            }
+            else
+            {
+                /* Print closing ``` */
+                fwrite(line_start, 1, line_len, st.out);
+                in_fenced_block = 0;
+                st.in_code_block = 0;
+                /* Restore color — reset then re-apply */
+                fputs(st.color_reset, st.out);
+                fputs(st.color_prefix, st.out);
+            }
+
+            if (*p == '\n')
+            {
+                fputc('\n', st.out);
+                p++;
+            }
+            continue;
+        }
+
+        /* Inside fenced code block: emit raw */
+        if (in_fenced_block)
+        {
+            fwrite(line_start, 1, line_len, st.out);
+            if (*p == '\n')
+            {
+                fputc('\n', st.out);
+                p++;
+            }
+            continue;
+        }
+
+        /* Check for indented code block (4 spaces or 1 tab) */
+        if (line_len >= 4 && line_start[0] == ' ' && line_start[1] == ' '
+            && line_start[2] == ' ' && line_start[3] == ' ')
+        {
+            fputs(st.color_reset, st.out);
+            fwrite(line_start, 1, line_len, st.out);
+            fputs(st.color_reset, st.out);
+            fputs(st.color_prefix, st.out);
+            if (*p == '\n')
+            {
+                fputc('\n', st.out);
+                p++;
+            }
+            continue;
+        }
+        if (line_len >= 1 && line_start[0] == '\t')
+        {
+            fputs(st.color_reset, st.out);
+            fwrite(line_start, 1, line_len, st.out);
+            fputs(st.color_reset, st.out);
+            fputs(st.color_prefix, st.out);
+            if (*p == '\n')
+            {
+                fputc('\n', st.out);
+                p++;
+            }
+            continue;
+        }
+
+        /* Check for headings: # at start of line */
+        if (line_len >= 2 && line_start[0] == '#')
+        {
+            int heading_level = 0;
+            int hi = 0;
+            while (hi < line_len && line_start[hi] == '#')
+            {
+                heading_level++;
+                hi++;
+            }
+            /* Must be followed by space (or end of line) to be a heading */
+            if (hi < line_len && line_start[hi] == ' ')
+            {
+                fputs(st.color_reset, st.out);
+                if (heading_level == 1)
+                {
+                    /* # Heading: bold_italic (bold, no italic — stands out from italic base) */
+                    fputs(st.bold_italic_prefix, st.out);
+                }
+                else if (heading_level == 2)
+                {
+                    /* ## Heading: bold */
+                    fputs(st.bold_prefix, st.out);
+                }
+                else
+                {
+                    /* ### and deeper: italic (i.e. non-italic — lighter emphasis) */
+                    fputs(st.italic_prefix, st.out);
+                }
+
+                fwrite(line_start, 1, line_len, st.out);
+
+                /* Restore normal color */
+                fputs(st.color_reset, st.out);
+                fputs(st.color_prefix, st.out);
+
+                if (*p == '\n')
+                {
+                    fputc('\n', st.out);
+                    p++;
+                }
+                continue;
+            }
+        }
+
+        /* Normal line: render inline markdown */
+        /* Reset inline state at line start (code spans don't cross lines) */
+        st.in_code_span = 0;
+
+        yo_md_render_line(&st, line_start, line_len);
+
+        if (*p == '\n')
+        {
+            fputc('\n', st.out);
+            p++;
+        }
+    }
+
+    /* Reset terminal */
+    fputs(st.color_reset, st.out);
+    fputc('\n', st.out);
+    fflush(st.out);
 }
 
 static void
 yo_print_error_no_newlinev(const char *msg, va_list args)
 {
-    fprintf(rl_outstream, "%sError: ", yo_get_chat_prefix());
+    fprintf(rl_outstream, "%s%sError: ", yo_get_chat_prefix(), yo_get_color_prefix());
     vfprintf(rl_outstream, msg, args);
-    fprintf(rl_outstream, "%s\n", yo_get_chat_reset());
+    fprintf(rl_outstream, "%s\n", yo_get_color_reset());
     fflush(rl_outstream);
 }
 
@@ -3507,7 +3876,7 @@ yo_print_error(const char *msg, ...)
 static void
 yo_print_thinking(void)
 {
-    fprintf(rl_outstream, "%sThinking...%s", yo_get_chat_prefix(), yo_get_chat_reset());
+    fprintf(rl_outstream, "%s%sThinking...%s", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
     fflush(rl_outstream);
 }
 

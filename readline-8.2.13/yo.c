@@ -218,7 +218,11 @@ static int yo_is_pump = 0;
 /*                                                                  */
 /* **************************************************************** */
 
-static bool yo_load_config(void);
+enum yo_load_config_mode {
+    yo_load_config_in_pty_init,
+    yo_load_config_on_prompt
+};
+static bool yo_load_config(enum yo_load_config_mode mode);
 static cJSON *yo_build_tools_anthropic(void);
 static cJSON *yo_build_tools_openai(void);
 static char *yo_sanitize_scrollback_openai(const char *input);
@@ -656,7 +660,7 @@ yo_pty_init(void)
 
     /* Load config early so scrollback settings from ~/.yoconf are available.
        If config loading fails, disable scrollback rather than aborting init. */
-    if (!yo_load_config())
+    if (!yo_load_config(yo_load_config_in_pty_init))
     {
         yo_display_chat("Disabling scrollback because of ~/.yoconf error");
         yo_scrollback_enabled = 0;
@@ -1379,7 +1383,7 @@ yo_continuation_hook(void)
         return 0;
 
     /* Load config and API key */
-    if (!yo_load_config()) 
+    if (!yo_load_config(yo_load_config_on_prompt)) 
     {
         yo_continuation_active = 0;
         return 0;
@@ -1561,7 +1565,7 @@ rl_yo_accept_line(int count, int key)
     fprintf(rl_outstream, "\n");
 
     /* Load config file fresh each time (sets provider, config_model, returns key) */
-    if (!yo_load_config())
+    if (!yo_load_config(yo_load_config_on_prompt))
     {
         /* Error already printed by yo_load_config */
         rl_replace_line("", 0);
@@ -1893,7 +1897,7 @@ yo_finish_config(char *parsed_key)
    3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey
    4. Model defaults applied by yo_finish_config. */
 static bool
-yo_load_config(void)
+yo_load_config(enum yo_load_config_mode mode)
 {
     char *home;
     char path[1024];
@@ -2361,6 +2365,8 @@ yo_load_config(void)
         if (found)
             return false;  /* File existed but had an error — already printed */
 
+        if (mode == yo_load_config_in_pty_init)
+            return true;
         yo_print_error_no_newline(
             "~/.yoconf specifies provider '%s' but no key. "
             "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
@@ -2410,6 +2416,8 @@ yo_load_config(void)
             return false;
     }
 
+    if (mode == yo_load_config_in_pty_init)
+        return true;
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
                               "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
                               "See 'yo how do I configure the LLM' for details.");

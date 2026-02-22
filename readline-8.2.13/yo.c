@@ -1814,14 +1814,15 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
 
     if ((st.st_mode & 0777) != 0600)
     {
-        yo_print_error("%s must have mode 0600 (current: %04o)", display_name, st.st_mode & 0777);
+        yo_print_error_no_newline(
+            "%s must have mode 0600 (current: %04o)", display_name, st.st_mode & 0777);
         return NULL;
     }
 
     fp = fopen(path, "r");
     if (!fp)
     {
-        yo_print_error("Cannot read %s: %s", display_name, strerror(errno));
+        yo_print_error_no_newline("Cannot read %s: %s", display_name, strerror(errno));
         return NULL;
     }
 
@@ -1830,7 +1831,7 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
     {
         fclose(fp);
         free(key);
-        yo_print_error("%s is empty", display_name);
+        yo_print_error_no_newline("%s is empty", display_name);
         return NULL;
     }
 
@@ -1851,7 +1852,7 @@ yo_read_keyfile(const char *path, const char *display_name, int *found_out)
     if (strlen(key) == 0)
     {
         free(key);
-        yo_print_error("%s is empty", display_name);
+        yo_print_error_no_newline("%s is empty", display_name);
         return NULL;
     }
 
@@ -2337,6 +2338,9 @@ yo_load_config(enum yo_load_config_mode mode)
         }
     }
 
+    if (mode == yo_load_config_in_pty_init)
+        return true;
+    
     /* Step 2: Key not found in yoconf (or yoconf doesn't exist).
        Try provider-specific key files. */
 
@@ -2416,8 +2420,6 @@ yo_load_config(enum yo_load_config_mode mode)
             return false;
     }
 
-    if (mode == yo_load_config_in_pty_init)
-        return true;
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
                               "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
                               "See 'yo how do I configure the LLM' for details.");

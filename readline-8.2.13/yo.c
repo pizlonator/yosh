@@ -36,6 +36,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <termios.h>
 #include <poll.h>
 #include <pthread.h>
@@ -483,17 +484,27 @@ yo_write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
-/* The pump loop - runs in the parent process, forwards I/O and waits for child */
+/* Wrapper for pidfd_open(2) since glibc does not provide one. */
+static int
+yo_pidfd_open(pid_t pid, unsigned int flags)
+{
+    return (int)syscall(SYS_pidfd_open, pid, flags);
+}
+
+/* The pump loop - runs in the parent process, forwards I/O and waits for child.
+   Uses pidfd to get notified of child exit via poll(), eliminating the need
+   for periodic waitpid() polling with a timeout. */
 static void
 yo_pump_loop(void)
 {
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     char buf[4096];
     ssize_t n;
     int status = 0;
     int error_exit = 0;  /* If set, exit with 1 regardless of child status */
     struct sigaction sa;
-    pid_t wpid;
+    int pidfd;
+    int nfds;
 
     /* Set up signal forwarding for common signals */
     sa.sa_handler = yo_forward_signal;
@@ -510,55 +521,39 @@ yo_pump_loop(void)
     sa.sa_handler = yo_pump_sigwinch_handler;
     sigaction(SIGWINCH, &sa, NULL);
 
+    /* Open a pidfd for the child process.  When the child exits, the pidfd
+       becomes readable (POLLIN), so we can detect child exit purely through
+       poll() without needing a timeout or periodic waitpid(WNOHANG). */
+    pidfd = yo_pidfd_open(yo_child_pid, 0);
+
     /* Set up poll fds:
        [0] = real stdin (read input from user)
        [1] = PTY master (read output from shell)
+       [2] = pidfd (child exit notification) — only if pidfd_open succeeded
     */
     fds[0].fd = yo_real_stdin;
     fds[0].events = POLLIN;
     fds[1].fd = yo_pty_master;
     fds[1].events = POLLIN;
+    if (pidfd >= 0)
+    {
+        fds[2].fd = pidfd;
+        fds[2].events = POLLIN;
+        nfds = 3;
+    }
+    else
+    {
+        /* pidfd_open failed (old kernel?) — we'll rely on PTY hangup */
+        fds[2].fd = -1;
+        fds[2].events = 0;
+        nfds = 2;
+    }
 
     for (;;)
     {
         int ret;
 
-        /* Check if child is still alive */
-        wpid = waitpid(yo_child_pid, &status, WNOHANG);
-        if (wpid < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            goto error;
-        }
-        if (wpid > 0)
-        {
-            /* Child exited - drain any remaining output */
-            int flags = fcntl(yo_pty_master, F_GETFL);
-            if (flags >= 0)
-                fcntl(yo_pty_master, F_SETFL, flags | O_NONBLOCK);
-            for (;;)
-            {
-                n = read(yo_pty_master, buf, sizeof(buf));
-                if (n > 0)
-                {
-                    if (yo_write_all(yo_real_stdout, buf, n) < 0)
-                        break;  /* Write error during drain, stop draining */
-                    yo_scrollback_append(buf, n);
-                }
-                else if (n == 0)
-                {
-                    break;  /* EOF */
-                }
-                else if (errno != EINTR)
-                {
-                    break;  /* Read error during drain */
-                }
-            }
-            goto cleanup;
-        }
-
-        ret = poll(fds, 2, 100);  /* 100ms timeout to check child status */
+        ret = poll(fds, nfds, -1);  /* No timeout needed — pidfd signals child exit */
 
         if (ret < 0)
         {
@@ -566,9 +561,6 @@ yo_pump_loop(void)
                 continue;
             goto error;
         }
-
-        if (ret == 0)
-            continue;  /* Timeout, check child status */
 
         /* Forward input from real stdin to PTY master */
         if (fds[0].revents & POLLIN)
@@ -611,9 +603,37 @@ yo_pump_loop(void)
             }
         }
 
-        /* Check for hangup/error on PTY */
+        /* Check for hangup/error on PTY (only when no data to read) */
         if ((fds[1].revents & (POLLHUP | POLLERR)) && !(fds[1].revents & POLLIN))
             goto wait_child;
+
+        /* Child exit notification via pidfd */
+        if (pidfd >= 0 && (fds[2].revents & POLLIN))
+        {
+            /* Child has exited — drain any remaining PTY output */
+            int fl = fcntl(yo_pty_master, F_GETFL);
+            if (fl >= 0)
+                fcntl(yo_pty_master, F_SETFL, fl | O_NONBLOCK);
+            for (;;)
+            {
+                n = read(yo_pty_master, buf, sizeof(buf));
+                if (n > 0)
+                {
+                    if (yo_write_all(yo_real_stdout, buf, n) < 0)
+                        break;  /* Write error during drain, stop draining */
+                    yo_scrollback_append(buf, n);
+                }
+                else if (n == 0)
+                {
+                    break;  /* EOF */
+                }
+                else if (errno != EINTR)
+                {
+                    break;  /* Read error during drain */
+                }
+            }
+            goto wait_child;
+        }
     }
 
 error:
@@ -629,6 +649,10 @@ wait_child:
     /* Fall through to cleanup */
 
 cleanup:
+    /* Close pidfd if we opened one */
+    if (pidfd >= 0)
+        close(pidfd);
+
     /* Restore terminal settings */
     if (yo_orig_termios_saved)
         tcsetattr(yo_real_stdin, TCSANOW, &yo_orig_termios);

@@ -105,12 +105,12 @@ model claude-sonnet-4-20250514
 # API key (optional if using a key file instead)
 key sk-ant-api03-...
 
-# Chat display prefix/reset (optional, supports C-style escapes)
-# chat_prefix \033[3;36m
-# chat_reset \033[0m
+# Chat display color/reset (optional, supports C-style escapes)
+# color_prefix \033[3;36m
+# color_reset \033[0m
 ```
 
-Values for `chat_prefix` and `chat_reset` support C-style escape sequences (`\033`, `\n`, `\t`, `\\`) and optional quoting with `"` or `'` to preserve whitespace.
+Directives that accept escape sequences (such as `chat_prefix`, `color_prefix`, `color_reset`, and the markdown rendering directives below) support C-style escape sequences (`\033`, `\n`, `\t`, `\\`) and optional quoting with `"` or `'` to preserve whitespace.
 
 ### API Key Files
 
@@ -132,8 +132,23 @@ All settings are configured in `~/.yoconf`. The file is re-read on each `yo` com
 | `scrollback_bytes` | `1048576` | Max scrollback buffer size in bytes (startup only) |
 | `scrollback_lines` | `1000` | Max lines to return to the LLM (startup only) |
 | `server_web` | `1` | Set to `0` to disable server-side web search |
-| `chat_prefix` | `\033[3;36m` | String printed before chat output (supports C escapes) |
-| `chat_reset` | `\033[0m` | String printed after chat output (supports C escapes) |
+| `chat_prefix` | `""` (empty) | Text string printed before chat output (supports C escapes) |
+| `color_prefix` | `\033[3;36m` | ANSI escape applied at the start of chat output (cyan italic) |
+| `chat_reset` / `color_reset` | `\033[0m` | ANSI escape applied after chat output (reset) |
+
+#### Markdown Rendering
+
+These directives control the ANSI escape sequences used for rendering markdown formatting in chat output. Since the default base style is italic, markdown `*italic*` toggles italic OFF to create visual contrast, then toggles it back ON when the italic span ends. All values support C-style escapes.
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `enable_italic` | `\033[23m` | Escape for markdown `*italic*` start (disables terminal italic since base is already italic) |
+| `disable_italic` | `\033[3m` | Escape for markdown `*italic*` end (re-enables terminal italic to return to base style) |
+| `enable_bold` | `\033[1m` | Escape for markdown `**bold**` start |
+| `disable_bold` | `\033[22m` | Escape for markdown `**bold**` end |
+| `enable_strikethrough` | `\033[9m` | Escape for markdown `~~strikethrough~~` start |
+| `disable_strikethrough` | `\033[29m` | Escape for markdown `~~strikethrough~~` end |
+| `code_delimiter` | `\033[0;3;38;5;23m` | Escape for fenced code block delimiter lines (reset + italic + dark cyan) |
 
 ## Usage
 

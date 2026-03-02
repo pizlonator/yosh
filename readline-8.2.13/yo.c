@@ -65,7 +65,7 @@
 #define YO_DEFAULT_HISTORY_LIMIT 10
 #define YO_DEFAULT_TOKEN_BUDGET 4096
 #define YO_MAX_TOKENS 1024
-#define YO_DEFAULT_OPENAI_MODEL "gpt-5"
+#define YO_DEFAULT_OPENAI_MODEL "gpt-5.2"
 
 /* Default styling.  Base text is italic cyan (color_prefix).
    Since base is already italic, markdown *italic* toggles italic OFF;
@@ -2657,7 +2657,10 @@ yo_build_tools_openai(void)
     cJSON_AddStringToObject(tool, "description",
         "Request recent terminal output to see command results, error messages, or context. "
         "Use this when you need to see what happened in the terminal. "
-        "If you need output, use this tool. Never ask the user to paste output manually.");
+        "If you need output, use this tool first. "
+        "Never ask the user what they were doing. "
+        "Never suggest you could look at scrollback. "
+        "Never ask the user to paste output manually.");
     params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "type", "object");
     json_props = cJSON_CreateObject();
@@ -3276,6 +3279,10 @@ yo_build_openai_request(cJSON *messages,
         "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
         "files with cat/grep. Use docs first, then answer based on what it returns.\n"
         "\n"
+        "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+        "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+        "use scrollback instead.\n"
+        "\n"
         "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
         "output before deciding the next action, you MUST use pending=true and issue ONE\n"
         "command at a time. NEVER combine steps into a single compound command (no && chains\n"
@@ -3283,8 +3290,17 @@ yo_build_openai_request(cJSON *messages,
         "(except the last step, which should have pending=false).\n"
         "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
         "with the scrollback tool and continue after you receive it.\n"
+        "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+        "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+        "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+        "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+        "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+        "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+        "use scrollback. This is non-negotiable.\n"
         "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
         "Ignore escape-code garbage and focus on actual command output.\n"
+        "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+        "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
         "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
         "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
         "use HTML tags or markdown links.\n"
@@ -3298,7 +3314,7 @@ yo_build_openai_request(cJSON *messages,
         "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
         "  (pending=true), then decide based on output"
         "%s",
-        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt, yo_name,
+        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt, yo_name, yo_name, yo_name,
         yo_server_web_enabled
             ? "\n\nYou have web search available. When you find the answer to the user's question "
               "via web search (weather, news, sports scores, prices, current events, etc.), "

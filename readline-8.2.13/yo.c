@@ -66,6 +66,7 @@
 #define YO_DEFAULT_TOKEN_BUDGET 4096
 #define YO_MAX_TOKENS 1024
 #define YO_DEFAULT_OPENAI_MODEL "gpt-5.2"
+#define YO_DEFAULT_KIMI_MODEL "kimi-k2.5"
 
 /* Default styling.  Base text is italic cyan (color_prefix).
    Since base is already italic, markdown *italic* toggles italic OFF;
@@ -101,7 +102,8 @@ typedef enum {
 
 typedef enum {
     YO_PROVIDER_ANTHROPIC,
-    YO_PROVIDER_OPENAI
+    YO_PROVIDER_OPENAI,
+    YO_PROVIDER_KIMI
 } yo_provider_t;
 
 typedef struct {
@@ -111,6 +113,7 @@ typedef struct {
     char *tool_use_id;    /* Anthropic tool_use "id" field */
     int pending;          /* 1 if multi-step continuation */
     cJSON *raw_tool_use;  /* raw cJSON tool_use block (owned by this struct) */
+    char *reasoning_content;  /* Kimi reasoning content when thinking is enabled */
 } yo_response_t;
 
 #define YO_LLM_RETRY_EXPLANATION            (1 << 0)
@@ -123,6 +126,7 @@ typedef struct {
     char *tool_use_id;             /* tool_use.id from LLM response */
     int executed;                  /* 1 if user ran it, 0 if not */
     int pending;                   /* 1 if response had "pending":true (multi-step) */
+    char *reasoning_content;       /* Kimi reasoning content when thinking is enabled */
 } yo_exchange_t;
 
 /* **************************************************************** */
@@ -225,10 +229,11 @@ enum yo_load_config_mode {
 };
 static bool yo_load_config(enum yo_load_config_mode mode);
 static cJSON *yo_build_tools_anthropic(void);
-static cJSON *yo_build_tools_openai(void);
-static char *yo_sanitize_scrollback_openai(const char *input);
+static cJSON *yo_build_tools_openai();
+static char *yo_sanitize_scrollback(const char *input);
 static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
-                                const char *tool_name, cJSON *input);
+                                const char *tool_name, cJSON *input,
+                                const char *reasoning_content);
 static void yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                                    const char *result_content);
 static cJSON *yo_build_history_tool_input(int idx);
@@ -236,19 +241,23 @@ static const char *yo_response_type_to_string(yo_response_type_t type);
 static cJSON *yo_call_api(const char *query);
 static cJSON *yo_call_api_with_scrollback(const char *query,
                                           const char *scrollback_request, const char *scrollback_data,
-                                          const char *scrollback_tool_id);
+                                          const char *scrollback_tool_id,
+                                          const char *reasoning_content);
 static cJSON *yo_call_api_with_docs(const char *query, const char *docs_request,
-                                    const char *docs_tool_id);
+                                    const char *docs_tool_id,
+                                    const char *reasoning_content);
 static int yo_parse_response(cJSON *tool_use, yo_response_t *resp);
 static void yo_display_chat(const char *response);
-static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending);
+static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content);
 static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
 static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
-                                                 const char *scrollback_data, const char *scrollback_tool_id);
+                                                 const char *scrollback_data, const char *scrollback_tool_id,
+                                                 const char *reasoning_content);
 static cJSON *yo_build_messages_with_docs(const char *current_query, const char *docs_request,
-                                          const char *docs_tool_id);
+                                          const char *docs_tool_id,
+                                          const char *reasoning_content);
 static void yo_print_error_no_newlinev(const char *msg, va_list args);
 static void yo_print_error_no_newline(const char *msg, ...);
 static void yo_print_error(const char *msg, ...);
@@ -1119,6 +1128,8 @@ rl_yo_clear_history(void)
             free(yo_history[i].response);
         if (yo_history[i].tool_use_id)
             free(yo_history[i].tool_use_id);
+        if (yo_history[i].reasoning_content)
+            free(yo_history[i].reasoning_content);
     }
 
     if (yo_history)
@@ -1205,7 +1216,8 @@ yo_handle_requests(const char *query,
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
             new_tool_use = yo_call_api_with_scrollback(
-                query, saved_content, scrollback_data, saved_tool_id);
+                query, saved_content, scrollback_data, saved_tool_id, resp->reasoning_content);
+            if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
             free(saved_tool_id);
             free(saved_content);
             free(scrollback_data);
@@ -1243,7 +1255,8 @@ yo_handle_requests(const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_api_with_docs(query, "", saved_tool_id);
+            new_tool_use = yo_call_api_with_docs(query, "", saved_tool_id, resp->reasoning_content);
+            if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
             free(saved_tool_id);
 
             if (!new_tool_use)
@@ -1473,7 +1486,7 @@ yo_continuation_hook(void)
             yo_display_chat(resp.explanation);
 
         /* Add continuation exchange to session history */
-        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content);
 
         /* Prefill the command */
         rl_replace_line(resp.content, 0);
@@ -1488,7 +1501,7 @@ yo_continuation_hook(void)
     else if (resp.type == YO_RESPONSE_CHAT)
     {
         yo_display_chat(resp.content);
-        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 1, 0);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content);
         rl_replace_line("", 0);
         yo_continuation_active = 0;
     }
@@ -1625,7 +1638,7 @@ rl_yo_accept_line(int count, int key)
         }
 
         /* Add to session history (not executed yet) */
-        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content);
 
         /* Replace line with the command */
         rl_replace_line(resp.content, 0);
@@ -1649,7 +1662,7 @@ rl_yo_accept_line(int count, int key)
         yo_display_chat(resp.content);
 
         /* Add to session history */
-        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 1, 0);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content);
 
         /* Clear any active continuation */
         yo_continuation_active = 0;
@@ -1905,6 +1918,10 @@ yo_finish_config(char *parsed_key)
     else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         yo_model = strdup(YO_DEFAULT_OPENAI_MODEL);
+    }
+    else if (yo_provider == YO_PROVIDER_KIMI)
+    {
+        yo_model = strdup(YO_DEFAULT_KIMI_MODEL);
     }
     else
     {
@@ -2332,10 +2349,15 @@ yo_load_config(enum yo_load_config_mode mode)
                 yo_provider = YO_PROVIDER_OPENAI;
                 have_provider = 1;
             }
+            else if (strcmp(parsed_provider, "kimi") == 0)
+            {
+                yo_provider = YO_PROVIDER_KIMI;
+                have_provider = 1;
+            }
             else
             {
                 yo_print_error_no_newline(
-                    "~/.yoconf: unknown provider '%s' (expected 'anthropic' or 'openai')",
+                    "~/.yoconf: unknown provider '%s' (expected 'anthropic', 'openai', or 'kimi')",
                     parsed_provider);
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
@@ -2378,6 +2400,11 @@ yo_load_config(enum yo_load_config_mode mode)
             snprintf(path, sizeof(path), "%s/.anthropickey", home);
             parsed_key = yo_read_keyfile(path, "~/.anthropickey", &found);
         }
+        else if (yo_provider == YO_PROVIDER_KIMI)
+        {
+            snprintf(path, sizeof(path), "%s/.kimikey", home);
+            parsed_key = yo_read_keyfile(path, "~/.kimikey", &found);
+        }
         else
         {
             snprintf(path, sizeof(path), "%s/.openaikey", home);
@@ -2398,13 +2425,15 @@ yo_load_config(enum yo_load_config_mode mode)
         yo_print_error_no_newline(
             "~/.yoconf specifies provider '%s' but no key. "
             "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
-            yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" : "openai",
-            yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" : ".openaikey");
+            yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" :
+            yo_provider == YO_PROVIDER_KIMI ? "kimi" : "openai",
+            yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" :
+            yo_provider == YO_PROVIDER_KIMI ? ".kimikey" : ".openaikey");
         return false;
     }
 
     /* Step 3: Neither key nor provider known — try the fallback chain.
-       ~/.anthropickey -> ~/.yoshkey -> ~/.openaikey
+       ~/.anthropickey -> ~/.yoshkey -> ~/.openaikey -> ~/.kimikey
        If a file exists but has an error, stop immediately. */
 
     {
@@ -2442,10 +2471,21 @@ yo_load_config(enum yo_load_config_mode mode)
         }
         if (found)
             return false;
+
+        snprintf(path, sizeof(path), "%s/.kimikey", home);
+        parsed_key = yo_read_keyfile(path, "~/.kimikey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_KIMI;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
     }
 
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
-                              "or create ~/.anthropickey or ~/.openaikey (mode 0600). "
+                              "or create ~/.anthropickey, ~/.openaikey, or ~/.kimikey (mode 0600). "
                               "See 'yo how do I configure the LLM' for details.");
     return false;
 }
@@ -2575,9 +2615,131 @@ yo_build_tools_anthropic(void)
     return tools;
 }
 
+/* Build tools array in Kimi Chat Completions API format.
+   Similar to OpenAI format but without strict mode and additionalProperties
+   which Kimi doesn't support.
+   web_search_enabled is ignored for Kimi (always 0). */
+static cJSON *
+yo_build_tools_kimi(void)
+{
+    cJSON *tools = cJSON_CreateArray();
+    cJSON *tool, *func, *params, *json_props, *prop, *required;
+    char *docs_desc;
+
+    /* Tool: command */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    func = cJSON_CreateObject();
+    cJSON_AddStringToObject(func, "name", "command");
+    cJSON_AddStringToObject(func, "description",
+        "Generate a shell command for the user to review and execute. "
+        "The command will be prefilled at the prompt for the user to edit or run. "
+        "CRITICAL: If you recommend any command, you MUST use this tool. "
+        "Do NOT respond with chat that suggests a command. "
+        "Keep commands short and readable (prefer single-line commands). "
+        "Do NOT emit large here-docs or long multi-line scripts. "
+        "If a solution would be long, split into multiple steps using pending=true.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "The shell command to execute");
+    cJSON_AddItemToObject(json_props, "command", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description",
+        "Brief explanation of what this command does, shown to user before the command");
+    cJSON_AddItemToObject(json_props, "explanation", prop);
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "boolean");
+    cJSON_AddStringToObject(prop, "description",
+        "Set to true if this is part of a multi-step sequence and you need to see "
+        "the output before providing the next command. After the user executes this "
+        "command, you will automatically receive the terminal output.");
+    cJSON_AddItemToObject(json_props, "pending", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("command"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("explanation"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddItemToObject(func, "parameters", params);
+    cJSON_AddItemToObject(tool, "function", func);
+    cJSON_AddItemToArray(tools, tool);
+
+    /* Tool: chat */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    func = cJSON_CreateObject();
+    cJSON_AddStringToObject(func, "name", "chat");
+    cJSON_AddStringToObject(func, "description",
+        "Respond with a text message for questions and explanations; use ONLY when no command is needed. "
+        "Do NOT include command suggestions here; if a command is appropriate, use the command tool.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "string");
+    cJSON_AddStringToObject(prop, "description", "Your text response to the user");
+    cJSON_AddItemToObject(json_props, "response", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("response"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddItemToObject(func, "parameters", params);
+    cJSON_AddItemToObject(tool, "function", func);
+    cJSON_AddItemToArray(tools, tool);
+
+    /* Tool: scrollback */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    func = cJSON_CreateObject();
+    cJSON_AddStringToObject(func, "name", "scrollback");
+    cJSON_AddStringToObject(func, "description",
+        "Request recent terminal output to see command results, error messages, or context. "
+        "Use this when you need to see what happened in the terminal. "
+        "If you need output, use this tool first. "
+        "Never ask the user what they were doing. "
+        "Never suggest you could look at scrollback. "
+        "Never ask the user to paste output manually.");
+    params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "type", "object");
+    json_props = cJSON_CreateObject();
+    prop = cJSON_CreateObject();
+    cJSON_AddStringToObject(prop, "type", "integer");
+    cJSON_AddStringToObject(prop, "description", "Number of recent lines to retrieve (max 1000)");
+    cJSON_AddItemToObject(json_props, "lines", prop);
+    cJSON_AddItemToObject(params, "properties", json_props);
+    required = cJSON_CreateArray();
+    cJSON_AddItemToArray(required, cJSON_CreateString("lines"));
+    cJSON_AddItemToObject(params, "required", required);
+    cJSON_AddItemToObject(func, "parameters", params);
+    cJSON_AddItemToObject(tool, "function", func);
+    cJSON_AddItemToArray(tools, tool);
+
+    /* Tool: docs */
+    tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "function");
+    func = cJSON_CreateObject();
+    cJSON_AddStringToObject(func, "name", "docs");
+    asprintf(&docs_desc,
+             "Request %s documentation to answer questions about %s features, configuration, "
+             "environment variables, LLM provider/model or API key setup, or usage.",
+             yo_name, yo_name);
+    cJSON_AddStringToObject(func, "description", docs_desc);
+    free(docs_desc);
+    /* For parameter-less functions, omit the parameters field entirely for Kimi */
+    cJSON_AddItemToObject(tool, "function", func);
+    cJSON_AddItemToArray(tools, tool);
+
+    return tools;
+}
+
 /* Build tools array in OpenAI Responses API format.
    Converts common tool definitions to OpenAI function format and appends
-   OpenAI-specific tools (web_search). */
+   OpenAI-specific tools (web_search) if enabled.
+   web_search_enabled: whether to add the web_search tool (OpenAI only, not Kimi). */
 static cJSON *
 yo_build_tools_openai(void)
 {
@@ -2712,7 +2874,7 @@ yo_build_tools_openai(void)
 /* Remove ANSI escape sequences and other control characters from scrollback
    before sending it to OpenAI (Anthropic already handles raw scrollback well). */
 static char *
-yo_sanitize_scrollback_openai(const char *input)
+yo_sanitize_scrollback(const char *input)
 {
     size_t in_len, out_len = 0;
     char *out;
@@ -3324,7 +3486,7 @@ yo_build_openai_request(cJSON *messages,
               "or markdown link syntax in citations."
             : "");
 
-    /* When web search is enabled, bump max tokens and timeout */
+    /* When web search is enabled, bump max tokens */
     if (yo_server_web_enabled)
         max_tokens = 4096;
 
@@ -3362,6 +3524,344 @@ yo_build_openai_request(cJSON *messages,
     *timeout_out = 0;
 
     return request_body;
+}
+
+/* Build Kimi Chat Completions API request body, URL, and headers.
+   Uses the Chat Completions API format with `messages` array.
+   Unlike OpenAI Responses API, this uses role-based messages.
+   Returns malloc'd request body string.  Sets *url_out and *headers_out.
+   Caller must free the request body and the headers. */
+static char *
+yo_build_kimi_request(cJSON *messages,
+                      const char **url_out, struct curl_slist **headers_out,
+                      long *timeout_out)
+{
+    cJSON *request_json;
+    cJSON *tools;
+    char *request_body;
+    char auth_header[300];
+    struct curl_slist *headers = NULL;
+    char *system_prompt;
+
+    /* Build tools array for Kimi (no strict mode, no additionalProperties) */
+    tools = yo_build_tools_kimi();
+
+    /* Build system instructions */
+    asprintf(&system_prompt,
+        "You are powered by %s (provider: kimi).\n\n"
+        "%s\n\n"
+        "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+        "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+        "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+        "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+        "If the user's question can be answered by running a command on this system\n"
+        "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+        "Examples that MUST use command, not chat:\n"
+        "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+        "- 'what version of gcc do I have' -> command: gcc --version\n"
+        "- 'how much disk space is left' -> command: df -h\n"
+        "- 'what ports are open' -> command: ss -tlnp\n"
+        "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+        "\n"
+        "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+        "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+        "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+        "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+        "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+        "\n"
+        "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+        "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+        "use scrollback instead.\n"
+        "\n"
+        "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+        "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+        "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+        "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+        "(except the last step, which should have pending=false).\n"
+        "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+        "with the scrollback tool and continue after you receive it.\n"
+        "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+        "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+        "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+        "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+        "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+        "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+        "use scrollback. This is non-negotiable.\n"
+        "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+        "Ignore escape-code garbage and focus on actual command output.\n"
+        "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+        "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
+        "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
+        "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
+        "use HTML tags or markdown links.\n"
+        "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+        "scripts. If it would be long, split into multiple steps using pending=true.\n"
+        "Examples that MUST use pending=true (one command at a time):\n"
+        "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+        "  then after seeing output: echo world (pending=false)\n"
+        "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+        "  then after seeing it succeed: configure command (pending=false)\n"
+        "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+        "  (pending=true), then decide based on output",
+        yo_model ? yo_model : YO_DEFAULT_KIMI_MODEL, yo_system_prompt,
+        yo_name, yo_name, yo_name);
+
+    /* Build request JSON for Chat Completions API */
+    request_json = cJSON_CreateObject();
+    cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_KIMI_MODEL);
+    cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
+
+    /* Build messages array with system prompt as first message */
+    {
+        cJSON *messages_array = cJSON_CreateArray();
+        cJSON *system_msg = cJSON_CreateObject();
+        cJSON *user_msg;
+        
+        /* System message */
+        cJSON_AddStringToObject(system_msg, "role", "system");
+        cJSON_AddStringToObject(system_msg, "content", system_prompt);
+        cJSON_AddItemToArray(messages_array, system_msg);
+        
+        /* Add conversation messages - convert from Responses API format to Chat Completions format */
+        if (messages && cJSON_IsArray(messages)) {
+            cJSON *item;
+            cJSON_ArrayForEach(item, messages) {
+                cJSON *type = cJSON_GetObjectItem(item, "type");
+                cJSON *role = cJSON_GetObjectItem(item, "role");
+                cJSON *content = cJSON_GetObjectItem(item, "content");
+                
+                if (role && cJSON_IsString(role)) {
+                    /* Already in Chat Completions format (user query messages) */
+                    cJSON_AddItemToArray(messages_array, cJSON_Duplicate(item, 1));
+                } else if (type && cJSON_IsString(type)) {
+                    /* In Responses API format - convert to Chat Completions format */
+                    const char *type_str = type->valuestring;
+                    
+                    if (strcmp(type_str, "function_call") == 0) {
+                        /* Assistant message with tool_calls */
+                        cJSON *call_id = cJSON_GetObjectItem(item, "call_id");
+                        cJSON *name = cJSON_GetObjectItem(item, "name");
+                        cJSON *arguments = cJSON_GetObjectItem(item, "arguments");
+                        cJSON *assistant_msg = cJSON_CreateObject();
+                        cJSON *tool_calls = cJSON_CreateArray();
+                        cJSON *tool_call = cJSON_CreateObject();
+                        cJSON *function = cJSON_CreateObject();
+                        
+                        cJSON_AddStringToObject(assistant_msg, "role", "assistant");
+                        cJSON_AddStringToObject(assistant_msg, "content", "");
+                        
+                        cJSON_AddStringToObject(tool_call, "id", 
+                            (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "call_1");
+                        cJSON_AddStringToObject(tool_call, "type", "function");
+                        cJSON_AddStringToObject(function, "name",
+                            (name && cJSON_IsString(name)) ? name->valuestring : "chat");
+                        if (arguments && cJSON_IsString(arguments)) {
+                            cJSON_AddStringToObject(function, "arguments", arguments->valuestring);
+                        } else {
+                            cJSON_AddStringToObject(function, "arguments", "{}");
+                        }
+                        cJSON_AddItemToObject(tool_call, "function", function);
+                        cJSON_AddItemToArray(tool_calls, tool_call);
+                        cJSON_AddItemToObject(assistant_msg, "tool_calls", tool_calls);
+                        cJSON_AddItemToArray(messages_array, assistant_msg);
+                    } else if (strcmp(type_str, "function_call_output") == 0) {
+                        /* Tool result message */
+                        cJSON *call_id = cJSON_GetObjectItem(item, "call_id");
+                        cJSON *output = cJSON_GetObjectItem(item, "output");
+                        cJSON *tool_msg = cJSON_CreateObject();
+                        
+                        cJSON_AddStringToObject(tool_msg, "role", "tool");
+                        cJSON_AddStringToObject(tool_msg, "tool_call_id",
+                            (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "call_1");
+                        cJSON_AddStringToObject(tool_msg, "content",
+                            (output && cJSON_IsString(output)) ? output->valuestring : "");
+                        cJSON_AddItemToArray(messages_array, tool_msg);
+                    }
+                }
+            }
+        }
+        
+        cJSON_AddItemToObject(request_json, "messages", messages_array);
+    }
+    
+    free(system_prompt);
+
+    /* Add tools array (takes ownership) */
+    cJSON_AddItemToObject(request_json, "tools", tools);
+
+    /* Note: Kimi doesn't support tool_choice field, so we omit it */
+
+    request_body = cJSON_PrintUnformatted(request_json);
+    cJSON_Delete(request_json);
+
+    /* Set up headers */
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+    headers = curl_slist_append(headers, auth_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    *url_out = "https://api.moonshot.ai/v1/chat/completions";
+    *headers_out = headers;
+    *timeout_out = 0;
+
+    return request_body;
+}
+
+/* Parse Kimi Chat Completions API response → normalized tool_use cJSON.
+   Extracts tool_calls from choices[0].message.tool_calls[].
+   Falls back to message.content for text responses.
+   Caller must free the returned cJSON with cJSON_Delete. */
+static cJSON *
+yo_parse_kimi_response(const char *response_data)
+{
+    cJSON *response_json;
+    cJSON *choices_array;
+    cJSON *first_choice;
+    cJSON *message;
+    cJSON *tool_calls;
+    cJSON *result = NULL;
+
+    response_json = cJSON_Parse(response_data);
+    if (!response_json)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Failed to parse API response");
+        return NULL;
+    }
+
+    /* Check for error response */
+    {
+        cJSON *error = cJSON_GetObjectItem(response_json, "error");
+        if (error && !cJSON_IsNull(error))
+        {
+            cJSON *msg = cJSON_GetObjectItem(error, "message");
+            yo_clear_thinking();
+            if (msg && cJSON_IsString(msg))
+            {
+                fprintf(rl_outstream, "%s%sAPI error: %s%s\n",
+                        yo_get_chat_prefix(), yo_get_color_prefix(), msg->valuestring, yo_get_color_reset());
+                fflush(rl_outstream);
+            }
+            else
+            {
+                yo_print_error_no_newline("API returned an error: %s", response_data);
+            }
+            cJSON_Delete(response_json);
+            return NULL;
+        }
+    }
+
+    /* Extract choices[] array */
+    choices_array = cJSON_GetObjectItem(response_json, "choices");
+    if (!choices_array || !cJSON_IsArray(choices_array) || cJSON_GetArraySize(choices_array) == 0)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Unexpected API response format: %s",
+                                  cJSON_PrintUnformatted(response_json));
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    /* Get first choice */
+    first_choice = cJSON_GetArrayItem(choices_array, 0);
+    if (!first_choice)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("Empty choices array in response");
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    /* Get message object */
+    message = cJSON_GetObjectItem(first_choice, "message");
+    if (!message)
+    {
+        yo_clear_thinking();
+        yo_print_error_no_newline("No message in response choice");
+        cJSON_Delete(response_json);
+        return NULL;
+    }
+
+    /* Extract reasoning_content if present (for thinking mode) */
+    {
+        cJSON *reasoning = cJSON_GetObjectItem(message, "reasoning_content");
+        if (reasoning && cJSON_IsString(reasoning) && reasoning->valuestring && *reasoning->valuestring)
+        {
+            /* Store reasoning_content for later use when building messages */
+            /* We'll add it to the result object as a special field */
+        }
+    }
+
+    /* Look for tool_calls array */
+    tool_calls = cJSON_GetObjectItem(message, "tool_calls");
+    if (tool_calls && cJSON_IsArray(tool_calls) && cJSON_GetArraySize(tool_calls) > 0)
+    {
+        cJSON *tool_call = cJSON_GetArrayItem(tool_calls, 0);
+        cJSON *id = cJSON_GetObjectItem(tool_call, "id");
+        cJSON *type = cJSON_GetObjectItem(tool_call, "type");
+        cJSON *function = cJSON_GetObjectItem(tool_call, "function");
+        
+        if (function && cJSON_IsObject(function))
+        {
+            cJSON *name = cJSON_GetObjectItem(function, "name");
+            cJSON *arguments = cJSON_GetObjectItem(function, "arguments");
+            cJSON *input;
+            cJSON *reasoning = cJSON_GetObjectItem(message, "reasoning_content");
+
+            result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "type", "tool_use");
+            cJSON_AddStringToObject(result, "id",
+                (id && cJSON_IsString(id)) ? id->valuestring : "kimi_call");
+            cJSON_AddStringToObject(result, "name",
+                (name && cJSON_IsString(name)) ? name->valuestring : "chat");
+
+            /* Parse arguments JSON string into an object */
+            input = (arguments && cJSON_IsString(arguments))
+                ? cJSON_Parse(arguments->valuestring) : NULL;
+            if (!input)
+                input = cJSON_CreateObject();
+            cJSON_AddItemToObject(result, "input", input);
+
+            /* Store reasoning_content if present */
+            if (reasoning && cJSON_IsString(reasoning) && reasoning->valuestring)
+            {
+                cJSON_AddStringToObject(result, "reasoning_content", reasoning->valuestring);
+            }
+        }
+    }
+
+    if (!result)
+    {
+        /* No tool_calls found — look for content */
+        cJSON *content = cJSON_GetObjectItem(message, "content");
+        cJSON *reasoning = cJSON_GetObjectItem(message, "reasoning_content");
+        char *text_content = NULL;
+        
+        if (content && cJSON_IsString(content))
+        {
+            text_content = content->valuestring;
+        }
+
+        /* Wrap text as synthetic chat tool_use */
+        result = cJSON_CreateObject();
+        cJSON_AddStringToObject(result, "type", "tool_use");
+        cJSON_AddStringToObject(result, "id", "synthetic_text_response");
+        cJSON_AddStringToObject(result, "name", "chat");
+        {
+            cJSON *input = cJSON_CreateObject();
+            cJSON_AddStringToObject(input, "response",
+                text_content ? text_content : "(empty response)");
+            cJSON_AddItemToObject(result, "input", input);
+        }
+
+        /* Store reasoning_content if present */
+        if (reasoning && cJSON_IsString(reasoning) && reasoning->valuestring)
+        {
+            cJSON_AddStringToObject(result, "reasoning_content", reasoning->valuestring);
+        }
+    }
+
+    cJSON_Delete(response_json);
+    return result;
 }
 
 /* Parse OpenAI Responses API output → normalized tool_use cJSON.
@@ -3533,6 +4033,10 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     {
         request_body = yo_build_openai_request(messages, &url, &headers, &timeout);
     }
+    else if (yo_provider == YO_PROVIDER_KIMI)
+    {
+        request_body = yo_build_kimi_request(messages, &url, &headers, &timeout);
+    }
     else
     {
         request_body = yo_build_anthropic_request(messages, &url, &headers, &timeout);
@@ -3570,7 +4074,13 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
         return NULL;  /* Error/cancellation already printed by yo_http_post */
 
     /* Provider-specific response parsing */
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider == YO_PROVIDER_KIMI)
+    {
+        result = yo_parse_kimi_response(response_data);
+        free(response_data);
+        return result;
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         result = yo_parse_openai_response(response_data);
         free(response_data);
@@ -3621,10 +4131,12 @@ yo_call_api(const char *query)
 static cJSON *
 yo_call_api_with_scrollback(const char *query,
                             const char *scrollback_request, const char *scrollback_data,
-                            const char *scrollback_tool_id)
+                            const char *scrollback_tool_id,
+                            const char *reasoning_content)
 {
     cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request,
-                                                        scrollback_data, scrollback_tool_id);
+                                                        scrollback_data, scrollback_tool_id,
+                                                        reasoning_content);
     return yo_call_api_with_messages(messages);
 }
 
@@ -3667,7 +4179,9 @@ yo_retry_for_explanation(const char *query, cJSON *original_tool_use)
     /* Append the assistant's original tool_use using provider-native format */
     {
         cJSON *input_copy = input_item ? cJSON_Duplicate(input_item, 1) : cJSON_CreateObject();
-        yo_msg_add_tool_use(messages, tool_use_id, tool_name, input_copy);
+        cJSON *reasoning_item = cJSON_GetObjectItem(original_tool_use, "reasoning_content");
+        const char *reasoning = (reasoning_item && cJSON_IsString(reasoning_item)) ? reasoning_item->valuestring : NULL;
+        yo_msg_add_tool_use(messages, tool_use_id, tool_name, input_copy, reasoning);
         cJSON_Delete(input_copy);
     }
 
@@ -3719,6 +4233,7 @@ yo_response_free(yo_response_t *resp)
     if (resp->explanation)  { free(resp->explanation);  resp->explanation = NULL; }
     if (resp->tool_use_id)  { free(resp->tool_use_id);  resp->tool_use_id = NULL; }
     if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
+    if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
     resp->type = YO_RESPONSE_ERROR;
     resp->pending = 0;
 }
@@ -3749,6 +4264,7 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
     resp->explanation = NULL;
     resp->tool_use_id = NULL;
     resp->pending = 0;
+    resp->reasoning_content = NULL;
     /* Note: resp->raw_tool_use is NOT touched here - caller manages it */
 
     if (!tool_use)
@@ -3765,6 +4281,13 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
     id_item = cJSON_GetObjectItem(tool_use, "id");
     if (id_item && cJSON_IsString(id_item))
         resp->tool_use_id = strdup(id_item->valuestring);
+
+    /* Extract reasoning_content if present (Kimi thinking mode) */
+    {
+        cJSON *reasoning_item = cJSON_GetObjectItem(tool_use, "reasoning_content");
+        if (reasoning_item && cJSON_IsString(reasoning_item) && reasoning_item->valuestring)
+            resp->reasoning_content = strdup(reasoning_item->valuestring);
+    }
 
     /* Extract input object */
     input = cJSON_GetObjectItem(tool_use, "input");
@@ -4358,7 +4881,7 @@ yo_report_parse_error(cJSON *tool_use)
 /* **************************************************************** */
 
 static void
-yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending)
+yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content)
 {
     /* Prune if necessary */
     yo_history_prune();
@@ -4381,6 +4904,7 @@ yo_history_add(const char *query, yo_response_type_t type, const char *response,
     yo_history[yo_history_count].tool_use_id = tool_use_id ? strdup(tool_use_id) : NULL;
     yo_history[yo_history_count].executed = executed;
     yo_history[yo_history_count].pending = pending;
+    yo_history[yo_history_count].reasoning_content = reasoning_content ? strdup(reasoning_content) : NULL;
     yo_history_count++;
 }
 
@@ -4397,6 +4921,8 @@ yo_history_prune(void)
             free(yo_history[0].response);
         if (yo_history[0].tool_use_id)
             free(yo_history[0].tool_use_id);
+        if (yo_history[0].reasoning_content)
+            free(yo_history[0].reasoning_content);
 
         memmove(&yo_history[0], &yo_history[1], (yo_history_count - 1) * sizeof(yo_exchange_t));
         yo_history_count--;
@@ -4412,6 +4938,8 @@ yo_history_prune(void)
             free(yo_history[0].response);
         if (yo_history[0].tool_use_id)
             free(yo_history[0].tool_use_id);
+        if (yo_history[0].reasoning_content)
+            free(yo_history[0].reasoning_content);
 
         memmove(&yo_history[0], &yo_history[1], (yo_history_count - 1) * sizeof(yo_exchange_t));
         yo_history_count--;
@@ -4438,15 +4966,17 @@ yo_estimate_tokens(void)
 
 /* Add an assistant message with a single tool use to the messages array.
    For Anthropic: content array with tool_use block.
-   For OpenAI: tool_calls array with function call.
-   The input object is NOT consumed (it is duplicated for Anthropic, serialized for OpenAI). */
+   For OpenAI Responses API: flat function_call item, no role wrapper.
+   For Kimi Chat Completions API: assistant message with tool_calls array.
+   The input object is NOT consumed (it is duplicated). */
 static void
 yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
-                    const char *tool_name, cJSON *input)
+                    const char *tool_name, cJSON *input,
+                    const char *reasoning_content)
 {
     if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        /* Responses API: flat function_call item, no role wrapper */
+        /* OpenAI Responses API: flat function_call item, no role wrapper */
         cJSON *msg = cJSON_CreateObject();
         char *args;
 
@@ -4458,8 +4988,39 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
         free(args);
         cJSON_AddItemToArray(messages, msg);
     }
+    else if (yo_provider == YO_PROVIDER_KIMI)
+    {
+        /* Kimi Chat Completions API: assistant message with tool_calls */
+        cJSON *msg = cJSON_CreateObject();
+        cJSON *tool_calls = cJSON_CreateArray();
+        cJSON *tool_call = cJSON_CreateObject();
+        cJSON *function = cJSON_CreateObject();
+        char *args;
+
+        cJSON_AddStringToObject(msg, "role", "assistant");
+        cJSON_AddStringToObject(msg, "content", "");
+
+        /* Add reasoning_content if present (required for thinking mode) */
+        if (reasoning_content && *reasoning_content)
+        {
+            cJSON_AddStringToObject(msg, "reasoning_content", reasoning_content);
+        }
+
+        cJSON_AddStringToObject(tool_call, "id", tool_use_id);
+        cJSON_AddStringToObject(tool_call, "type", "function");
+        cJSON_AddStringToObject(function, "name", tool_name);
+        args = cJSON_PrintUnformatted(input);
+        cJSON_AddStringToObject(function, "arguments", args);
+        free(args);
+
+        cJSON_AddItemToObject(tool_call, "function", function);
+        cJSON_AddItemToArray(tool_calls, tool_call);
+        cJSON_AddItemToObject(msg, "tool_calls", tool_calls);
+        cJSON_AddItemToArray(messages, msg);
+    }
     else
     {
+        /* Anthropic: content array with tool_use block */
         cJSON *msg = cJSON_CreateObject();
         cJSON *content_array = cJSON_CreateArray();
         cJSON *tool_use = cJSON_CreateObject();
@@ -4476,7 +5037,8 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
 
 /* Add a tool result message to the messages array.
    For Anthropic: user message with tool_result content block.
-   For OpenAI: tool message with tool_call_id. */
+   For OpenAI Responses API: function_call_output item.
+   For Kimi Chat Completions API: tool message with tool_call_id. */
 static void
 yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                        const char *result_content)
@@ -4485,13 +5047,21 @@ yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
 
     if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        /* Responses API: function_call_output item */
+        /* OpenAI Responses API: function_call_output item */
         cJSON_AddStringToObject(msg, "type", "function_call_output");
         cJSON_AddStringToObject(msg, "call_id", tool_use_id);
         cJSON_AddStringToObject(msg, "output", result_content);
     }
+    else if (yo_provider == YO_PROVIDER_KIMI)
+    {
+        /* Kimi Chat Completions API: tool message with tool_call_id */
+        cJSON_AddStringToObject(msg, "role", "tool");
+        cJSON_AddStringToObject(msg, "tool_call_id", tool_use_id);
+        cJSON_AddStringToObject(msg, "content", result_content);
+    }
     else
     {
+        /* Anthropic: user message with tool_result content block */
         cJSON *content_array = cJSON_CreateArray();
         cJSON *tool_result = cJSON_CreateObject();
         cJSON_AddStringToObject(msg, "role", "user");
@@ -4548,7 +5118,7 @@ yo_add_history_to_messages(cJSON *messages)
         input = yo_build_history_tool_input(i);
         yo_msg_add_tool_use(messages, yo_history[i].tool_use_id,
                             yo_response_type_to_string(yo_history[i].response_type),
-                            input);
+                            input, yo_history[i].reasoning_content);
         cJSON_Delete(input);
 
         /* Tool result (provider-native) */
@@ -4584,7 +5154,8 @@ yo_build_messages(const char *current_query)
 /* Build messages array for a follow-up call after a scrollback request. */
 static cJSON *
 yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
-                                  const char *scrollback_data, const char *scrollback_tool_id)
+                                  const char *scrollback_data, const char *scrollback_tool_id,
+                                  const char *reasoning_content)
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
@@ -4607,14 +5178,14 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     {
         cJSON *input = cJSON_CreateObject();
         cJSON_AddNumberToObject(input, "lines", lines_requested);
-        yo_msg_add_tool_use(messages, scrollback_tool_id, "scrollback", input);
+        yo_msg_add_tool_use(messages, scrollback_tool_id, "scrollback", input, reasoning_content);
         cJSON_Delete(input);
     }
 
     /* Add tool_result with scrollback data (provider-native) */
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider == YO_PROVIDER_OPENAI || yo_provider == YO_PROVIDER_KIMI)
     {
-        char *clean = yo_sanitize_scrollback_openai(scrollback_data);
+        char *clean = yo_sanitize_scrollback(scrollback_data);
         asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped):\n```\n%s\n```",
                  clean);
@@ -4634,7 +5205,8 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 /* Build messages array for a follow-up call after a docs request. */
 static cJSON *
 yo_build_messages_with_docs(const char *current_query, const char *docs_request,
-                            const char *docs_tool_id)
+                            const char *docs_tool_id,
+                            const char *reasoning_content)
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
@@ -4653,7 +5225,7 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     /* Add assistant's docs tool_use (provider-native) */
     {
         cJSON *input = cJSON_CreateObject();
-        yo_msg_add_tool_use(messages, docs_tool_id, "docs", input);
+        yo_msg_add_tool_use(messages, docs_tool_id, "docs", input, reasoning_content);
         cJSON_Delete(input);
     }
 
@@ -4670,8 +5242,10 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 /* API call with docs context - for follow-up after docs request */
 static cJSON *
 yo_call_api_with_docs(const char *query, const char *docs_request,
-                      const char *docs_tool_id)
+                      const char *docs_tool_id,
+                      const char *reasoning_content)
 {
-    cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id);
+    cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id,
+                                                  reasoning_content);
     return yo_call_api_with_messages(messages);
 }

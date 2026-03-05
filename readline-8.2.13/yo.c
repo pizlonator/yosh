@@ -168,6 +168,7 @@ static char *yo_code_delimiter = NULL;  /* from ~/.yoconf code_delimiter */
 static int yo_config_scrollback_enabled = -1; /* -1 = not set (use default: enabled) */
 static long yo_config_scrollback_bytes = -1;  /* -1 = not set (use default) */
 static int yo_config_scrollback_lines = -1;   /* -1 = not set (use default) */
+static char *yo_base_url = NULL;              /* from ~/.yoconf base_url, overrides default API URL */
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
@@ -2019,6 +2020,11 @@ yo_load_config(enum yo_load_config_mode mode)
         free(yo_code_delimiter);
         yo_code_delimiter = NULL;
     }
+    if (yo_base_url)
+    {
+        free(yo_base_url);
+        yo_base_url = NULL;
+    }
     yo_config_scrollback_enabled = -1;
     yo_config_scrollback_bytes = -1;
     yo_config_scrollback_lines = -1;
@@ -2307,6 +2313,17 @@ yo_load_config(enum yo_load_config_mode mode)
                 }
                 yo_server_web_enabled = (*value == '0') ? 0 : 1;
             }
+            else if (strcmp(directive, "base_url") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'base_url' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (yo_base_url) free(yo_base_url);
+                yo_base_url = strdup(value);
+            }
             else
             {
                 yo_print_error_no_newline(
@@ -2333,6 +2350,7 @@ yo_load_config(enum yo_load_config_mode mode)
             if (yo_enable_strikethrough) { free(yo_enable_strikethrough); yo_enable_strikethrough = NULL; }
             if (yo_disable_strikethrough) { free(yo_disable_strikethrough); yo_disable_strikethrough = NULL; }
             if (yo_code_delimiter) { free(yo_code_delimiter); yo_code_delimiter = NULL; }
+            if (yo_base_url) { free(yo_base_url); yo_base_url = NULL; }
             return false;
         }
 
@@ -3259,7 +3277,38 @@ yo_build_anthropic_request(cJSON *messages,
     if (web_enabled)
         headers = curl_slist_append(headers, "anthropic-beta: web-fetch-2025-09-10");
 
-    *url_out = "https://api.anthropic.com/v1/messages";
+    /* Build URL: use base_url if set, otherwise default */
+    if (yo_base_url)
+    {
+        /* Ensure base_url ends with / */
+        size_t base_len = strlen(yo_base_url);
+        if (base_len > 0 && yo_base_url[base_len - 1] == '/')
+        {
+            if (asprintf((char **)url_out, "%smessages", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+        else
+        {
+            if (asprintf((char **)url_out, "%s/messages", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+    }
+    else
+    {
+        *url_out = strdup("https://api.anthropic.com/v1/messages");
+    }
+
+    if (!*url_out)
+    {
+        cJSON_Delete(request_json);
+        curl_slist_free_all(headers);
+        return NULL;
+    }
+
     *headers_out = headers;
     *timeout_out = 0;
 
@@ -3523,7 +3572,38 @@ yo_build_openai_request(cJSON *messages,
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    *url_out = "https://api.openai.com/v1/responses";
+    /* Build URL: use base_url if set, otherwise default */
+    if (yo_base_url)
+    {
+        /* Ensure base_url ends with / */
+        size_t base_len = strlen(yo_base_url);
+        if (base_len > 0 && yo_base_url[base_len - 1] == '/')
+        {
+            if (asprintf((char **)url_out, "%sresponses", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+        else
+        {
+            if (asprintf((char **)url_out, "%s/responses", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+    }
+    else
+    {
+        *url_out = strdup("https://api.openai.com/v1/responses");
+    }
+
+    if (!*url_out)
+    {
+        cJSON_Delete(request_json);
+        curl_slist_free_all(headers);
+        return NULL;
+    }
+
     *headers_out = headers;
     *timeout_out = 0;
 
@@ -3711,7 +3791,38 @@ yo_build_kimi_request(cJSON *messages,
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    *url_out = "https://api.moonshot.ai/v1/chat/completions";
+    /* Build URL: use base_url if set, otherwise default */
+    if (yo_base_url)
+    {
+        /* Ensure base_url ends with / */
+        size_t base_len = strlen(yo_base_url);
+        if (base_len > 0 && yo_base_url[base_len - 1] == '/')
+        {
+            if (asprintf((char **)url_out, "%schat/completions", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+        else
+        {
+            if (asprintf((char **)url_out, "%s/chat/completions", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+    }
+    else
+    {
+        *url_out = strdup("https://api.moonshot.ai/v1/chat/completions");
+    }
+
+    if (!*url_out)
+    {
+        cJSON_Delete(request_json);
+        curl_slist_free_all(headers);
+        return NULL;
+    }
+
     *headers_out = headers;
     *timeout_out = 0;
 
@@ -4033,7 +4144,7 @@ yo_call_api_with_messages(cJSON *messages)
 static cJSON *
 yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
 {
-    const char *url;
+    char *url;
     struct curl_slist *headers = NULL;
     long timeout;
     char *request_body;
@@ -4043,15 +4154,15 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     /* Provider-specific request building */
     if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        request_body = yo_build_openai_request(messages, &url, &headers, &timeout);
+        request_body = yo_build_openai_request(messages, (const char **)&url, &headers, &timeout);
     }
     else if (yo_provider == YO_PROVIDER_KIMI)
     {
-        request_body = yo_build_kimi_request(messages, &url, &headers, &timeout);
+        request_body = yo_build_kimi_request(messages, (const char **)&url, &headers, &timeout);
     }
     else
     {
-        request_body = yo_build_anthropic_request(messages, &url, &headers, &timeout);
+        request_body = yo_build_anthropic_request(messages, (const char **)&url, &headers, &timeout);
     }
     /* Note: messages is now owned by the request JSON and freed with it */
 
@@ -4083,19 +4194,24 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     free(request_body);
 
     if (!response_data)
+    {
+        free(url);
         return NULL;  /* Error/cancellation already printed by yo_http_post */
+    }
 
     /* Provider-specific response parsing */
     if (yo_provider == YO_PROVIDER_KIMI)
     {
         result = yo_parse_kimi_response(response_data);
         free(response_data);
+        free(url);
         return result;
     }
     else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         result = yo_parse_openai_response(response_data);
         free(response_data);
+        free(url);
         return result;
     }
     else
@@ -4124,9 +4240,11 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
                 "the most appropriate one for the user's request.");
             cJSON_AddItemToArray(retry_messages, user_msg);
 
+            free(url);
             return yo_call_api_with_messages_internal(retry_messages, 1);
         }
 
+        free(url);
         return result;
     }
 }

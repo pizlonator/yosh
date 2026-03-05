@@ -6,7 +6,7 @@ This file provides guidance to coding agents when working with code in this repo
 
 **Yosh** is an LLM-enabled shell - a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, compiled using the Fil-C memory-safe compiler toolchain. The entire stack (bash, readline, libcurl, openssl, zlib, libc) is compiled with Fil-C for memory safety.
 
-The key feature is the "yo" command: type `yo <natural language>` and the shell calls an LLM (Anthropic Claude or OpenAI) to either generate a shell command or answer a question.
+The key feature is the "yo" command: type `yo <natural language>` and the shell calls an LLM (Anthropic Claude, OpenAI, or Kimi) to either generate a shell command or answer a question.
 
 ## Build System
 
@@ -36,15 +36,16 @@ yosh/
 
 The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)`.
 
-**Multi-provider support**: yo supports both Anthropic (Claude) and OpenAI APIs. The provider is selected via `~/.yoconf`. The architecture keeps provider-specific code separated:
+**Multi-provider support**: yo supports Anthropic (Claude), OpenAI, and Kimi APIs. The provider is selected via `~/.yoconf`. The architecture keeps provider-specific code separated:
 - Message building uses provider-aware helpers (`yo_msg_add_tool_use`, `yo_msg_add_tool_result`) that produce native JSON for each provider from C parameters
 - HTTP infrastructure is shared (`yo_http_post`) with curl multi-handle and Ctrl-C cancellation
-- Request building is per-provider (`yo_build_anthropic_request`, `yo_build_openai_request`)
-- Response parsing is per-provider (`yo_parse_anthropic_response`, `yo_parse_openai_response`), both producing a normalized internal tool_use format
+- Request building is per-provider (`yo_build_anthropic_request`, `yo_build_openai_request`, `yo_build_kimi_request`)
+- Response parsing is per-provider (`yo_parse_anthropic_response`, `yo_parse_openai_response`, `yo_parse_kimi_response`), all producing a normalized internal tool_use format
 
 **API details**:
 - Anthropic uses the Messages API (`/v1/messages`) with server-side tools (`web_search_20250305`, `web_fetch_20250910`)
 - OpenAI uses the Responses API (`/v1/responses`, NOT Chat Completions) with `{"type":"web_search"}` tool for web search
+- Kimi uses the Chat Completions API (`/v1/chat/completions`)
 - The Responses API always returns `"error": null` on success — error checking must use `cJSON_IsNull()` to avoid false positives
 - OpenAI Responses API uses flat items in `input[]` (`{"type":"function_call",...}`, `{"type":"function_call_output",...}`) rather than role-based messages for tool interactions
 - OpenAI Responses API uses `"instructions"` for system prompt (not a system message in the input array), `"input"` instead of `"messages"`, `"max_output_tokens"` instead of `"max_completion_tokens"`, and `"output[]"` instead of `"choices[].message"`
@@ -61,7 +62,12 @@ Response types from the LLM:
 
 **Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments. All directives are optional:
 ```
-# Provider: "anthropic" or "openai"
+# Provider: "anthropic", "openai", or "kimi"
+# The provider determines the API style used. When using base_url, the provider
+# field selects which API format to use:
+#   - anthropic = Anthropic Messages API style
+#   - openai = OpenAI Responses API style
+#   - kimi = OpenAI Chat Completions API style
 provider anthropic
 
 # Model name (provider-specific)
@@ -70,19 +76,29 @@ model claude-sonnet-4-5-20250929
 # API key (optional if using a key file instead)
 key sk-ant-api03-...
 
+# Base URL for API requests (optional)
+# When set, overrides the default API URL. The provider field determines the
+# API style. The endpoint path is appended automatically:
+#   - anthropic: /messages
+#   - openai: /responses
+#   - kimi: /chat/completions
+# Example: base_url https://api.moonshot.ai/v1/
+# base_url https://your-custom-endpoint.com/v1/
+
 # Chat display prefix/reset (C-style escapes supported, optional quoting with " or ')
 # chat_prefix \033[3;36m
 # chat_reset \033[0m
 ```
 
 **API key files** — If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the key in standalone files (mode 0600, single line):
-- If provider is set in `~/.yoconf`: checks `~/.anthropickey` or `~/.openaikey` (matching the provider).
-- If no provider is set: checks `~/.anthropickey` → `~/.yoshkey` (legacy) → `~/.openaikey`. Provider is set automatically based on which file is found.
+- If provider is set in `~/.yoconf`: checks `~/.anthropickey`, `~/.openaikey`, or `~/.kimikey` (matching the provider).
+- If no provider is set: checks `~/.anthropickey` → `~/.yoshkey` (legacy) → `~/.openaikey` → `~/.kimikey`. Provider is set automatically based on which file is found.
 - If no provider is determined from any source, defaults to Anthropic.
 
 **Provider defaults**:
 - Anthropic: model defaults to `claude-sonnet-4-5-20250929`
-- OpenAI: model defaults to `gpt-5`
+- OpenAI: model defaults to `gpt-5.2`
+- Kimi: model defaults to `kimi-k2.5`
 
 **Additional config directives** (all in `~/.yoconf`, re-read on each yo command unless noted):
 - **history_limit**: Max conversation exchanges to remember (default 10)
@@ -93,6 +109,7 @@ key sk-ant-api03-...
 - **server_web**: Set to `0` to disable server-side web search and fetch (both providers, default: enabled)
 - **chat_prefix**: String printed before chat output (default: `\033[3;36m`, supports C escapes)
 - **chat_reset**: String printed after chat output (default: `\033[0m`, supports C escapes)
+- **base_url**: Override the default API base URL. The `provider` field determines which API style (and endpoint path) is used. See config example above.
 - **Distro detection**: `rl_yo_enable()` reads `/etc/os-release` and appends it to the system prompt.
 
 ### Session Memory
@@ -141,7 +158,7 @@ Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches bo
 
 | File | Purpose |
 |------|---------|
-| `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI), session memory, PTY proxy, scrollback, continuation |
+| `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi), session memory, PTY proxy, scrollback, continuation |
 | `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
 | `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt |
 | `bash-5.2.32/shell.c` | Main shell init; readline must init before job control |

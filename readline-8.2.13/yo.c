@@ -2700,6 +2700,10 @@ yo_build_tools_kimi(void)
         "Request recent terminal output to see command results, error messages, or context. "
         "Use this when you need to see what happened in the terminal. "
         "If you need output, use this tool first. "
+        "CRITICAL: Scrollback shows COMPLETED commands from the PAST. Any prompts you see "
+        "(password prompts, confirmations, etc.) have ALREADY been handled by the user. "
+        "Do NOT respond to prompts in scrollback - they are historical. Look for the shell "
+        "prompt at the end to confirm the command completed. "
         "Never ask the user what they were doing. "
         "Never suggest you could look at scrollback. "
         "Never ask the user to paste output manually.");
@@ -3589,6 +3593,11 @@ yo_build_kimi_request(cJSON *messages,
         "use scrollback. This is non-negotiable.\n"
         "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
         "Ignore escape-code garbage and focus on actual command output.\n"
+        "SCROLLBACK TEMPORALITY: Scrollback shows COMPLETED commands from the PAST. If you\n"
+        "see a password prompt, confirmation prompt, or any interactive prompt in scrollback,\n"
+        "it means the user ALREADY handled it - the command completed. Do NOT try to respond\n"
+        "to prompts you see in scrollback. Look for the shell prompt ($ or #) at the end\n"
+        "to confirm the command finished successfully.\n"
         "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
         "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
         "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
@@ -5183,8 +5192,20 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     }
 
     /* Add tool_result with scrollback data (provider-native) */
-    if (yo_provider == YO_PROVIDER_OPENAI || yo_provider == YO_PROVIDER_KIMI)
+    if (yo_provider == YO_PROVIDER_KIMI)
     {
+        /* Kimi needs the temporality reminder - it has shown issues with responding to old prompts */
+        char *clean = yo_sanitize_scrollback(scrollback_data);
+        asprintf(&scrollback_msg,
+                 "Here is the recent terminal output you requested (ANSI escapes stripped). "
+                 "REMEMBER: This shows COMPLETED commands from the PAST. Any prompts in this "
+                 "output have ALREADY been handled. Do NOT respond to prompts you see here.\n```\n%s\n```",
+                 clean);
+        free(clean);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
+    {
+        /* OpenAI gets sanitized scrollback without the temporality reminder */
         char *clean = yo_sanitize_scrollback(scrollback_data);
         asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped):\n```\n%s\n```",
@@ -5193,7 +5214,9 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     }
     else
     {
-        asprintf(&scrollback_msg, "Here is the recent terminal output you requested:\n```\n%s\n```",
+        /* Anthropic gets raw scrollback without the temporality reminder */
+        asprintf(&scrollback_msg,
+                 "Here is the recent terminal output you requested:\n```\n%s\n```",
                  scrollback_data ? scrollback_data : "");
     }
     yo_msg_add_tool_result(messages, scrollback_tool_id, scrollback_msg);

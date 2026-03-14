@@ -150,7 +150,7 @@ static int yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
 static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
 static const char *yo_name = NULL;
-static const char *yo_documentation = NULL;
+static rl_yo_docs_callback_t yo_documentation_callback = NULL;
 static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
@@ -1045,7 +1045,7 @@ yo_detect_distro(void)
 }
 
 void
-rl_yo_enable(const char* name, const char *system_prompt, const char *documentation)
+rl_yo_enable(const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback)
 {
     if (yo_is_enabled)
         return;
@@ -1054,7 +1054,7 @@ rl_yo_enable(const char* name, const char *system_prompt, const char *documentat
     yo_pty_init();
 
     yo_name = name;
-    yo_documentation = documentation;
+    yo_documentation_callback = documentation_callback;
 
     /* Store system prompt from caller. Tool definitions handle the response format;
        the system prompt provides behavioral guidance. */
@@ -5355,8 +5355,23 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
     char *docs_msg;
+    char *documentation = NULL;
+    const char *provider_name = "anthropic";
 
     (void)docs_request;
+
+    /* Determine provider name for the callback */
+    if (yo_provider == YO_PROVIDER_OPENAI)
+        provider_name = "openai";
+    else if (yo_provider == YO_PROVIDER_KIMI)
+        provider_name = "kimi";
+
+    /* Get documentation via callback if available, otherwise use empty docs.
+       The callback returns newly allocated memory that we must free. */
+    if (yo_documentation_callback)
+        documentation = (char *)yo_documentation_callback(provider_name, yo_model ? yo_model : "");
+    if (!documentation)
+        documentation = strdup("No documentation available.");
 
     yo_add_history_to_messages(messages);
 
@@ -5376,9 +5391,10 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     /* Add tool_result with documentation (provider-native) */
     asprintf(&docs_msg, "Here is the documentation:\n\n%s\n\n"
              "Now please answer the user's original question based on this documentation.",
-             yo_documentation);
+             documentation);
     yo_msg_add_tool_result(messages, docs_tool_id, docs_msg);
     free(docs_msg);
+    free(documentation);  /* Free the documentation returned by callback */
 
     return messages;
 }

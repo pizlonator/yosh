@@ -34,13 +34,19 @@ extern "C" {
 #  include <readline/rltypedefs.h>
 #endif
 
+/* Callback type for retrieving documentation. Called with the current
+   provider and model, returns a newly allocated documentation string.
+   The caller is responsible for freeing the returned pointer. */
+typedef const char *(*rl_yo_docs_callback_t)(const char *provider, const char *model);
+
 /* Enable "yo" LLM features. Call this to opt-in (like using_history()).
    Binds Enter key to yo-aware accept-line and loads config from env vars.
    The system_prompt parameter is the prompt sent to the LLM - the shell
    should provide this to give context about the environment.
-   The documentation parameter is comprehensive docs about the shell that
-   the LLM can request when users ask about how to use the shell. */
-    extern void rl_yo_enable (const char* name, const char *system_prompt, const char *documentation);
+   The documentation_callback is a function that returns comprehensive docs
+   about the shell. It receives the current provider and model so the
+   documentation can be customized for different LLMs. */
+extern void rl_yo_enable (const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback);
 
 /* Check if yo is currently enabled. Returns non-zero if enabled. */
 extern int rl_yo_enabled (void);

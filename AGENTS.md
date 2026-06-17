@@ -36,7 +36,7 @@ yosh/
 
 The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)`.
 
-**Multi-provider support**: yo supports Anthropic (Claude), OpenAI, and Kimi APIs. The provider is selected via `~/.yoconf`. The architecture keeps provider-specific code separated:
+**Multi-provider support**: yo supports Anthropic (Claude), OpenAI, Kimi, DeepSeek, Qwen, and z.ai APIs. The provider is selected via `~/.yoconf`. Anthropic, OpenAI, and Kimi each have their own API style; DeepSeek, Qwen, and z.ai use the Chat Completions API style (defaulting to the Kimi-tuned prompt). The architecture keeps provider-specific code separated:
 - Message building uses provider-aware helpers (`yo_msg_add_tool_use`, `yo_msg_add_tool_result`) that produce native JSON for each provider from C parameters
 - HTTP infrastructure is shared (`yo_http_post`) with curl multi-handle and Ctrl-C cancellation
 - Request building is per-API-style (`yo_build_anthropic_request`, `yo_build_responses_api_request`, `yo_build_chat_completions_api_request`)
@@ -46,6 +46,9 @@ The yo feature is an **opt-in readline extension** (like history). Readline prov
 - Anthropic uses the Messages API (`/v1/messages`) with server-side tools (`web_search_20250305`, `web_fetch_20250910`)
 - OpenAI uses the Responses API (`/v1/responses`, NOT Chat Completions) with `{"type":"web_search"}` tool for web search
 - Kimi uses the Chat Completions API (`/v1/chat/completions`)
+- DeepSeek uses the Chat Completions API (`/chat/completions`) and the Kimi-tuned prompt
+- Qwen uses the Chat Completions API (`/v1/chat/completions`) and the Kimi-tuned prompt
+- z.ai uses the Chat Completions API (`/api/paas/v4/chat/completions`) and the Kimi-tuned prompt
 - The Responses API always returns `"error": null` on success — error checking must use `cJSON_IsNull()` to avoid false positives
 - OpenAI Responses API uses flat items in `input[]` (`{"type":"function_call",...}`, `{"type":"function_call_output",...}`) rather than role-based messages for tool interactions
 - OpenAI Responses API uses `"instructions"` for system prompt (not a system message in the input array), `"input"` instead of `"messages"`, `"max_output_tokens"` instead of `"max_completion_tokens"`, and `"output[]"` instead of `"choices[].message"`
@@ -62,12 +65,15 @@ Response types from the LLM:
 
 **Config file (`~/.yoconf`)** — Read fresh on each yo request. Supports `#` comments. All directives are optional:
 ```
-# Provider: "anthropic", "openai", or "kimi"
+# Provider: "anthropic", "openai", "kimi", "deepseek", "qwen", or "zai"
 # The provider determines the API style used. When using base_url, the provider
 # field selects which API format to use:
 #   - anthropic = Anthropic Messages API style
 #   - openai = OpenAI Responses API style
 #   - kimi = OpenAI Chat Completions API style
+#   - deepseek = Chat Completions API style
+#   - qwen = Chat Completions API style
+#   - zai = Chat Completions API style
 provider anthropic
 
 # Model name (provider-specific)
@@ -91,14 +97,17 @@ key sk-ant-api03-...
 ```
 
 **API key files** — If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the key in standalone files (mode 0600, single line):
-- If provider is set in `~/.yoconf`: checks `~/.anthropickey`, `~/.openaikey`, or `~/.kimikey` (matching the provider).
-- If no provider is set: checks `~/.anthropickey` → `~/.yoshkey` (legacy) → `~/.openaikey` → `~/.kimikey`. Provider is set automatically based on which file is found.
+- If provider is set in `~/.yoconf`: checks `~/.anthropickey`, `~/.openaikey`, `~/.kimikey`, `~/.deepseekkey`, `~/.qwenkey`, or `~/.zaikey` (matching the provider).
+- If no provider is set: checks `~/.anthropickey` → `~/.yoshkey` (legacy) → `~/.openaikey` → `~/.kimikey` → `~/.deepseekkey` → `~/.qwenkey` → `~/.zaikey`. Provider is set automatically based on which file is found.
 - If no provider is determined from any source, defaults to Anthropic.
 
 **Provider defaults**:
 - Anthropic: model defaults to `claude-sonnet-4-5-20250929`
 - OpenAI: model defaults to `gpt-5.2`
 - Kimi: model defaults to `kimi-k2.5`
+- DeepSeek: model defaults to `deepseek-v4-flash`
+- Qwen: model defaults to `qwen-plus`
+- z.ai: model defaults to `glm-5.2`
 
 **Additional config directives** (all in `~/.yoconf`, re-read on each yo command unless noted):
 - **history_limit**: Max conversation exchanges to remember (default 10)
@@ -158,7 +167,7 @@ Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches bo
 
 | File | Purpose |
 |------|---------|
-| `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi), session memory, PTY proxy, scrollback, continuation |
+| `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi + DeepSeek + Qwen + z.ai), session memory, PTY proxy, scrollback, continuation |
 | `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
 | `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt |
 | `bash-5.2.32/shell.c` | Main shell init; readline must init before job control |

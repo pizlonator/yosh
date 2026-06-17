@@ -67,6 +67,9 @@
 #define YO_MAX_TOKENS 1024
 #define YO_DEFAULT_OPENAI_MODEL "gpt-5.2"
 #define YO_DEFAULT_KIMI_MODEL "kimi-k2.5"
+#define YO_DEFAULT_DEEPSEEK_MODEL "deepseek-v4-flash"
+#define YO_DEFAULT_QWEN_MODEL "qwen-plus"
+#define YO_DEFAULT_ZAI_MODEL "glm-5.2"
 
 /* Default styling.  Base text is italic cyan (color_prefix).
    Since base is already italic, markdown *italic* toggles italic OFF;
@@ -103,8 +106,13 @@ typedef enum {
 typedef enum {
     YO_PROVIDER_ANTHROPIC,
     YO_PROVIDER_OPENAI,
-    YO_PROVIDER_KIMI
+    YO_PROVIDER_KIMI,
+    YO_PROVIDER_DEEPSEEK,
+    YO_PROVIDER_QWEN,
+    YO_PROVIDER_ZAI
 } yo_provider_t;
+
+static const char *yo_provider_to_string(yo_provider_t provider);
 
 typedef struct {
     yo_response_type_t type;
@@ -1924,6 +1932,18 @@ yo_finish_config(char *parsed_key)
     {
         yo_model = strdup(YO_DEFAULT_KIMI_MODEL);
     }
+    else if (yo_provider == YO_PROVIDER_DEEPSEEK)
+    {
+        yo_model = strdup(YO_DEFAULT_DEEPSEEK_MODEL);
+    }
+    else if (yo_provider == YO_PROVIDER_QWEN)
+    {
+        yo_model = strdup(YO_DEFAULT_QWEN_MODEL);
+    }
+    else if (yo_provider == YO_PROVIDER_ZAI)
+    {
+        yo_model = strdup(YO_DEFAULT_ZAI_MODEL);
+    }
     else
     {
         yo_model = strdup(YO_DEFAULT_MODEL);
@@ -1936,8 +1956,10 @@ yo_finish_config(char *parsed_key)
 
    Key resolution order:
    1. ~/.yoconf (all fields optional: provider, model, key)
-   2. If key missing and provider known: ~/.anthropickey or ~/.openaikey
-   3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey
+   2. If key missing and provider known: ~/.anthropickey, ~/.openaikey, ~/.kimikey,
+      ~/.deepseekkey, ~/.qwenkey, or ~/.zaikey (matching the provider)
+   3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey,
+      ~/.kimikey, ~/.deepseekkey, ~/.qwenkey, ~/.zaikey
    4. Model defaults applied by yo_finish_config. */
 static bool
 yo_load_config(enum yo_load_config_mode mode)
@@ -2086,7 +2108,7 @@ yo_load_config(enum yo_load_config_mode mode)
                 if (!*value)
                 {
                     yo_print_error_no_newline(
-                        "~/.yoconf:%d: 'provider' requires a value (anthropic or openai)", line_num);
+                        "~/.yoconf:%d: 'provider' requires a value", line_num);
                     had_error = 1;
                     break;
                 }
@@ -2372,10 +2394,30 @@ yo_load_config(enum yo_load_config_mode mode)
                 yo_provider = YO_PROVIDER_KIMI;
                 have_provider = 1;
             }
+            else if (strcmp(parsed_provider, "deepseek") == 0)
+            {
+                yo_provider = YO_PROVIDER_DEEPSEEK;
+                have_provider = 1;
+            }
+            else if (strcmp(parsed_provider, "qwen") == 0)
+            {
+                yo_provider = YO_PROVIDER_QWEN;
+                have_provider = 1;
+            }
+            else if (strcmp(parsed_provider, "z.ai") == 0)
+            {
+                yo_provider = YO_PROVIDER_ZAI;
+                have_provider = 1;
+            }
+            else if (strcmp(parsed_provider, "zai") == 0)
+            {
+                yo_provider = YO_PROVIDER_ZAI;
+                have_provider = 1;
+            }
             else
             {
                 yo_print_error_no_newline(
-                    "~/.yoconf: unknown provider '%s' (expected 'anthropic', 'openai', or 'kimi')",
+                    "~/.yoconf: unknown provider '%s' (expected 'anthropic', 'openai', 'kimi', 'deepseek', 'qwen', 'zai', or 'z.ai')",
                     parsed_provider);
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
@@ -2411,22 +2453,25 @@ yo_load_config(enum yo_load_config_mode mode)
     if (have_provider)
     {
         int found = 0;
+        const char *key_filename;
 
         /* Provider was set by yoconf — check the matching key file */
-        if (yo_provider == YO_PROVIDER_ANTHROPIC)
+        switch (yo_provider)
         {
-            snprintf(path, sizeof(path), "%s/.anthropickey", home);
-            parsed_key = yo_read_keyfile(path, "~/.anthropickey", &found);
+            case YO_PROVIDER_ANTHROPIC: key_filename = ".anthropickey"; break;
+            case YO_PROVIDER_KIMI:      key_filename = ".kimikey"; break;
+            case YO_PROVIDER_OPENAI:    key_filename = ".openaikey"; break;
+            case YO_PROVIDER_DEEPSEEK:  key_filename = ".deepseekkey"; break;
+            case YO_PROVIDER_QWEN:      key_filename = ".qwenkey"; break;
+            case YO_PROVIDER_ZAI:       key_filename = ".zaikey"; break;
+            default:                    key_filename = ".openaikey"; break;
         }
-        else if (yo_provider == YO_PROVIDER_KIMI)
+
+        snprintf(path, sizeof(path), "%s/%s", home, key_filename);
         {
-            snprintf(path, sizeof(path), "%s/.kimikey", home);
-            parsed_key = yo_read_keyfile(path, "~/.kimikey", &found);
-        }
-        else
-        {
-            snprintf(path, sizeof(path), "%s/.openaikey", home);
-            parsed_key = yo_read_keyfile(path, "~/.openaikey", &found);
+            char display_path[128];
+            snprintf(display_path, sizeof(display_path), "~/%s", key_filename);
+            parsed_key = yo_read_keyfile(path, display_path, &found);
         }
 
         if (parsed_key)
@@ -2443,15 +2488,13 @@ yo_load_config(enum yo_load_config_mode mode)
         yo_print_error_no_newline(
             "~/.yoconf specifies provider '%s' but no key. "
             "Add 'key' to ~/.yoconf or create ~/%s (mode 0600).",
-            yo_provider == YO_PROVIDER_ANTHROPIC ? "anthropic" :
-            yo_provider == YO_PROVIDER_KIMI ? "kimi" : "openai",
-            yo_provider == YO_PROVIDER_ANTHROPIC ? ".anthropickey" :
-            yo_provider == YO_PROVIDER_KIMI ? ".kimikey" : ".openaikey");
+            yo_provider_to_string(yo_provider),
+            key_filename);
         return false;
     }
 
     /* Step 3: Neither key nor provider known — try the fallback chain.
-       ~/.anthropickey -> ~/.yoshkey -> ~/.openaikey -> ~/.kimikey
+       ~/.anthropickey -> ~/.yoshkey -> ~/.openaikey -> ~/.kimikey -> ~/.deepseekkey -> ~/.qwenkey -> ~/.zaikey
        If a file exists but has an error, stop immediately. */
 
     {
@@ -2500,10 +2543,43 @@ yo_load_config(enum yo_load_config_mode mode)
         }
         if (found)
             return false;
+
+        snprintf(path, sizeof(path), "%s/.deepseekkey", home);
+        parsed_key = yo_read_keyfile(path, "~/.deepseekkey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_DEEPSEEK;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
+
+        snprintf(path, sizeof(path), "%s/.qwenkey", home);
+        parsed_key = yo_read_keyfile(path, "~/.qwenkey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_QWEN;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
+
+        snprintf(path, sizeof(path), "%s/.zaikey", home);
+        parsed_key = yo_read_keyfile(path, "~/.zaikey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_ZAI;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
     }
 
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
-                              "or create ~/.anthropickey, ~/.openaikey, or ~/.kimikey (mode 0600). "
+                              "or create ~/.anthropickey, ~/.yoshkey, ~/.openaikey, ~/.kimikey, ~/.deepseekkey, ~/.qwenkey, or ~/.zaikey (mode 0600). "
                               "See 'yo how do I configure the LLM' for details.");
     return false;
 }
@@ -2894,7 +2970,7 @@ yo_build_tools_responses_api(void)
 }
 
 /* Remove ANSI escape sequences and other control characters from scrollback
-   before sending it to OpenAI (Anthropic already handles raw scrollback well). */
+   before sending it to providers that need sanitized scrollback (Anthropic already handles raw scrollback well). */
 static char *
 yo_sanitize_scrollback(const char *input)
 {
@@ -3220,18 +3296,20 @@ yo_build_anthropic_request(cJSON *messages,
     struct curl_slist *headers = NULL;
     int web_enabled = yo_server_web_enabled;
 
+    ZASSERT(yo_model);
+
     /* Build tools array */
     tools = yo_build_tools_anthropic();
 
     /* Build request JSON */
     request_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_MODEL);
+    cJSON_AddStringToObject(request_json, "model", yo_model);
     cJSON_AddNumberToObject(request_json, "max_tokens", web_enabled ? 4096 : YO_MAX_TOKENS);
 
     {
         char *base_prompt;
         asprintf(&base_prompt, "You are powered by %s (provider: anthropic).\n\n%s",
-                 yo_model ? yo_model : YO_DEFAULT_MODEL, yo_system_prompt);
+                 yo_model, yo_system_prompt);
 
         if (web_enabled)
         {
@@ -3450,9 +3528,34 @@ yo_provider_to_string(yo_provider_t provider)
         case YO_PROVIDER_ANTHROPIC: return "anthropic";
         case YO_PROVIDER_OPENAI:    return "openai";
         case YO_PROVIDER_KIMI:      return "kimi";
+        case YO_PROVIDER_DEEPSEEK:  return "deepseek";
+        case YO_PROVIDER_QWEN:      return "qwen";
+        case YO_PROVIDER_ZAI:       return "zai";
     }
     ZASSERT(!"unknown provider");
     return "unknown";
+}
+
+static int
+yo_provider_uses_chat_completions_api(yo_provider_t provider)
+{
+    return provider == YO_PROVIDER_KIMI
+        || provider == YO_PROVIDER_DEEPSEEK
+        || provider == YO_PROVIDER_QWEN
+        || provider == YO_PROVIDER_ZAI;
+}
+
+static const char *
+yo_default_chat_completions_url(yo_provider_t provider)
+{
+    switch (provider)
+    {
+        case YO_PROVIDER_KIMI:     return "https://api.moonshot.ai/v1/chat/completions";
+        case YO_PROVIDER_DEEPSEEK: return "https://api.deepseek.com/chat/completions";
+        case YO_PROVIDER_QWEN:     return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+        case YO_PROVIDER_ZAI:      return "https://api.z.ai/api/paas/v4/chat/completions";
+        default:                   ZASSERT(!"not a chat completions provider"); return NULL;
+    }
 }
 
 static char *
@@ -3856,7 +3959,7 @@ yo_build_chat_completions_api_request(cJSON *messages,
     }
     else
     {
-        *url_out = strdup("https://api.moonshot.ai/v1/chat/completions");
+        *url_out = strdup(yo_default_chat_completions_url(yo_provider));
     }
 
     if (!*url_out)
@@ -4199,7 +4302,7 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     {
         request_body = yo_build_responses_api_request(messages, (const char **)&url, &headers, &timeout);
     }
-    else if (yo_provider == YO_PROVIDER_KIMI)
+    else if (yo_provider_uses_chat_completions_api(yo_provider))
     {
         request_body = yo_build_chat_completions_api_request(messages, (const char **)&url, &headers, &timeout);
     }
@@ -4243,7 +4346,7 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     }
 
     /* Provider-specific response parsing */
-    if (yo_provider == YO_PROVIDER_KIMI)
+    if (yo_provider_uses_chat_completions_api(yo_provider))
     {
         result = yo_parse_chat_completions_api_response(response_data);
         free(response_data);
@@ -5140,7 +5243,7 @@ yo_estimate_tokens(void)
 /* Add an assistant message with a single tool use to the messages array.
    For Anthropic: content array with tool_use block.
    For OpenAI Responses API: flat function_call item, no role wrapper.
-   For Kimi Chat Completions API: assistant message with tool_calls array.
+   For Chat Completions API: assistant message with tool_calls array.
    The input object is NOT consumed (it is duplicated). */
 static void
 yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
@@ -5161,9 +5264,9 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
         free(args);
         cJSON_AddItemToArray(messages, msg);
     }
-    else if (yo_provider == YO_PROVIDER_KIMI)
+    else if (yo_provider_uses_chat_completions_api(yo_provider))
     {
-        /* Kimi Chat Completions API: assistant message with tool_calls */
+        /* Chat Completions API: assistant message with tool_calls */
         cJSON *msg = cJSON_CreateObject();
         cJSON *tool_calls = cJSON_CreateArray();
         cJSON *tool_call = cJSON_CreateObject();
@@ -5211,7 +5314,7 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
 /* Add a tool result message to the messages array.
    For Anthropic: user message with tool_result content block.
    For OpenAI Responses API: function_call_output item.
-   For Kimi Chat Completions API: tool message with tool_call_id. */
+   For Chat Completions API: tool message with tool_call_id. */
 static void
 yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                        const char *result_content)
@@ -5225,9 +5328,9 @@ yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
         cJSON_AddStringToObject(msg, "call_id", tool_use_id);
         cJSON_AddStringToObject(msg, "output", result_content);
     }
-    else if (yo_provider == YO_PROVIDER_KIMI)
+    else if (yo_provider_uses_chat_completions_api(yo_provider))
     {
-        /* Kimi Chat Completions API: tool message with tool_call_id */
+        /* Chat Completions API: tool message with tool_call_id */
         cJSON_AddStringToObject(msg, "role", "tool");
         cJSON_AddStringToObject(msg, "tool_call_id", tool_use_id);
         cJSON_AddStringToObject(msg, "content", result_content);
@@ -5356,9 +5459,9 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     }
 
     /* Add tool_result with scrollback data (provider-native) */
-    if (yo_provider == YO_PROVIDER_KIMI)
+    if (yo_provider_uses_chat_completions_api(yo_provider))
     {
-        /* Kimi needs the temporality reminder - it has shown issues with responding to old prompts */
+        /* Chat Completions API providers need the temporality reminder - they have shown issues with responding to old prompts */
         char *clean = yo_sanitize_scrollback(scrollback_data);
         asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped). "
@@ -5399,20 +5502,16 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     cJSON *msg;
     char *docs_msg;
     char *documentation = NULL;
-    const char *provider_name = "anthropic";
+    const char *provider_name = yo_provider_to_string(yo_provider);
 
     (void)docs_request;
 
-    /* Determine provider name for the callback */
-    if (yo_provider == YO_PROVIDER_OPENAI)
-        provider_name = "openai";
-    else if (yo_provider == YO_PROVIDER_KIMI)
-        provider_name = "kimi";
+    ZASSERT(yo_model);
 
     /* Get documentation via callback if available, otherwise use empty docs.
        The callback returns newly allocated memory that we must free. */
     if (yo_documentation_callback)
-        documentation = (char *)yo_documentation_callback(provider_name, yo_model ? yo_model : "");
+        documentation = (char *)yo_documentation_callback(provider_name, yo_model);
     if (!documentation)
         documentation = strdup("No documentation available.");
 

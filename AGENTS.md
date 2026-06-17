@@ -39,8 +39,8 @@ The yo feature is an **opt-in readline extension** (like history). Readline prov
 **Multi-provider support**: yo supports Anthropic (Claude), OpenAI, and Kimi APIs. The provider is selected via `~/.yoconf`. The architecture keeps provider-specific code separated:
 - Message building uses provider-aware helpers (`yo_msg_add_tool_use`, `yo_msg_add_tool_result`) that produce native JSON for each provider from C parameters
 - HTTP infrastructure is shared (`yo_http_post`) with curl multi-handle and Ctrl-C cancellation
-- Request building is per-provider (`yo_build_anthropic_request`, `yo_build_openai_request`, `yo_build_kimi_request`)
-- Response parsing is per-provider (`yo_parse_anthropic_response`, `yo_parse_openai_response`, `yo_parse_kimi_response`), all producing a normalized internal tool_use format
+- Request building is per-API-style (`yo_build_anthropic_request`, `yo_build_responses_api_request`, `yo_build_chat_completions_api_request`)
+- Response parsing is per-API-style (`yo_parse_anthropic_response`, `yo_parse_responses_api_response`, `yo_parse_chat_completions_api_response`), all producing a normalized internal tool_use format
 
 **API details**:
 - Anthropic uses the Messages API (`/v1/messages`) with server-side tools (`web_search_20250305`, `web_fetch_20250910`)

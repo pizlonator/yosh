@@ -230,7 +230,7 @@ enum yo_load_config_mode {
 };
 static bool yo_load_config(enum yo_load_config_mode mode);
 static cJSON *yo_build_tools_anthropic(void);
-static cJSON *yo_build_tools_openai();
+static cJSON *yo_build_tools_responses_api();
 static char *yo_sanitize_scrollback(const char *input);
 static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                                 const char *tool_name, cJSON *input,
@@ -2633,12 +2633,12 @@ yo_build_tools_anthropic(void)
     return tools;
 }
 
-/* Build tools array in Kimi Chat Completions API format.
-   Similar to OpenAI format but without strict mode and additionalProperties
-   which Kimi doesn't support.
-   web_search_enabled is ignored for Kimi (always 0). */
+/* Build tools array in Chat Completions API format.
+   Similar to Responses API format but without strict mode and additionalProperties
+   which Chat Completions API providers don't support.
+   web_search_enabled is ignored for Chat Completions API providers (always 0). */
 static cJSON *
-yo_build_tools_kimi(void)
+yo_build_tools_chat_completions_api(void)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *func, *params, *json_props, *prop, *required;
@@ -2751,19 +2751,19 @@ yo_build_tools_kimi(void)
              yo_name, yo_name);
     cJSON_AddStringToObject(func, "description", docs_desc);
     free(docs_desc);
-    /* For parameter-less functions, omit the parameters field entirely for Kimi */
+    /* For parameter-less functions, omit the parameters field entirely for Chat Completions API providers */
     cJSON_AddItemToObject(tool, "function", func);
     cJSON_AddItemToArray(tools, tool);
 
     return tools;
 }
 
-/* Build tools array in OpenAI Responses API format.
-   Converts common tool definitions to OpenAI function format and appends
-   OpenAI-specific tools (web_search) if enabled.
-   web_search_enabled: whether to add the web_search tool (OpenAI only, not Kimi). */
+/* Build tools array in Responses API format.
+   Converts common tool definitions to Responses API function format and appends
+   Responses API-specific tools (web_search) if enabled.
+   web_search_enabled: whether to add the web_search tool (Responses API only, not Chat Completions API). */
 static cJSON *
-yo_build_tools_openai(void)
+yo_build_tools_responses_api(void)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *params, *json_props, *prop, *required;
@@ -2882,7 +2882,7 @@ yo_build_tools_openai(void)
     cJSON_AddTrueToObject(tool, "strict");
     cJSON_AddItemToArray(tools, tool);
 
-    /* OpenAI-specific: web_search tool */
+    /* Responses API-specific: web_search tool */
     if (yo_server_web_enabled)
     {
         cJSON *ws = cJSON_CreateObject();
@@ -3442,38 +3442,28 @@ yo_parse_anthropic_response(const char *response_data, int is_retry,
     }
 }
 
-/* **************************************************************** */
-/*                                                                  */
-/*               OpenAI: Request Building & Response Parsing        */
-/*                                                                  */
-/* **************************************************************** */
-
-/* Build OpenAI request body, URL, and headers from provider-native messages.
-   The system prompt is prepended as a system message.
-   Returns malloc'd request body string.  Sets *url_out and *headers_out.
-   Caller must free the request body and the headers. */
-static char *
-yo_build_openai_request(cJSON *messages,
-                        const char **url_out, struct curl_slist **headers_out,
-                        long *timeout_out)
+static const char *
+yo_provider_to_string(yo_provider_t provider)
 {
-    cJSON *request_json;
-    cJSON *tools;
-    char *request_body;
-    char auth_header[300];
-    struct curl_slist *headers = NULL;
-    char *openai_prompt;
-    int max_tokens = YO_MAX_TOKENS;
+    switch (provider)
+    {
+        case YO_PROVIDER_ANTHROPIC: return "anthropic";
+        case YO_PROVIDER_OPENAI:    return "openai";
+        case YO_PROVIDER_KIMI:      return "kimi";
+    }
+    ZASSERT(!"unknown provider");
+    return "unknown";
+}
 
-    /* Build tools array in OpenAI Responses API format */
-    tools = yo_build_tools_openai();
+static char *
+yo_build_openai_tuned_prompt(const char *provider_name)
+{
+    char *prompt;
 
-    /* Build system instructions.
-       Append additional guidance to strongly bias toward command responses,
-       since OpenAI models tend to over-use chat for things a shell assistant
-       should answer with commands. */
-    asprintf(&openai_prompt,
-        "You are powered by %s (provider: openai).\n\n"
+    ZASSERT(yo_model);
+
+    asprintf(&prompt,
+        "You are powered by %s (provider: %s).\n\n"
         "%s\n\n"
         "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
         "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
@@ -3529,7 +3519,7 @@ yo_build_openai_request(cJSON *messages,
         "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
         "  (pending=true), then decide based on output"
         "%s",
-        yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL, yo_system_prompt, yo_name, yo_name, yo_name,
+        yo_model, provider_name, yo_system_prompt, yo_name, yo_name, yo_name,
         yo_server_web_enabled
             ? "\n\nYou have web search available. When you find the answer to the user's question "
               "via web search (weather, news, sports scores, prices, current events, etc.), "
@@ -3539,100 +3529,18 @@ yo_build_openai_request(cJSON *messages,
               "or markdown link syntax in citations."
             : "");
 
-    /* When web search is enabled, bump max tokens */
-    if (yo_server_web_enabled)
-        max_tokens = 4096;
-
-    /* Build Responses API request JSON */
-    request_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_OPENAI_MODEL);
-    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
-
-    /* System prompt goes in top-level "instructions" field */
-    cJSON_AddStringToObject(request_json, "instructions", openai_prompt);
-    free(openai_prompt);
-
-    /* Add input array (conversation messages — takes ownership) */
-    cJSON_AddItemToObject(request_json, "input", messages);
-
-    /* Add tools array (takes ownership) */
-    cJSON_AddItemToObject(request_json, "tools", tools);
-
-    /* Force tool use */
-    cJSON_AddStringToObject(request_json, "tool_choice", "required");
-
-    /* Privacy: don't store responses */
-    cJSON_AddFalseToObject(request_json, "store");
-
-    request_body = cJSON_PrintUnformatted(request_json);
-    cJSON_Delete(request_json);
-
-    /* Set up headers */
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
-    headers = curl_slist_append(headers, auth_header);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    /* Build URL: use base_url if set, otherwise default */
-    if (yo_base_url)
-    {
-        /* Ensure base_url ends with / */
-        size_t base_len = strlen(yo_base_url);
-        if (base_len > 0 && yo_base_url[base_len - 1] == '/')
-        {
-            if (asprintf((char **)url_out, "%sresponses", yo_base_url) < 0)
-            {
-                *url_out = NULL;
-            }
-        }
-        else
-        {
-            if (asprintf((char **)url_out, "%s/responses", yo_base_url) < 0)
-            {
-                *url_out = NULL;
-            }
-        }
-    }
-    else
-    {
-        *url_out = strdup("https://api.openai.com/v1/responses");
-    }
-
-    if (!*url_out)
-    {
-        cJSON_Delete(request_json);
-        curl_slist_free_all(headers);
-        return NULL;
-    }
-
-    *headers_out = headers;
-    *timeout_out = 0;
-
-    return request_body;
+    return prompt;
 }
 
-/* Build Kimi Chat Completions API request body, URL, and headers.
-   Uses the Chat Completions API format with `messages` array.
-   Unlike OpenAI Responses API, this uses role-based messages.
-   Returns malloc'd request body string.  Sets *url_out and *headers_out.
-   Caller must free the request body and the headers. */
 static char *
-yo_build_kimi_request(cJSON *messages,
-                      const char **url_out, struct curl_slist **headers_out,
-                      long *timeout_out)
+yo_build_kimi_tuned_prompt(const char *provider_name)
 {
-    cJSON *request_json;
-    cJSON *tools;
-    char *request_body;
-    char auth_header[300];
-    struct curl_slist *headers = NULL;
-    char *system_prompt;
+    char *prompt;
 
-    /* Build tools array for Kimi (no strict mode, no additionalProperties) */
-    tools = yo_build_tools_kimi();
+    ZASSERT(yo_model);
 
-    /* Build system instructions */
-    asprintf(&system_prompt,
-        "You are powered by %s (provider: kimi).\n\n"
+    asprintf(&prompt,
+        "You are powered by %s (provider: %s).\n\n"
         "%s\n\n"
         "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
         "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
@@ -3695,12 +3603,145 @@ yo_build_kimi_request(cJSON *messages,
         "  then after seeing it succeed: configure command (pending=false)\n"
         "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
         "  (pending=true), then decide based on output",
-        yo_model ? yo_model : YO_DEFAULT_KIMI_MODEL, yo_system_prompt,
+        yo_model, provider_name, yo_system_prompt,
         yo_name, yo_name, yo_name);
+
+    return prompt;
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*               Responses API: Request Building & Response Parsing        */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Build Responses API request body, URL, and headers from provider-native messages.
+   The system prompt is prepended as top-level instructions.
+   Returns malloc'd request body string.  Sets *url_out and *headers_out.
+   Caller must free the request body and the headers. */
+static char *
+yo_build_responses_api_request(cJSON *messages,
+                        const char **url_out, struct curl_slist **headers_out,
+                        long *timeout_out)
+{
+    cJSON *request_json;
+    cJSON *tools;
+    char *request_body;
+    char auth_header[300];
+    struct curl_slist *headers = NULL;
+    char *tuned_prompt;
+    int max_tokens = YO_MAX_TOKENS;
+
+    ZASSERT(yo_model);
+
+    /* Build tools array in Responses API format */
+    tools = yo_build_tools_responses_api();
+
+    /* Build tuned system instructions.
+       Append additional guidance to strongly bias toward command responses,
+       since Responses API models tend to over-use chat for things a shell assistant
+       should answer with commands. */
+    tuned_prompt = yo_build_openai_tuned_prompt(yo_provider_to_string(yo_provider));
+
+    /* When web search is enabled, bump max tokens */
+    if (yo_server_web_enabled)
+        max_tokens = 4096;
+
+    /* Build Responses API request JSON */
+    request_json = cJSON_CreateObject();
+    cJSON_AddStringToObject(request_json, "model", yo_model);
+    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
+
+    /* System prompt goes in top-level "instructions" field */
+    cJSON_AddStringToObject(request_json, "instructions", tuned_prompt);
+    free(tuned_prompt);
+
+    /* Add input array (conversation messages — takes ownership) */
+    cJSON_AddItemToObject(request_json, "input", messages);
+
+    /* Add tools array (takes ownership) */
+    cJSON_AddItemToObject(request_json, "tools", tools);
+
+    /* Force tool use */
+    cJSON_AddStringToObject(request_json, "tool_choice", "required");
+
+    /* Privacy: don't store responses */
+    cJSON_AddFalseToObject(request_json, "store");
+
+    request_body = cJSON_PrintUnformatted(request_json);
+    cJSON_Delete(request_json);
+
+    /* Set up headers */
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+    headers = curl_slist_append(headers, auth_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    /* Build URL: use base_url if set, otherwise default */
+    if (yo_base_url)
+    {
+        /* Ensure base_url ends with / */
+        size_t base_len = strlen(yo_base_url);
+        if (base_len > 0 && yo_base_url[base_len - 1] == '/')
+        {
+            if (asprintf((char **)url_out, "%sresponses", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+        else
+        {
+            if (asprintf((char **)url_out, "%s/responses", yo_base_url) < 0)
+            {
+                *url_out = NULL;
+            }
+        }
+    }
+    else
+    {
+        *url_out = strdup("https://api.openai.com/v1/responses");
+    }
+
+    if (!*url_out)
+    {
+        free(request_body);
+        curl_slist_free_all(headers);
+        return NULL;
+    }
+
+    *headers_out = headers;
+    *timeout_out = 0;
+
+    return request_body;
+}
+
+/* Build Chat Completions API request body, URL, and headers.
+   Uses the Chat Completions API format with `messages` array.
+   Unlike the Responses API, this uses role-based messages.
+   Returns malloc'd request body string.  Sets *url_out and *headers_out.
+   Caller must free the request body and the headers. */
+static char *
+yo_build_chat_completions_api_request(cJSON *messages,
+                      const char **url_out, struct curl_slist **headers_out,
+                      long *timeout_out)
+{
+    cJSON *request_json;
+    cJSON *tools;
+    char *request_body;
+    char auth_header[300];
+    struct curl_slist *headers = NULL;
+    char *system_prompt;
+
+    ZASSERT(yo_model);
+
+    /* Build tools array for Chat Completions API providers (no strict mode, no additionalProperties) */
+    tools = yo_build_tools_chat_completions_api();
+
+    /* Build system instructions */
+    system_prompt = yo_build_kimi_tuned_prompt(yo_provider_to_string(yo_provider));
 
     /* Build request JSON for Chat Completions API */
     request_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(request_json, "model", yo_model ? yo_model : YO_DEFAULT_KIMI_MODEL);
+    cJSON_AddStringToObject(request_json, "model", yo_model);
     cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
 
     /* Build messages array with system prompt as first message */
@@ -3772,7 +3813,9 @@ yo_build_kimi_request(cJSON *messages,
                 }
             }
         }
-        
+
+        cJSON_Delete(messages);
+
         cJSON_AddItemToObject(request_json, "messages", messages_array);
     }
     
@@ -3781,7 +3824,7 @@ yo_build_kimi_request(cJSON *messages,
     /* Add tools array (takes ownership) */
     cJSON_AddItemToObject(request_json, "tools", tools);
 
-    /* Note: Kimi doesn't support tool_choice field, so we omit it */
+    /* Note: Chat Completions API providers don't support tool_choice field, so we omit it */
 
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
@@ -3818,7 +3861,7 @@ yo_build_kimi_request(cJSON *messages,
 
     if (!*url_out)
     {
-        cJSON_Delete(request_json);
+        free(request_body);
         curl_slist_free_all(headers);
         return NULL;
     }
@@ -3829,12 +3872,12 @@ yo_build_kimi_request(cJSON *messages,
     return request_body;
 }
 
-/* Parse Kimi Chat Completions API response → normalized tool_use cJSON.
+/* Parse Chat Completions API response → normalized tool_use cJSON.
    Extracts tool_calls from choices[0].message.tool_calls[].
    Falls back to message.content for text responses.
    Caller must free the returned cJSON with cJSON_Delete. */
 static cJSON *
-yo_parse_kimi_response(const char *response_data)
+yo_parse_chat_completions_api_response(const char *response_data)
 {
     cJSON *response_json;
     cJSON *choices_array;
@@ -3933,7 +3976,7 @@ yo_parse_kimi_response(const char *response_data)
             result = cJSON_CreateObject();
             cJSON_AddStringToObject(result, "type", "tool_use");
             cJSON_AddStringToObject(result, "id",
-                (id && cJSON_IsString(id)) ? id->valuestring : "kimi_call");
+                (id && cJSON_IsString(id)) ? id->valuestring : "chat_call");
             cJSON_AddStringToObject(result, "name",
                 (name && cJSON_IsString(name)) ? name->valuestring : "chat");
 
@@ -3987,12 +4030,12 @@ yo_parse_kimi_response(const char *response_data)
     return result;
 }
 
-/* Parse OpenAI Responses API output → normalized tool_use cJSON.
+/* Parse Responses API output → normalized tool_use cJSON.
    Extracts function_call items from the output[] array.
    Falls back to message items for text content.
    Caller must free the returned cJSON with cJSON_Delete. */
 static cJSON *
-yo_parse_openai_response(const char *response_data)
+yo_parse_responses_api_response(const char *response_data)
 {
     cJSON *response_json;
     cJSON *output_array;
@@ -4056,7 +4099,7 @@ yo_parse_openai_response(const char *response_data)
                 result = cJSON_CreateObject();
                 cJSON_AddStringToObject(result, "type", "tool_use");
                 cJSON_AddStringToObject(result, "id",
-                    (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "openai_call");
+                    (call_id && cJSON_IsString(call_id)) ? call_id->valuestring : "responses_call");
                 cJSON_AddStringToObject(result, "name",
                     (name && cJSON_IsString(name)) ? name->valuestring : "chat");
 
@@ -4154,11 +4197,11 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     /* Provider-specific request building */
     if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        request_body = yo_build_openai_request(messages, (const char **)&url, &headers, &timeout);
+        request_body = yo_build_responses_api_request(messages, (const char **)&url, &headers, &timeout);
     }
     else if (yo_provider == YO_PROVIDER_KIMI)
     {
-        request_body = yo_build_kimi_request(messages, (const char **)&url, &headers, &timeout);
+        request_body = yo_build_chat_completions_api_request(messages, (const char **)&url, &headers, &timeout);
     }
     else
     {
@@ -4202,14 +4245,14 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     /* Provider-specific response parsing */
     if (yo_provider == YO_PROVIDER_KIMI)
     {
-        result = yo_parse_kimi_response(response_data);
+        result = yo_parse_chat_completions_api_response(response_data);
         free(response_data);
         free(url);
         return result;
     }
     else if (yo_provider == YO_PROVIDER_OPENAI)
     {
-        result = yo_parse_openai_response(response_data);
+        result = yo_parse_responses_api_response(response_data);
         free(response_data);
         free(url);
         return result;

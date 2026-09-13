@@ -1,6 +1,7 @@
 /* yo.c -- LLM-powered shell assistant for readline */
 
 /* Copyright (C) 2026 Epic Games, Inc.
+   Copyright (C) 2026 Filip Pizlo
 
    This file is part of the GNU Readline Library (Readline), a library
    for reading lines of text with interactive input and history editing.

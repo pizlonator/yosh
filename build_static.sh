@@ -7,23 +7,19 @@ set -x
 
 rm -rf static_deps
 mkdir static_deps
-cd static_deps
-tar -xf ../pizlix/zlib-1.3.1.tar.gz
-cd zlib-1.3.1
-CC=$PWD/../../build/bin/clang CXX=$PWD/../../build/bin/clang++ ./configure --prefix=$PWD/../../pizfix
+
+cd projects/zlib-1.3.2
+extract_source
+CC=$PWD/../../../build/bin/clang CXX=$PWD/../../../build/bin/clang++ ./configure --prefix=$PWD/../../../pizfix
 make -j `nproc`
 make -j `nproc` install
-cd ..
-rm -rf zlib-1.3.1
 
-tar -xf ../pizlix/zstd-1.5.6.tar.gz
-cd zstd-1.5.6
-CC=$PWD/../../build/bin/clang CXX=$PWD/../../build/bin/clang++ ZSTD_NO_ASM=1 make -j `nproc` prefix=$PWD/../../pizfix
-CC=$PWD/../../build/bin/clang CXX=$PWD/../../build/bin/clang++ ZSTD_NO_ASM=1 make -j `nproc` prefix=$PWD/../../pizfix install
-cd ..
-rm -rf zstd-1.5.6
+cd ../../zstd-1.5.7
+extract_source
+CC=$PWD/../../../build/bin/clang CXX=$PWD/../../../build/bin/clang++ ZSTD_NO_ASM=1 make -j `nproc` prefix=$PWD/../../../pizfix
+CC=$PWD/../../../build/bin/clang CXX=$PWD/../../../build/bin/clang++ ZSTD_NO_ASM=1 make -j `nproc` prefix=$PWD/../../../pizfix install
 
-cd ../projects/ncurses-6.5-20240720
+cd ../../ncurses-6.6
 extract_source
 PATH=$PWD/../../../pizfix/bin:$PATH CC="$PWD/../../../build/bin/clang -O -g" CXX="$PWD/../../../build/bin/clang++ -O -g" ./configure \
     --prefix="$PWD/../../../pizfix" --disable-lib-suffixes --without-shared --without-ada --disable-db-install --with-terminfo-dirs=/usr/share/terminfo:/lib/terminfo:/usr/lib/terminfo:/etc/terminfo
@@ -31,39 +27,41 @@ make -j $NCPU
 make -j $NCPU install
 ln -fs ncurses6-config ../../../pizfix/bin/ncursesw6-config
 
-cd ../../openssl-3.3.1
-extract_source
-CC="$PWD/../../../build/bin/clang -g -O2" ./Configure \
+cd ../../
+rm -rf openssl-build/extracted-source
+mkdir -p openssl-build
+../filc/projeny extract openssl.projeny openssl-build/extracted-source
+cd openssl-build/extracted-source
+CC="$PWD/../../../build/bin/clang -g -O2 -yolo-assembler" ./Configure \
     zlib --prefix=$PWD/../../../pizfix --libdir=lib no-shared
 make -j $NCPU
 make -j $NCPU install_sw
 make -j $NCPU install_ssldirs
 
 cd ../../../static_deps
-tar -xf ../pizlix/libunistring-1.2.tar.xz
-cd libunistring-1.2
+tar -xf ../pizlix/libunistring-1.4.2.tar.xz
+cd libunistring-1.4.2
 CC=$PWD/../../build/bin/clang CXX=$PWD/../../build/bin/clang++ ./configure --prefix=$PWD/../../pizfix --disable-shared --sysconfdir=/etc
 make -j `nproc`
 make -j `nproc` install
 cd ..
-rm -rf libunistring-1.2
+rm -rf libunistring-1.4.2
 
-cd ../projects/libidn2-2.3.7
-extract_source
+cd ../projects
+rm -rf libidn2/extracted-source
+../filc/projeny extract libidn2.projeny libidn2/extracted-source
+cd libidn2/extracted-source
 CC=$PWD/../../../build/bin/clang CXX=$PWD/../../../build/bin/clang++ ./configure --prefix=$PWD/../../../pizfix --sysconfdir=/etc --disable-shared
 make -j `nproc`
 make -j `nproc` install
 
-cd ../../../static_deps
-tar -xf ../pizlix/nghttp2-1.62.1.tar.xz
-cd nghttp2-1.62.1
-CC=$PWD/../../build/bin/clang CXX=$PWD/../../build/bin/clang++ ./configure --prefix=$PWD/../../pizfix --sysconfdir=/etc --disable-shared --enable-lib-only
+cd ../../nghttp2-1.70.0
+extract_source
+CC=$PWD/../../../build/bin/clang CXX=$PWD/../../../build/bin/clang++ ./configure --prefix=$PWD/../../../pizfix --sysconfdir=/etc --disable-shared --enable-lib-only
 make -j `nproc`
 make -j `nproc` install
-cd ..
-rm -rf nghttp2-1.62.1
 
-cd ../projects/curl-8.9.1
+cd ../../curl-8.22.0
 extract_source
 CC=$PWD/../../../build/bin/clang LIBS="-lidn2 -lunistring" \
     ./configure --with-openssl --with-nghttp2 \

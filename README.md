@@ -1,6 +1,6 @@
 # Yosh 0.1.2
 
-Yosh is an LLM-enabled shell. It's a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, featuring built-in LLM integration for natural language command generation and assistance. It supports both **Anthropic Claude** and **OpenAI** as providers.
+Yosh is an LLM-enabled shell. It's a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, featuring built-in LLM integration for natural language command generation and assistance. It supports **Anthropic Claude**, **OpenAI**, **Kimi**, **DeepSeek**, **Qwen**, **z.ai**, **Meta Muse**, and **OpenRouter** as providers.
 
 The key feature is the **yo** command: type `yo <natural language>` at the prompt and the shell calls an LLM to either generate a shell command or answer a question directly.
 
@@ -8,7 +8,7 @@ The key feature is the **yo** command: type `yo <natural language>` at the promp
 
 - **Natural language to shell commands**: Type `yo list all python files modified today` and get an executable command prefilled at your prompt
 - **Interactive Q&A**: Ask questions like `yo what does the -exec flag in find do?` and get answers inline
-- **Multi-provider**: Supports Anthropic Claude and OpenAI models, configurable via `~/.yoconf`
+- **Multi-provider**: Supports Anthropic Claude, OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta Muse, and OpenRouter models, configurable via `~/.yoconf`
 - **Web search**: The LLM can search the web to answer questions about current events, weather, news, etc.
 - **Session memory**: The shell remembers your conversation within a session for context-aware assistance
 - **Terminal awareness**: The LLM can read your recent terminal output to understand what you're working on
@@ -43,12 +43,32 @@ If you have a pre-built `yosh` binary:
 
    # For OpenAI:
    echo 'your-openai-api-key' > ~/.openaikey && chmod 600 ~/.openaikey
+
+   # For Kimi:
+   echo 'your-kimi-api-key' > ~/.kimikey && chmod 600 ~/.kimikey
+
+   # For DeepSeek:
+   echo 'your-deepseek-api-key' > ~/.deepseekkey && chmod 600 ~/.deepseekkey
+
+   # For Qwen:
+   echo 'your-qwen-api-key' > ~/.qwenkey && chmod 600 ~/.qwenkey
+
+   # For z.ai:
+   echo 'your-zai-api-key' > ~/.zaikey && chmod 600 ~/.zaikey
+
+   # For Meta Muse:
+   echo 'your-meta-api-key' > ~/.metakey && chmod 600 ~/.metakey
+
+   # For OpenRouter:
+   echo 'your-openrouter-api-key' > ~/.openrouterkey && chmod 600 ~/.openrouterkey
    ```
 
    **Option B: Config file (more control)**
+
    ```bash
    cat > ~/.yoconf << 'EOF'
-   # Provider: "anthropic" (default) or "openai"
+   # Provider: "anthropic" (default), "openai", "kimi", "deepseek", "qwen",
+   # "zai" (or "z.ai"), "meta" (or "muse"), or "openrouter"
    provider anthropic
 
    # Model (optional, uses provider default if omitted)
@@ -94,12 +114,15 @@ The built binary will be at `./prefix/bin/yosh`.
 Optionally create `~/.yoconf` to configure your LLM provider, model, and/or API key. All directives are optional:
 
 ```bash
-# Provider: "anthropic" (default) or "openai"
+# Provider: "anthropic" (default), "openai", "kimi", "deepseek", "qwen",
+# "zai" (or "z.ai"), "meta" (or "muse"), or "openrouter"
 provider anthropic
 
 # Model name (provider-specific, optional)
 # Anthropic default: claude-sonnet-4-20250514
 # OpenAI default: gpt-4o-mini
+# Meta default: muse-spark-1.3
+# OpenRouter default: meta/muse-spark-1.3
 model claude-sonnet-4-20250514
 
 # API key (optional if using a key file instead)
@@ -116,8 +139,8 @@ Directives that accept escape sequences (such as `chat_prefix`, `color_prefix`, 
 
 If `~/.yoconf` doesn't contain a `key` directive (or doesn't exist), yosh looks for the API key in a standalone key file (mode 0600, single line with the key):
 
-- If `provider` is set in `~/.yoconf`: checks `~/.anthropickey` or `~/.openaikey` (matching the provider).
-- If no provider is set: checks `~/.anthropickey`, then `~/.yoshkey` (legacy), then `~/.openaikey`. The provider is set automatically based on which file is found.
+- If `provider` is set in `~/.yoconf`: checks `~/.anthropickey`, `~/.openaikey`, `~/.kimikey`, `~/.deepseekkey`, `~/.qwenkey`, `~/.zaikey`, `~/.metakey`, or `~/.openrouterkey` (matching the provider).
+- If no provider is set: checks `~/.anthropickey`, then `~/.yoshkey` (legacy), then `~/.openaikey`, then `~/.kimikey`, then `~/.deepseekkey`, then `~/.qwenkey`, then `~/.zaikey`, then `~/.metakey`, then `~/.openrouterkey`. The provider is set automatically based on which file is found.
 - If no provider is determined from any source, it defaults to Anthropic.
 
 ### Additional Directives
@@ -127,11 +150,16 @@ All settings are configured in `~/.yoconf`. The file is re-read on each `yo` com
 | Directive | Default | Description |
 |-----------|---------|-------------|
 | `history_limit` | `10` | Max conversation exchanges to remember |
-| `token_budget` | `4096` | Max tokens for history context |
+| `token_budget` | (unset) | Alias of `context_window`: when set, it overrides the context budget used for the `[N%]` usage indicator and compaction (see below) |
 | `scrollback_enabled` | `1` | Set to `0` to disable terminal scrollback capture (startup only) |
 | `scrollback_bytes` | `1048576` | Max scrollback buffer size in bytes (startup only) |
 | `scrollback_lines` | `1000` | Max lines to return to the LLM (startup only) |
 | `server_web` | `1` | Set to `0` to disable server-side web search |
+| `context_window` | model-dependent | Override the model's context window (in tokens) used for usage display/compaction; `0` unsets |
+| `max_output_tokens` | model-dependent | Override the max output tokens requested from the model; `0` unsets |
+| `openrouter_api` | `chat` | API style for the `openrouter` provider: `chat` (OpenAI Chat Completions) or `responses` (OpenAI Responses). Only valid when `provider openrouter` is set |
+| `include_reasoning` | provider default | Ask Responses API providers for encrypted reasoning content and replay it on later turns. Defaults: enabled for `openai` reasoning models (o-series, gpt-5+) and always for `meta`; disabled for `openrouter`. Ignored by non-Responses providers |
+| `thinking` | off | Thinking/reasoning level: `off`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `chat_prefix` | `""` (empty) | Text string printed before chat output (supports C escapes) |
 | `color_prefix` | `\033[3;36m` | ANSI escape applied at the start of chat output (cyan italic) |
 | `chat_reset` / `color_reset` | `\033[0m` | ANSI escape applied after chat output (reset) |
@@ -149,6 +177,31 @@ These directives control the ANSI escape sequences used for rendering markdown f
 | `enable_strikethrough` | `\033[9m` | Escape for markdown `~~strikethrough~~` start |
 | `disable_strikethrough` | `\033[29m` | Escape for markdown `~~strikethrough~~` end |
 | `code_delimiter` | `\033[0;3;38;5;23m` | Escape for fenced code block delimiter lines (reset + italic + dark cyan) |
+
+### Context Compaction
+
+While the LLM is working, yosh prints `[N%] Thinking...`, where N is a rough
+estimate of the request size (session history + system prompt + your query, at
+~4 characters per token) as a percentage of the context window.
+
+When the estimate crosses 50% of the context window, yosh compacts the session
+history before sending the request:
+
+1. The first ~75% of the history (by estimated tokens) is summarized by the
+   LLM using a tools-less summarization request with a minimal system prompt
+   (its output is capped at 2048 tokens).
+2. The summary replaces those exchanges as a single `[context compacted]`
+   exchange; the most recent ~25% of the history is kept verbatim.
+3. The terminal shows the sequence `[62%] Thinking...` → `Compacting...` →
+   `[49%] Thinking...`.
+
+Compaction is best-effort on failure: if the summarization request fails (for
+example an HTTP error), the original request proceeds with the uncompacted
+history. Pressing Ctrl-C during compaction aborts the whole operation with
+"Cancelled" instead. Compaction only runs again when the estimate crosses 50%
+again. The context window comes from
+the model registry (or the provider's model-info API); the `context_window`
+directive — or the legacy `token_budget` directive — overrides it.
 
 ## Usage
 

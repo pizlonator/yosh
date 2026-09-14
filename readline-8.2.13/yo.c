@@ -30,6 +30,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -65,12 +66,59 @@
 #define YO_DEFAULT_MODEL "claude-sonnet-4-5-20250929"
 #define YO_DEFAULT_HISTORY_LIMIT 10
 #define YO_DEFAULT_TOKEN_BUDGET 4096
-#define YO_MAX_TOKENS 1024
+
+/* Context compaction.  When the estimated size of a request (history + system
+   prompt + query) exceeds half of the effective context window, the oldest
+   ~75% of the session history (by estimated tokens) is summarized by the LLM
+   and replaced with a single synthetic summary exchange; the most recent
+   ~25% is kept verbatim. */
+#define YO_COMPACTION_MIN_TOKENS 256        /* don't bother below this history size */
+#define YO_COMPACTION_OLD_PART_PCT 75       /* summarize the first ~75% of history tokens */
+#define YO_SUMMARY_MAX_OUTPUT_TOKENS 2048L  /* cap for the summarizer request (min with configured max_output_tokens) */
+
+/* System prompt for the compaction summarizer request (NOT the yosh shell
+   system prompt — the summarizer only needs to condense the transcript). */
+#define YO_SUMMARIZER_SYSTEM_PROMPT \
+    "You are a concise summarization assistant. Summarize the conversation as instructed."
+
+/* Final user message of the compaction summarizer request (the conversation
+   transcript follows it in the same message). */
+#define YO_COMPACTION_PROMPT \
+    "[compaction] Summarize the following conversation transcript in at most 300 words. " \
+    "Preserve: the user's goals, commands that were run and their outcomes, " \
+    "key facts learned, and anything unresolved. Output only the summary text."
+
+/* The synthetic history exchange that replaces the summarized part. */
+#define YO_COMPACTION_QUERY "[context compacted] Summary of the earlier conversation:"
+#define YO_COMPACTION_TOOL_USE_ID "compaction_summary"
 #define YO_DEFAULT_OPENAI_MODEL "gpt-5.2"
 #define YO_DEFAULT_KIMI_MODEL "kimi-k2.5"
 #define YO_DEFAULT_DEEPSEEK_MODEL "deepseek-v4-flash"
 #define YO_DEFAULT_QWEN_MODEL "qwen-plus"
 #define YO_DEFAULT_ZAI_MODEL "glm-5.2"
+#define YO_DEFAULT_META_MODEL "muse-spark-1.3"
+#define YO_DEFAULT_OPENROUTER_MODEL "meta/muse-spark-1.3"
+
+/* Model limits.  When the model is unknown to the built-in registry (ported
+   from brainstorm-3 lib/shared/model_registry.rb), we assume these defaults. */
+#define YO_REGISTRY_DEFAULT_MAX_OUTPUT_TOKENS 16000L  /* known context, unknown output */
+#define YO_UNKNOWN_MODEL_CONTEXT_WINDOW 131072L       /* model not in registry at all */
+#define YO_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS 16384L
+
+/* Timeout (seconds) for the best-effort model-info API GETs. */
+#define YO_MODEL_INFO_TIMEOUT 10L
+
+/* Thinking levels, from the ~/.yoconf "thinking" directive.
+   YO_THINKING_UNSET means the user did not configure thinking (disabled);
+   YO_THINKING_OFF is the explicit "off"/"none" (also disabled). */
+#define YO_THINKING_UNSET   (-1)
+#define YO_THINKING_OFF     0
+#define YO_THINKING_MINIMAL 1
+#define YO_THINKING_LOW     2
+#define YO_THINKING_MEDIUM  3
+#define YO_THINKING_HIGH    4
+#define YO_THINKING_XHIGH   5
+#define YO_THINKING_MAX     6
 
 /* Default styling.  Base text is italic cyan (color_prefix).
    Since base is already italic, markdown *italic* toggles italic OFF;
@@ -110,7 +158,9 @@ typedef enum {
     YO_PROVIDER_KIMI,
     YO_PROVIDER_DEEPSEEK,
     YO_PROVIDER_QWEN,
-    YO_PROVIDER_ZAI
+    YO_PROVIDER_ZAI,
+    YO_PROVIDER_META,
+    YO_PROVIDER_OPENROUTER
 } yo_provider_t;
 
 static const char *yo_provider_to_string(yo_provider_t provider);
@@ -123,6 +173,8 @@ typedef struct {
     int pending;          /* 1 if multi-step continuation */
     cJSON *raw_tool_use;  /* raw cJSON tool_use block (owned by this struct) */
     char *reasoning_content;  /* Kimi reasoning content when thinking is enabled */
+    char *reasoning_items_json;  /* serialized reasoning-items array (Responses API
+                                    reasoning replay; NULL when absent) */
 } yo_response_t;
 
 #define YO_LLM_RETRY_EXPLANATION            (1 << 0)
@@ -136,6 +188,8 @@ typedef struct {
     int executed;                  /* 1 if user ran it, 0 if not */
     int pending;                   /* 1 if response had "pending":true (multi-step) */
     char *reasoning_content;       /* Kimi reasoning content when thinking is enabled */
+    char *reasoning_items_json;    /* serialized reasoning-items array for Responses
+                                      API reasoning replay (NULL when absent) */
 } yo_exchange_t;
 
 /* **************************************************************** */
@@ -156,6 +210,9 @@ static int yo_history_count = 0;
 static int yo_history_capacity = 0;
 static int yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
 static int yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+static int yo_token_budget_set = 0;   /* 1 when ~/.yoconf sets token_budget explicitly (it
+                                         then acts as an alias of the context window for
+                                         compaction/usage-display purposes) */
 static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
 static const char *yo_name = NULL;
@@ -178,10 +235,30 @@ static int yo_config_scrollback_enabled = -1; /* -1 = not set (use default: enab
 static long yo_config_scrollback_bytes = -1;  /* -1 = not set (use default) */
 static int yo_config_scrollback_lines = -1;   /* -1 = not set (use default) */
 static char *yo_base_url = NULL;              /* from ~/.yoconf base_url, overrides default API URL */
+static long yo_config_context_window = -1;    /* from ~/.yoconf context_window, -1 = unset (0 also means unset) */
+static long yo_config_max_output_tokens = -1; /* from ~/.yoconf max_output_tokens, -1 = unset (0 also means unset) */
+static int yo_config_thinking = YO_THINKING_UNSET; /* from ~/.yoconf thinking (-1 unset, 0 off, else level) */
+
+/* OpenRouter API style, from the ~/.yoconf "openrouter_api" directive.
+   OpenRouter supports both the OpenAI Chat Completions API and the OpenAI
+   Responses API; the style selects which request builder/parser is used.
+   Only meaningful when the provider is openrouter (default: chat). */
+#define YO_OPENROUTER_API_CHAT      0
+#define YO_OPENROUTER_API_RESPONSES 1
+static int yo_openrouter_api_style = YO_OPENROUTER_API_CHAT;
+
+/* Whether to ask Responses API providers for encrypted reasoning content via
+   "include": ["reasoning.encrypted_content"], from the ~/.yoconf
+   "include_reasoning" directive.  YO_INCLUDE_REASONING_UNSET means the user
+   did not configure it and per-provider defaults apply:
+   openai — yes when the model plausibly supports reasoning; meta — always
+   (Muse Spark is a reasoning model); openrouter — no (OpenRouter only
+   forwards encrypted reasoning for some models; sending "include" can 400). */
+#define YO_INCLUDE_REASONING_UNSET (-1)
+static int yo_include_reasoning = YO_INCLUDE_REASONING_UNSET;
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
-static int yo_last_command_executed = 0;
 
 /* Continuation state for multi-step command sequences */
 static int yo_continuation_active = 0;     /* 1 if mid-plan (LLM returned pending:true) */
@@ -239,11 +316,13 @@ enum yo_load_config_mode {
 };
 static bool yo_load_config(enum yo_load_config_mode mode);
 static cJSON *yo_build_tools_anthropic(void);
-static cJSON *yo_build_tools_responses_api();
+static cJSON *yo_build_tools_responses_api(void);
+static cJSON *yo_build_tools_responses_api_compat(int include_web_search);
 static char *yo_sanitize_scrollback(const char *input);
 static void yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                                 const char *tool_name, cJSON *input,
-                                const char *reasoning_content);
+                                const char *reasoning_content,
+                                const char *reasoning_items_json);
 static void yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                                    const char *result_content);
 static cJSON *yo_build_history_tool_input(int idx);
@@ -252,26 +331,34 @@ static cJSON *yo_call_api(const char *query);
 static cJSON *yo_call_api_with_scrollback(const char *query,
                                           const char *scrollback_request, const char *scrollback_data,
                                           const char *scrollback_tool_id,
-                                          const char *reasoning_content);
+                                          const char *reasoning_content,
+                                          const char *reasoning_items_json);
 static cJSON *yo_call_api_with_docs(const char *query, const char *docs_request,
                                     const char *docs_tool_id,
-                                    const char *reasoning_content);
+                                    const char *reasoning_content,
+                                    const char *reasoning_items_json);
 static int yo_parse_response(cJSON *tool_use, yo_response_t *resp);
 static void yo_display_chat(const char *response);
-static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content);
+static void yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content, const char *reasoning_items_json);
 static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
+static int yo_estimate_request_tokens(const char *query);
+static long yo_get_effective_context_window(void);
+static int yo_usage_percent(long estimate, long window);
+static int yo_compact_history(void);
 static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
                                                  const char *scrollback_data, const char *scrollback_tool_id,
-                                                 const char *reasoning_content);
+                                                 const char *reasoning_content,
+                                                 const char *reasoning_items_json);
 static cJSON *yo_build_messages_with_docs(const char *current_query, const char *docs_request,
                                           const char *docs_tool_id,
-                                          const char *reasoning_content);
+                                          const char *reasoning_content,
+                                          const char *reasoning_items_json);
 static void yo_print_error_no_newlinev(const char *msg, va_list args);
 static void yo_print_error_no_newline(const char *msg, ...);
 static void yo_print_error(const char *msg, ...);
-static void yo_print_thinking(void);
+static void yo_print_thinking(int pct);
 static void yo_clear_thinking(void);
 static void yo_report_parse_error(cJSON *tool_use);
 static const char *yo_get_chat_prefix(void);
@@ -1140,6 +1227,8 @@ rl_yo_clear_history(void)
             free(yo_history[i].tool_use_id);
         if (yo_history[i].reasoning_content)
             free(yo_history[i].reasoning_content);
+        if (yo_history[i].reasoning_items_json)
+            free(yo_history[i].reasoning_items_json);
     }
 
     if (yo_history)
@@ -1225,9 +1314,13 @@ yo_handle_requests(const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
+            /* Replay this turn's reasoning items in the follow-up request, then
+               release them — resp is about to be replaced by the new response. */
             new_tool_use = yo_call_api_with_scrollback(
-                query, saved_content, scrollback_data, saved_tool_id, resp->reasoning_content);
+                query, saved_content, scrollback_data, saved_tool_id,
+                resp->reasoning_content, resp->reasoning_items_json);
             if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
+            if (resp->reasoning_items_json) { free(resp->reasoning_items_json); resp->reasoning_items_json = NULL; }
             free(saved_tool_id);
             free(saved_content);
             free(scrollback_data);
@@ -1265,8 +1358,13 @@ yo_handle_requests(const char *query,
             if (resp->explanation) { free(resp->explanation); resp->explanation = NULL; }
             if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
 
-            new_tool_use = yo_call_api_with_docs(query, "", saved_tool_id, resp->reasoning_content);
+            /* Replay this turn's reasoning items in the follow-up request, then
+               release them — resp is about to be replaced by the new response. */
+            new_tool_use = yo_call_api_with_docs(query, "", saved_tool_id,
+                                                 resp->reasoning_content,
+                                                 resp->reasoning_items_json);
             if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
+            if (resp->reasoning_items_json) { free(resp->reasoning_items_json); resp->reasoning_items_json = NULL; }
             free(saved_tool_id);
 
             if (!new_tool_use)
@@ -1328,6 +1426,18 @@ yo_handle_explanation_retry(const char *query,
             resp->pending = r.pending;
             cJSON_Delete(resp->raw_tool_use);
             resp->raw_tool_use = retry_tool_use;
+            /* Adopt the retry's reasoning fields too.  The retry is a distinct
+               LLM response: its reasoning_content / reasoning_items belong
+               with ITS function_call.  Keeping the original response's copies
+               would replay foreign reasoning items immediately before the
+               retry's function_call on the next request, violating the
+               Responses API reasoning-items ordering/pairing rule. */
+            if (resp->reasoning_content) free(resp->reasoning_content);
+            resp->reasoning_content = r.reasoning_content;
+            r.reasoning_content = NULL;
+            if (resp->reasoning_items_json) free(resp->reasoning_items_json);
+            resp->reasoning_items_json = r.reasoning_items_json;
+            r.reasoning_items_json = NULL;
         }
         else
         {
@@ -1335,6 +1445,8 @@ yo_handle_explanation_retry(const char *query,
             if (r.content) free(r.content);
             if (r.explanation) free(r.explanation);
             if (r.tool_use_id) free(r.tool_use_id);
+            if (r.reasoning_content) free(r.reasoning_content);
+            if (r.reasoning_items_json) free(r.reasoning_items_json);
             cJSON_Delete(retry_tool_use);
         }
     }
@@ -1361,8 +1473,54 @@ static int
 yo_call_llm(const char *query, int flags, yo_response_t *resp)
 {
     cJSON *tool_use;
+    long window;
+    int est, pct;
 
     memset(resp, 0, sizeof(*resp));
+
+    /* Context-usage estimate + thinking indicator.  The indicator lives here
+       (not at the call sites) so it can be redrawn when history compaction
+       runs.  pct = estimated request size (history + system prompt + query
+       + JSON slack) as a percentage of the effective context window. */
+    est = yo_estimate_request_tokens(query);
+    window = yo_get_effective_context_window();
+    pct = yo_usage_percent(est, window);
+    yo_print_thinking(pct);
+
+    /* Compact the session history when this request would exceed half of the
+       effective context window.  yo_compact_history() prints its own
+       "Compacting..." indicator (only when it actually attempts the
+       summarization request); on failure it is best-effort — the history is
+       left alone and the original usage estimate stands.  The one exception
+       is Ctrl-C: a cancelled summarizer must not be followed by the main
+       request (the user would have to press Ctrl-C twice, and "Cancelled"
+       would be followed by the request going through anyway). */
+    if (est > window / 2)
+    {
+        /* Ignore cancels left over from earlier requests: only a Ctrl-C that
+           lands on THIS compaction attempt may abort the operation. */
+        yo_cancelled = 0;
+
+        if (yo_compact_history())
+        {
+            est = yo_estimate_request_tokens(query);
+            pct = yo_usage_percent(est, window);
+        }
+        else if (yo_cancelled)
+        {
+            /* The summarizer request was cancelled: the HTTP layer already
+               erased the "Compacting..." indicator and printed "Cancelled".
+               Abort the whole operation — no indicator redraw and no main
+               request.  resp is still zeroed; the callers (rl_yo_accept_line,
+               yo_continuation_hook) redisplay the prompt on a 0 return. */
+            return 0;
+        }
+        /* Redraw the indicator: "[M%] Thinking..." with the post-compaction
+           usage on success, the original "[N%] Thinking..." after a
+           best-effort (non-cancel) failure. */
+        yo_clear_thinking();
+        yo_print_thinking(pct);
+    }
 
     /* Step 1: Call LLM API */
     tool_use = yo_call_api(query);
@@ -1436,8 +1594,6 @@ yo_continuation_hook(void)
         return 0;
     }
 
-    yo_print_thinking();
-
     /* Grab scrollback (limit to 200 lines for continuation) */
     scrollback = rl_yo_get_scrollback(200);
     if (!scrollback || !*scrollback)
@@ -1473,7 +1629,6 @@ yo_continuation_hook(void)
 
     if (!cont_query)
     {
-        yo_clear_thinking();
         yo_continuation_active = 0;
         return 0;
     }
@@ -1496,7 +1651,7 @@ yo_continuation_hook(void)
             yo_display_chat(resp.explanation);
 
         /* Add continuation exchange to session history */
-        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content, resp.reasoning_items_json);
 
         /* Prefill the command */
         rl_replace_line(resp.content, 0);
@@ -1511,7 +1666,7 @@ yo_continuation_hook(void)
     else if (resp.type == YO_RESPONSE_CHAT)
     {
         yo_display_chat(resp.content);
-        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content);
+        yo_history_add(cont_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content, resp.reasoning_items_json);
         rl_replace_line("", 0);
         yo_continuation_active = 0;
     }
@@ -1621,9 +1776,8 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
-    yo_print_thinking();
-
-    /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry */
+    /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry
+       (yo_call_llm prints the "[N%] Thinking..." indicator itself) */
     memset(&resp, 0, sizeof(resp));
     if (!yo_call_llm(saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
     {
@@ -1648,7 +1802,7 @@ rl_yo_accept_line(int count, int key)
         }
 
         /* Add to session history (not executed yet) */
-        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 0, resp.pending, resp.reasoning_content, resp.reasoning_items_json);
 
         /* Replace line with the command */
         rl_replace_line(resp.content, 0);
@@ -1672,7 +1826,7 @@ rl_yo_accept_line(int count, int key)
         yo_display_chat(resp.content);
 
         /* Add to session history */
-        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content);
+        yo_history_add(saved_query, resp.type, resp.content, resp.tool_use_id, 1, 0, resp.reasoning_content, resp.reasoning_items_json);
 
         /* Clear any active continuation */
         yo_continuation_active = 0;
@@ -1945,6 +2099,14 @@ yo_finish_config(char *parsed_key)
     {
         yo_model = strdup(YO_DEFAULT_ZAI_MODEL);
     }
+    else if (yo_provider == YO_PROVIDER_META)
+    {
+        yo_model = strdup(YO_DEFAULT_META_MODEL);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENROUTER)
+    {
+        yo_model = strdup(YO_DEFAULT_OPENROUTER_MODEL);
+    }
     else
     {
         yo_model = strdup(YO_DEFAULT_MODEL);
@@ -1958,9 +2120,10 @@ yo_finish_config(char *parsed_key)
    Key resolution order:
    1. ~/.yoconf (all fields optional: provider, model, key)
    2. If key missing and provider known: ~/.anthropickey, ~/.openaikey, ~/.kimikey,
-      ~/.deepseekkey, ~/.qwenkey, or ~/.zaikey (matching the provider)
+      ~/.deepseekkey, ~/.qwenkey, ~/.zaikey, ~/.metakey, or ~/.openrouterkey
+      (matching the provider)
    3. If key missing and provider unknown: ~/.anthropickey, ~/.yoshkey, ~/.openaikey,
-      ~/.kimikey, ~/.deepseekkey, ~/.qwenkey, ~/.zaikey
+      ~/.kimikey, ~/.deepseekkey, ~/.qwenkey, ~/.zaikey, ~/.metakey, ~/.openrouterkey
    4. Model defaults applied by yo_finish_config. */
 static bool
 yo_load_config(enum yo_load_config_mode mode)
@@ -2053,7 +2216,13 @@ yo_load_config(enum yo_load_config_mode mode)
     yo_config_scrollback_lines = -1;
     yo_history_limit = YO_DEFAULT_HISTORY_LIMIT;
     yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+    yo_token_budget_set = 0;
     yo_server_web_enabled = 1;
+    yo_config_context_window = -1;
+    yo_config_max_output_tokens = -1;
+    yo_config_thinking = YO_THINKING_UNSET;
+    yo_openrouter_api_style = YO_OPENROUTER_API_CHAT;
+    yo_include_reasoning = YO_INCLUDE_REASONING_UNSET;
 
     /* Step 1: Try ~/.yoconf — all fields optional */
     snprintf(path, sizeof(path), "%s/.yoconf", home);
@@ -2065,6 +2234,7 @@ yo_load_config(enum yo_load_config_mode mode)
         char *parsed_model = NULL;
         int line_num = 0;
         int had_error = 0;
+        int openrouter_api_line = 0;  /* line of the openrouter_api directive (0 = absent) */
 
         if ((st.st_mode & 0777) != 0600)
         {
@@ -2325,6 +2495,12 @@ yo_load_config(enum yo_load_config_mode mode)
                 yo_token_budget = atoi(value);
                 if (yo_token_budget < 100)
                     yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+                /* token_budget is repurposed as an alias of the context
+                   window: when set, it overrides the model's context window
+                   for the usage indicator and compaction threshold (the old
+                   round-robin history pruning is gone — compaction replaced
+                   it).  context_window takes precedence when both are set. */
+                yo_token_budget_set = 1;
             }
             else if (strcmp(directive, "server_web") == 0)
             {
@@ -2346,6 +2522,98 @@ yo_load_config(enum yo_load_config_mode mode)
                 }
                 if (yo_base_url) free(yo_base_url);
                 yo_base_url = strdup(value);
+            }
+            else if (strcmp(directive, "context_window") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'context_window' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_config_context_window = atol(value);
+                if (yo_config_context_window <= 0)
+                    yo_config_context_window = -1;  /* 0/negative = unset */
+            }
+            else if (strcmp(directive, "max_output_tokens") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'max_output_tokens' requires a value", line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_config_max_output_tokens = atol(value);
+                if (yo_config_max_output_tokens <= 0)
+                    yo_config_max_output_tokens = -1;  /* 0/negative = unset */
+            }
+            else if (strcmp(directive, "thinking") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'thinking' requires a value "
+                                              "(off, none, minimal, low, medium, high, xhigh, or max)", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (strcmp(value, "off") == 0 || strcmp(value, "none") == 0)
+                    yo_config_thinking = YO_THINKING_OFF;
+                else if (strcmp(value, "minimal") == 0)
+                    yo_config_thinking = YO_THINKING_MINIMAL;
+                else if (strcmp(value, "low") == 0)
+                    yo_config_thinking = YO_THINKING_LOW;
+                else if (strcmp(value, "medium") == 0)
+                    yo_config_thinking = YO_THINKING_MEDIUM;
+                else if (strcmp(value, "high") == 0)
+                    yo_config_thinking = YO_THINKING_HIGH;
+                else if (strcmp(value, "xhigh") == 0)
+                    yo_config_thinking = YO_THINKING_XHIGH;
+                else if (strcmp(value, "max") == 0)
+                    yo_config_thinking = YO_THINKING_MAX;
+                else
+                {
+                    yo_print_error_no_newline(
+                        "~/.yoconf:%d: thinking: unknown level '%s' "
+                        "(expected off, none, minimal, low, medium, high, xhigh, or max)",
+                        line_num, value);
+                    had_error = 1;
+                    break;
+                }
+            }
+            else if (strcmp(directive, "include_reasoning") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'include_reasoning' requires a value (0 or 1)",
+                                              line_num);
+                    had_error = 1;
+                    break;
+                }
+                yo_include_reasoning = (*value == '0') ? 0 : 1;
+            }
+            else if (strcmp(directive, "openrouter_api") == 0)
+            {
+                if (!*value)
+                {
+                    yo_print_error_no_newline("~/.yoconf:%d: 'openrouter_api' requires a value "
+                                              "(chat or responses)", line_num);
+                    had_error = 1;
+                    break;
+                }
+                if (strcmp(value, "chat") == 0)
+                    yo_openrouter_api_style = YO_OPENROUTER_API_CHAT;
+                else if (strcmp(value, "responses") == 0)
+                    yo_openrouter_api_style = YO_OPENROUTER_API_RESPONSES;
+                else
+                {
+                    yo_print_error_no_newline(
+                        "~/.yoconf:%d: openrouter_api: unknown style '%s' "
+                        "(expected 'chat' or 'responses')",
+                        line_num, value);
+                    had_error = 1;
+                    break;
+                }
+                openrouter_api_line = line_num;
             }
             else
             {
@@ -2374,6 +2642,13 @@ yo_load_config(enum yo_load_config_mode mode)
             if (yo_disable_strikethrough) { free(yo_disable_strikethrough); yo_disable_strikethrough = NULL; }
             if (yo_code_delimiter) { free(yo_code_delimiter); yo_code_delimiter = NULL; }
             if (yo_base_url) { free(yo_base_url); yo_base_url = NULL; }
+            yo_config_context_window = -1;
+            yo_config_max_output_tokens = -1;
+            yo_token_budget = YO_DEFAULT_TOKEN_BUDGET;
+            yo_token_budget_set = 0;
+            yo_config_thinking = YO_THINKING_UNSET;
+            yo_openrouter_api_style = YO_OPENROUTER_API_CHAT;
+            yo_include_reasoning = YO_INCLUDE_REASONING_UNSET;
             return false;
         }
 
@@ -2415,10 +2690,26 @@ yo_load_config(enum yo_load_config_mode mode)
                 yo_provider = YO_PROVIDER_ZAI;
                 have_provider = 1;
             }
+            else if (strcmp(parsed_provider, "meta") == 0)
+            {
+                yo_provider = YO_PROVIDER_META;
+                have_provider = 1;
+            }
+            else if (strcmp(parsed_provider, "muse") == 0)
+            {
+                yo_provider = YO_PROVIDER_META;
+                have_provider = 1;
+            }
+            else if (strcmp(parsed_provider, "openrouter") == 0)
+            {
+                yo_provider = YO_PROVIDER_OPENROUTER;
+                have_provider = 1;
+            }
             else
             {
                 yo_print_error_no_newline(
-                    "~/.yoconf: unknown provider '%s' (expected 'anthropic', 'openai', 'kimi', 'deepseek', 'qwen', 'zai', or 'z.ai')",
+                    "~/.yoconf: unknown provider '%s' (expected 'anthropic', 'openai', 'kimi', "
+                    "'deepseek', 'qwen', 'zai', 'z.ai', 'meta', 'muse', or 'openrouter')",
                     parsed_provider);
                 free(parsed_provider);
                 if (parsed_model) free(parsed_model);
@@ -2426,6 +2717,21 @@ yo_load_config(enum yo_load_config_mode mode)
                 return false;
             }
             free(parsed_provider);
+        }
+
+        /* Validate openrouter_api against the provider.  The directive may
+           appear before or after the provider directive, so this check runs
+           after the whole file has been parsed. */
+        if (openrouter_api_line && yo_provider != YO_PROVIDER_OPENROUTER)
+        {
+            yo_print_error_no_newline(
+                "~/.yoconf:%d: openrouter_api only applies to provider 'openrouter'",
+                openrouter_api_line);
+            if (parsed_model) free(parsed_model);
+            if (parsed_key) free(parsed_key);
+            yo_config_model = NULL;
+            yo_openrouter_api_style = YO_OPENROUTER_API_CHAT;
+            return false;
         }
 
         /* Apply model from config */
@@ -2465,6 +2771,8 @@ yo_load_config(enum yo_load_config_mode mode)
             case YO_PROVIDER_DEEPSEEK:  key_filename = ".deepseekkey"; break;
             case YO_PROVIDER_QWEN:      key_filename = ".qwenkey"; break;
             case YO_PROVIDER_ZAI:       key_filename = ".zaikey"; break;
+            case YO_PROVIDER_META:      key_filename = ".metakey"; break;
+            case YO_PROVIDER_OPENROUTER: key_filename = ".openrouterkey"; break;
             default:                    key_filename = ".openaikey"; break;
         }
 
@@ -2577,10 +2885,33 @@ yo_load_config(enum yo_load_config_mode mode)
         }
         if (found)
             return false;
+
+        snprintf(path, sizeof(path), "%s/.metakey", home);
+        parsed_key = yo_read_keyfile(path, "~/.metakey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_META;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
+
+        snprintf(path, sizeof(path), "%s/.openrouterkey", home);
+        parsed_key = yo_read_keyfile(path, "~/.openrouterkey", &found);
+        if (parsed_key)
+        {
+            yo_provider = YO_PROVIDER_OPENROUTER;
+            yo_finish_config(parsed_key);
+            return true;
+        }
+        if (found)
+            return false;
     }
 
     yo_print_error_no_newline("No API key found. Create ~/.yoconf with your API key (mode 0600), "
-                              "or create ~/.anthropickey, ~/.yoshkey, ~/.openaikey, ~/.kimikey, ~/.deepseekkey, ~/.qwenkey, or ~/.zaikey (mode 0600). "
+                              "or create ~/.anthropickey, ~/.yoshkey, ~/.openaikey, ~/.kimikey, "
+                              "~/.deepseekkey, ~/.qwenkey, ~/.zaikey, ~/.metakey, or ~/.openrouterkey (mode 0600). "
                               "See 'yo how do I configure the LLM' for details.");
     return false;
 }
@@ -2838,9 +3169,13 @@ yo_build_tools_chat_completions_api(void)
 /* Build tools array in Responses API format.
    Converts common tool definitions to Responses API function format and appends
    Responses API-specific tools (web_search) if enabled.
-   web_search_enabled: whether to add the web_search tool (Responses API only, not Chat Completions API). */
+   strict: when true (OpenAI), tool schemas include "strict":true and
+   "additionalProperties":false.  When false (Meta, OpenRouter), plain
+   {type,name,description,parameters} schemas are emitted.
+   include_web_search: when true, the {"type":"web_search"} server tool is
+   appended (still gated on yo_server_web_enabled). */
 static cJSON *
-yo_build_tools_responses_api(void)
+yo_build_tools_responses_api_ex(int strict, int include_web_search)
 {
     cJSON *tools = cJSON_CreateArray();
     cJSON *tool, *params, *json_props, *prop, *required;
@@ -2883,9 +3218,11 @@ yo_build_tools_responses_api(void)
     cJSON_AddItemToArray(required, cJSON_CreateString("explanation"));
     cJSON_AddItemToArray(required, cJSON_CreateString("pending"));
     cJSON_AddItemToObject(params, "required", required);
-    cJSON_AddFalseToObject(params, "additionalProperties");
+    if (strict)
+        cJSON_AddFalseToObject(params, "additionalProperties");
     cJSON_AddItemToObject(tool, "parameters", params);
-    cJSON_AddTrueToObject(tool, "strict");
+    if (strict)
+        cJSON_AddTrueToObject(tool, "strict");
     cJSON_AddItemToArray(tools, tool);
 
     /* Tool: chat */
@@ -2906,9 +3243,11 @@ yo_build_tools_responses_api(void)
     required = cJSON_CreateArray();
     cJSON_AddItemToArray(required, cJSON_CreateString("response"));
     cJSON_AddItemToObject(params, "required", required);
-    cJSON_AddFalseToObject(params, "additionalProperties");
+    if (strict)
+        cJSON_AddFalseToObject(params, "additionalProperties");
     cJSON_AddItemToObject(tool, "parameters", params);
-    cJSON_AddTrueToObject(tool, "strict");
+    if (strict)
+        cJSON_AddTrueToObject(tool, "strict");
     cJSON_AddItemToArray(tools, tool);
 
     /* Tool: scrollback */
@@ -2933,9 +3272,11 @@ yo_build_tools_responses_api(void)
     required = cJSON_CreateArray();
     cJSON_AddItemToArray(required, cJSON_CreateString("lines"));
     cJSON_AddItemToObject(params, "required", required);
-    cJSON_AddFalseToObject(params, "additionalProperties");
+    if (strict)
+        cJSON_AddFalseToObject(params, "additionalProperties");
     cJSON_AddItemToObject(tool, "parameters", params);
-    cJSON_AddTrueToObject(tool, "strict");
+    if (strict)
+        cJSON_AddTrueToObject(tool, "strict");
     cJSON_AddItemToArray(tools, tool);
 
     /* Tool: docs */
@@ -2954,13 +3295,15 @@ yo_build_tools_responses_api(void)
     cJSON_AddItemToObject(params, "properties", json_props);
     required = cJSON_CreateArray();
     cJSON_AddItemToObject(params, "required", required);
-    cJSON_AddFalseToObject(params, "additionalProperties");
+    if (strict)
+        cJSON_AddFalseToObject(params, "additionalProperties");
     cJSON_AddItemToObject(tool, "parameters", params);
-    cJSON_AddTrueToObject(tool, "strict");
+    if (strict)
+        cJSON_AddTrueToObject(tool, "strict");
     cJSON_AddItemToArray(tools, tool);
 
     /* Responses API-specific: web_search tool */
-    if (yo_server_web_enabled)
+    if (include_web_search && yo_server_web_enabled)
     {
         cJSON *ws = cJSON_CreateObject();
         cJSON_AddStringToObject(ws, "type", "web_search");
@@ -2968,6 +3311,26 @@ yo_build_tools_responses_api(void)
     }
 
     return tools;
+}
+
+/* Build tools array in Responses API format for OpenAI (strict schemas
+   enabled, web_search tool when yo_server_web_enabled). */
+static cJSON *
+yo_build_tools_responses_api(void)
+{
+    return yo_build_tools_responses_api_ex(1, yo_server_web_enabled);
+}
+
+/* Build tools array in Responses API format WITHOUT OpenAI strict-mode extras
+   ("strict":true / "additionalProperties":false): plain {type, name,
+   description, parameters} entries with top-level name/description/parameters
+   (no nested "function" object).  Used by providers that speak the Responses
+   API but reject strict tool schemas (Meta Muse, OpenRouter).
+   include_web_search: append {"type":"web_search"} when yo_server_web_enabled. */
+static cJSON *
+yo_build_tools_responses_api_compat(int include_web_search)
+{
+    return yo_build_tools_responses_api_ex(0, include_web_search);
 }
 
 /* Remove ANSI escape sequences and other control characters from scrollback
@@ -3080,14 +3443,19 @@ yo_sanitize_scrollback(const char *input)
 /*                                                                  */
 /* **************************************************************** */
 
-/* Make an HTTP POST request with curl multi-handle and Ctrl-C cancellation.
+/* Shared HTTP request core used by yo_http_post and yo_http_get.
+   Performs the curl multi-handle loop with Ctrl-C (self-pipe) cancellation.
+   `body` is the request body for POSTs (ignored when use_get is set);
+   when use_get is set, a plain GET with no body is issued.
+   When quiet is set, no error/cancellation chatter is printed and the
+   thinking indicator is left alone (used for best-effort background
+   fetches such as model info).
    Returns malloc'd response body on success, NULL on error/cancel.
    The caller owns the returned string and must free it.
-   On error, an error message is already printed.
    The headers list is freed by this function. */
 static char *
-yo_http_post(const char *url, struct curl_slist *headers,
-             const char *body, long timeout)
+yo_http_perform(const char *url, struct curl_slist *headers,
+                const char *body, long timeout, int use_get, int quiet)
 {
     CURL *curl;
     CURLM *multi;
@@ -3099,8 +3467,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
     /* Initialize self-pipe for Ctrl-C handling */
     if (yo_init_sigint_pipe() < 0)
     {
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize signal handling: %s", strerror(errno));
+        if (!quiet)
+        {
+            yo_clear_thinking();
+            yo_print_error_no_newline("Failed to initialize signal handling: %s", strerror(errno));
+        }
         curl_slist_free_all(headers);
         return NULL;
     }
@@ -3111,8 +3482,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
     curl = curl_easy_init();
     if (!curl)
     {
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize HTTP client (curl_easy_init returned NULL)");
+        if (!quiet)
+        {
+            yo_clear_thinking();
+            yo_print_error_no_newline("Failed to initialize HTTP client (curl_easy_init returned NULL)");
+        }
         curl_slist_free_all(headers);
         return NULL;
     }
@@ -3121,8 +3495,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
     if (!multi)
     {
         curl_easy_cleanup(curl);
-        yo_clear_thinking();
-        yo_print_error_no_newline("Failed to initialize HTTP client (curl_multi_init returned NULL)");
+        if (!quiet)
+        {
+            yo_clear_thinking();
+            yo_print_error_no_newline("Failed to initialize HTTP client (curl_multi_init returned NULL)");
+        }
         curl_slist_free_all(headers);
         return NULL;
     }
@@ -3130,7 +3507,10 @@ yo_http_post(const char *url, struct curl_slist *headers,
     /* Configure CURL easy handle */
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    if (use_get)
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    else
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, yo_curl_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response_buf);
     if (timeout > 0)
@@ -3198,8 +3578,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
 
         if (had_curl_error)
         {
-            yo_clear_thinking();
-            yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
+            if (!quiet)
+            {
+                yo_clear_thinking();
+                yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
+            }
             goto http_error;
         }
     }
@@ -3207,9 +3590,12 @@ yo_http_post(const char *url, struct curl_slist *headers,
     /* Handle cancellation */
     if (cancelled)
     {
-        yo_clear_thinking();
-        fprintf(rl_outstream, "%s%sCancelled%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
-        fflush(rl_outstream);
+        if (!quiet)
+        {
+            yo_clear_thinking();
+            fprintf(rl_outstream, "%s%sCancelled%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+            fflush(rl_outstream);
+        }
         goto http_error;
     }
 
@@ -3226,8 +3612,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
 
                 if (result != CURLE_OK)
                 {
-                    yo_clear_thinking();
-                    yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
+                    if (!quiet)
+                    {
+                        yo_clear_thinking();
+                        yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
+                    }
                     goto http_error;
                 }
 
@@ -3237,13 +3626,16 @@ yo_http_post(const char *url, struct curl_slist *headers,
                     if (http_code == 200)
                         break;
 
-                    yo_clear_thinking();
-                    if (response_buf.data) {
-                        yo_print_error_no_newline(
-                            "Unexpected HTTP status code: %ld; full response: %s",
-                            http_code, response_buf.data);
-                    } else
-                        yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
+                    if (!quiet)
+                    {
+                        yo_clear_thinking();
+                        if (response_buf.data) {
+                            yo_print_error_no_newline(
+                                "Unexpected HTTP status code: %ld; full response: %s",
+                                http_code, response_buf.data);
+                        } else
+                            yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
+                    }
                     goto http_error;
                 }
             }
@@ -3258,8 +3650,11 @@ yo_http_post(const char *url, struct curl_slist *headers,
 
     if (!response_buf.data)
     {
-        yo_clear_thinking();
-        yo_print_error_no_newline("No response from API");
+        if (!quiet)
+        {
+            yo_clear_thinking();
+            yo_print_error_no_newline("No response from API");
+        }
         return NULL;
     }
 
@@ -3275,75 +3670,1007 @@ http_error:
     return NULL;
 }
 
+/* Make an HTTP POST request with curl multi-handle and Ctrl-C cancellation.
+   Returns malloc'd response body on success, NULL on error/cancel.
+   The caller owns the returned string and must free it.
+   On error, an error message is already printed.
+   The headers list is freed by this function. */
+static char *
+yo_http_post(const char *url, struct curl_slist *headers,
+             const char *body, long timeout)
+{
+    return yo_http_perform(url, headers, body, timeout, 0, 0);
+}
+
+/* Make an HTTP GET request with no body, mirroring yo_http_post.
+   Uses the same curl multi-handle and Ctrl-C cancellation loop.
+   Returns malloc'd response body on success, NULL on error/cancel.
+   The caller owns the returned string and must free it.
+   On error, an error message is already printed.
+   The headers list is freed by this function. */
+static char *
+yo_http_get(const char *url, struct curl_slist *headers, long timeout)
+{
+    return yo_http_perform(url, headers, NULL, timeout, 1, 0);
+}
+
+/* Silent variant of yo_http_get for best-effort background fetches
+   (e.g. model info): on error/cancel it just returns NULL without
+   printing anything or touching the thinking indicator. */
+static char *
+yo_http_get_quiet(const char *url, struct curl_slist *headers, long timeout)
+{
+    return yo_http_perform(url, headers, NULL, timeout, 1, 1);
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*                     Model Limits & Registry                      */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Built-in model registry, ported from brainstorm-3
+   lib/shared/model_registry.rb (MODEL_CONTEXT_WINDOWS and
+   MODEL_MAX_OUTPUT_TOKENS).  Matching is case-insensitive on the model
+   name prefix and the first matching entry wins, so more-specific
+   prefixes must appear before less-specific ones.  Vendor-prefixed IDs
+   ("vendor/model", e.g. OpenRouter's "meta/muse-spark-1.3") fall back to
+   matching on the bare model name after the last '/'. */
+
+typedef struct {
+    const char *prefix;
+    long value;
+} yo_model_registry_entry_t;
+
+/* Model-to-context-window lookup table. */
+static const yo_model_registry_entry_t yo_model_context_windows[] = {
+    /* OpenAI models — values from OpenAI API docs, mid-2025.
+       More-specific prefixes must appear before less-specific ones. */
+    { "gpt-5.4-mini", 400000 },      /* mini/nano variants share the smaller 400K window */
+    { "gpt-5.4-nano", 400000 },
+    { "gpt-5.4", 1048576 },          /* GPT-5.4 / 5.4 Pro: 1M context */
+    { "gpt-5.2", 400000 },
+    { "gpt-5.1", 400000 },
+    { "gpt-5", 256000 },
+    { "gpt-4.1-nano", 1047576 },
+    { "gpt-4.1-mini", 1047576 },
+    { "gpt-4.1", 1047576 },
+    { "gpt-4o-mini", 128000 },
+    { "gpt-4o", 128000 },
+    { "gpt-4-turbo", 128000 },
+    { "gpt-4-1", 1047576 },
+    { "gpt-3.5-turbo", 16385 },
+    { "gpt-4", 8192 },               /* plain gpt-4 (after gpt-4o/gpt-4-turbo/gpt-4-1) */
+
+    /* OpenAI reasoning models */
+    { "o1-mini", 128000 },
+    { "o1-preview", 128000 },
+    { "o1", 200000 },
+    { "o3-mini", 200000 },
+    { "o3", 200000 },
+    { "o4-mini", 200000 },
+
+    /* Claude models (kept up to date; do not reorder) */
+    { "claude-opus-4-8", 1000000 },
+    { "claude-opus-4-7", 1000000 },
+    { "claude-opus-4-6", 1000000 },
+    { "claude-opus-4", 200000 },
+    { "claude-sonnet-4-6", 1000000 },
+    { "claude-sonnet-4", 200000 },
+    { "claude-3-5-sonnet", 200000 },
+    { "claude-3-opus", 200000 },
+    { "claude-3-haiku", 200000 },
+    { "claude", 200000 },            /* catch-all for any Claude variant */
+
+    /* DeepSeek — current V4 family uses 1M context; older chat/reasoner are 64K. */
+    { "deepseek-v4-pro", 1000000 },
+    { "deepseek-v4-flash", 1000000 },
+    { "deepseek-reasoner", 64000 },  /* R1 / V3 reasoning */
+    { "deepseek-chat", 64000 },      /* V3 chat */
+    { "deepseek-coder", 128000 },    /* Coder V2 family */
+    { "deepseek", 128000 },          /* legacy catch-all */
+
+    /* Kimi / Moonshot (kept up to date) */
+    { "kimi-k3", 1048576 },
+    { "kimi-k2.7", 262144 },
+    { "kimi-k2.6", 262144 },
+    { "kimi-k2.5", 256000 },
+    { "kimi", 128000 },
+    { "moonshot", 128000 },
+
+    /* Qwen / Alibaba */
+    { "qwen3.7-max", 262144 },
+    { "qwen3.5-plus", 1000000 },
+    { "qwen3.5-flash", 1000000 },
+    { "qwen3-235b-a22b", 128000 },
+    { "qwen-plus", 1000000 },
+    { "qwen-turbo", 1000000 },
+    { "qwen-coder-plus", 128000 },
+    { "qwen-max", 128000 },          /* uncertain; conservative */
+    { "qwen", 128000 },
+
+    /* z.ai GLM models — OpenAI-compatible API. */
+    { "glm-5.3", 1000000 },
+    { "glm-5.2", 1000000 },
+    { "glm-5.1", 200000 },
+    { "glm-5", 200000 },
+    { "glm-4.5", 128000 },
+    { "glm-4-plus", 128000 },
+    { "glm-4-air", 128000 },
+    { "glm-4-flash", 128000 },
+    { "glm-4", 128000 },             /* base GLM-4 catch-all */
+
+    /* xAI Grok models */
+    { "grok-4.20-multi-agent", 1000000 },
+    { "grok-4.20-0309-reasoning", 1000000 },
+    { "grok-4.20-0309-non-reasoning", 1000000 },
+    { "grok-4.20", 1000000 },        /* catch-all for grok-4.20 variants */
+    { "grok-4.5", 500000 },
+    { "grok-4.3", 1000000 },
+    { "grok-build", 256000 },
+    { "grok", 500000 },              /* catch-all for future Grok models */
+
+    /* Meta Muse models */
+    { "muse-spark", 1048576 },
+    { "muse", 1048576 },             /* catch-all */
+
+    { NULL, 0 }
+};
+
+/* Model-to-max-output-tokens lookup table.  This controls the max_tokens
+   parameter sent to APIs — the maximum number of tokens the model can
+   generate in a single response. */
+static const yo_model_registry_entry_t yo_model_max_output_tokens[] = {
+    /* OpenAI models */
+    { "gpt-5.4-mini", 128000 },
+    { "gpt-5.4-nano", 128000 },
+    { "gpt-5.4", 128000 },
+    { "gpt-5.2", 64000 },
+    { "gpt-5.1", 32768 },
+    { "gpt-5", 32768 },
+    { "gpt-4.1-nano", 32768 },
+    { "gpt-4.1-mini", 32768 },
+    { "gpt-4.1", 32768 },
+    { "gpt-4o-mini", 16384 },
+    { "gpt-4o", 16384 },
+    { "gpt-4-turbo", 4096 },
+    { "gpt-4-1", 32768 },
+    { "gpt-3.5-turbo", 4096 },
+    { "gpt-4", 8192 },
+
+    /* OpenAI reasoning models */
+    { "o1-mini", 65536 },
+    { "o1-preview", 32768 },
+    { "o1", 100000 },
+    { "o3-mini", 100000 },
+    { "o3", 100000 },
+    { "o4-mini", 100000 },
+
+    /* Claude models — official max output token limits from Anthropic docs.
+       More-specific prefixes first (e.g. claude-opus-4-6 before claude-opus-4). */
+    { "claude-opus-4-8", 128000 },
+    { "claude-opus-4-7", 128000 },
+    { "claude-opus-4-6", 128000 },
+    { "claude-sonnet-4-6", 64000 },
+    { "claude-opus-4-5", 64000 },
+    { "claude-sonnet-4-5", 64000 },
+    { "claude-haiku-4-5", 64000 },
+    { "claude-sonnet-4", 64000 },
+    { "claude-opus-4", 64000 },
+    { "claude-3-7-sonnet", 64000 },  /* 64k with extended thinking (8,192 without) */
+    { "claude-3-5-sonnet", 8192 },
+    { "claude-3-opus", 4096 },
+    { "claude-3-haiku", 4096 },
+    { "claude", 64000 },             /* safe default for unknown future Claude models */
+
+    /* DeepSeek — V4 models support very long outputs; older models are limited. */
+    { "deepseek-v4-pro", 384000 },   /* uncertain; may be lower for some endpoints */
+    { "deepseek-v4-flash", 384000 }, /* uncertain; may be lower for some endpoints */
+    { "deepseek-reasoner", 8192 },
+    { "deepseek-chat", 8192 },
+    { "deepseek-coder", 8192 },
+    { "deepseek", 8192 },
+
+    /* Kimi / Moonshot (kept up to date) */
+    { "kimi-k3", 131072 },
+    { "kimi-k2.7", 262000 },
+    { "kimi-k2.6", 262000 },
+    { "kimi-k2.5", 16384 },
+    { "kimi", 8192 },
+    { "moonshot", 8192 },
+
+    /* Qwen / Alibaba — conservative where docs are ambiguous. */
+    { "qwen3.7-max", 16384 },        /* uncertain; conservative */
+    { "qwen3.5-plus", 65536 },
+    { "qwen3.5-flash", 65536 },
+    { "qwen3-235b-a22b", 8192 },
+    { "qwen-plus", 32768 },
+    { "qwen-turbo", 16384 },
+    { "qwen-coder-plus", 8192 },
+    { "qwen-max", 8192 },            /* uncertain; conservative */
+    { "qwen", 8192 },
+
+    /* z.ai GLM models — conservative defaults where official specs are unclear. */
+    { "glm-5.3", 128000 },
+    { "glm-5.2", 128000 },
+    { "glm-5.1", 128000 },
+    { "glm-5", 128000 },
+    { "glm-4.5", 32768 },            /* uncertain; official may be higher */
+    { "glm-4-plus", 16384 },
+    { "glm-4-air", 16384 },
+    { "glm-4-flash", 16384 },
+    { "glm-4", 8192 },
+
+    /* xAI Grok models — max_output_tokens includes reasoning tokens */
+    { "grok-4.20-multi-agent", 128000 },
+    { "grok-4.20-0309-reasoning", 128000 },
+    { "grok-4.20-0309-non-reasoning", 128000 },
+    { "grok-4.20", 128000 },
+    { "grok-4.5", 128000 },
+    { "grok-4.3", 128000 },
+    { "grok-build", 64000 },
+    { "grok", 128000 },
+
+    /* Meta Muse models */
+    { "muse-spark", 128000 },
+    { "muse", 128000 },
+
+    { NULL, 0 }
+};
+
+/* Case-insensitive prefix lookup in a registry table.  First match wins.
+   Returns 1 and sets *value_out when the model matches an entry,
+   0 when the model is unknown to the table.
+
+   Vendor-prefixed model IDs ("vendor/model", as used by OpenRouter — e.g.
+   "meta/muse-spark-1.3") would defeat a plain prefix match, so when the
+   full string matches nothing the lookup retries with the substring after
+   the LAST '/' (the bare model name) before giving up.  The full string is
+   always tried first, so a registry entry that includes the vendor prefix
+   would still win. */
+static int
+yo_model_registry_lookup(const yo_model_registry_entry_t *table, const char *model,
+                         long *value_out)
+{
+    size_t i;
+
+    if (!model || !*model)
+        return 0;
+
+    for (i = 0; table[i].prefix; i++)
+    {
+        if (strncasecmp(model, table[i].prefix, strlen(table[i].prefix)) == 0)
+        {
+            *value_out = table[i].value;
+            return 1;
+        }
+    }
+
+    /* No match on the full string: retry with the bare model name when the
+       ID is vendor-prefixed ("vendor/model"), e.g. "meta/muse-spark-1.3"
+       must resolve through the "muse-spark"/"muse" entries. */
+    {
+        const char *slash = strrchr(model, '/');
+        if (slash && slash[1])
+        {
+            const char *bare = slash + 1;
+
+            for (i = 0; table[i].prefix; i++)
+            {
+                if (strncasecmp(bare, table[i].prefix, strlen(table[i].prefix)) == 0)
+                {
+                    *value_out = table[i].value;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Resolve a model's context window and max output tokens from the registry.
+   Uses YO_REGISTRY_DEFAULT_MAX_OUTPUT_TOKENS when the model has a context
+   entry but no output entry, and the YO_UNKNOWN_MODEL_* defaults when the
+   model isn't in the registry at all. */
+static void
+yo_model_registry_limits(const char *model, long *context_window_out,
+                         long *max_output_tokens_out)
+{
+    long context_window;
+    long max_output_tokens;
+
+    if (yo_model_registry_lookup(yo_model_context_windows, model, &context_window))
+    {
+        if (!yo_model_registry_lookup(yo_model_max_output_tokens, model,
+                                      &max_output_tokens))
+            max_output_tokens = YO_REGISTRY_DEFAULT_MAX_OUTPUT_TOKENS;
+    }
+    else
+    {
+        context_window = YO_UNKNOWN_MODEL_CONTEXT_WINDOW;
+        max_output_tokens = YO_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS;
+    }
+
+    *context_window_out = context_window;
+    *max_output_tokens_out = max_output_tokens;
+}
+
+/* Returns the wire string for a configured thinking level, or NULL when the
+   level does not map to a request parameter (unset/off/none). */
+static const char *
+yo_thinking_level_string(int level)
+{
+    switch (level)
+    {
+        case YO_THINKING_MINIMAL: return "minimal";
+        case YO_THINKING_LOW:     return "low";
+        case YO_THINKING_MEDIUM:  return "medium";
+        case YO_THINKING_HIGH:    return "high";
+        case YO_THINKING_XHIGH:   return "xhigh";
+        case YO_THINKING_MAX:     return "max";
+        default:                  return NULL;
+    }
+}
+
+/* True when the user configured a thinking level other than off/none. */
+static int
+yo_thinking_enabled(void)
+{
+    return yo_config_thinking > YO_THINKING_OFF
+        && yo_thinking_level_string(yo_config_thinking) != NULL;
+}
+
+/* Anthropic extended-thinking budget ("thinking":{"budget_tokens":B}) for a
+   configured thinking level.  Returns 0 for unset/off (no thinking).
+   Levels map: minimal→1024, low→2048, medium→4096, high→8192,
+   xhigh→16384, max→32768. */
+static long
+yo_thinking_budget_tokens(int level)
+{
+    switch (level)
+    {
+        case YO_THINKING_MINIMAL: return 1024;
+        case YO_THINKING_LOW:     return 2048;
+        case YO_THINKING_MEDIUM:  return 4096;
+        case YO_THINKING_HIGH:    return 8192;
+        case YO_THINKING_XHIGH:   return 16384;
+        case YO_THINKING_MAX:     return 32768;
+        default:                  return 0;
+    }
+}
+
+/* Mirror of brainstorm-3 openai_client.rb#model_supports_reasoning_effort?:
+   true for GLM-5.2 and newer GLM models (glm-5.2, glm-5.3, glm-6, ...). */
+static int
+yo_zai_supports_reasoning_effort(const char *model)
+{
+    long major = 0, minor = 0;
+
+    if (!model || strncasecmp(model, "glm-", 4) != 0)
+        return 0;
+    model += 4;
+
+    while (*model >= '0' && *model <= '9')
+        major = major * 10 + (*model++ - '0');
+
+    if (*model == '.')
+    {
+        model++;
+        while (*model >= '0' && *model <= '9')
+            minor = minor * 10 + (*model++ - '0');
+    }
+
+    return major > 5 || (major == 5 && minor >= 2);
+}
+
+/* Cached model info, keyed by (provider, model, base_url).  Re-fetched only
+   when the user changes provider, model, or base_url in ~/.yoconf — not on
+   every LLM call.  Failures (registry fallbacks) are cached under the same
+   rule.  Nothing is fetched at startup; the first fetch is lazy. */
+typedef struct {
+    char *key_provider;   /* provider string at fetch time */
+    char *key_model;      /* model at fetch time */
+    char *key_base_url;   /* base_url at fetch time ("" when unset) */
+    long context_window;
+    long max_output_tokens;
+    int fetched;
+} yo_model_info_t;
+
+static yo_model_info_t yo_model_info_cache;
+
+/* Fetch obj member `name` as a positive number.  Returns 1 if found. */
+static int
+yo_json_get_positive_number(cJSON *obj, const char *name, long *out)
+{
+    cJSON *item = cJSON_GetObjectItem(obj, name);
+    if (item && cJSON_IsNumber(item) && item->valuedouble > 0)
+    {
+        *out = (long)item->valuedouble;
+        return 1;
+    }
+    return 0;
+}
+
+/* Best-effort sniff: search root (and, where present, its "data",
+   "data"."top_provider", "top_provider", and "model" children) for a numeric
+   field with any of the given names.  Returns 1 if found. */
+static int
+yo_json_sniff_number(cJSON *root, const char *const *names, long *out)
+{
+    size_t i;
+    cJSON *data, *top_provider, *model;
+
+    for (i = 0; names[i]; i++)
+        if (yo_json_get_positive_number(root, names[i], out))
+            return 1;
+
+    data = cJSON_GetObjectItem(root, "data");
+    if (data && cJSON_IsObject(data))
+    {
+        for (i = 0; names[i]; i++)
+            if (yo_json_get_positive_number(data, names[i], out))
+                return 1;
+
+        top_provider = cJSON_GetObjectItem(data, "top_provider");
+        if (top_provider && cJSON_IsObject(top_provider))
+            for (i = 0; names[i]; i++)
+                if (yo_json_get_positive_number(top_provider, names[i], out))
+                    return 1;
+    }
+
+    top_provider = cJSON_GetObjectItem(root, "top_provider");
+    if (top_provider && cJSON_IsObject(top_provider))
+        for (i = 0; names[i]; i++)
+            if (yo_json_get_positive_number(top_provider, names[i], out))
+                return 1;
+
+    model = cJSON_GetObjectItem(root, "model");
+    if (model && cJSON_IsObject(model))
+        for (i = 0; names[i]; i++)
+            if (yo_json_get_positive_number(model, names[i], out))
+                return 1;
+
+    return 0;
+}
+
+/* Join base URL (yo_base_url when set, otherwise default_base) with path.
+   Returns malloc'd URL or NULL on allocation failure. */
+static char *
+yo_model_info_url(const char *default_base, const char *path)
+{
+    const char *base = (yo_base_url && *yo_base_url) ? yo_base_url : default_base;
+    size_t base_len = strlen(base);
+    const char *p = path;
+    char *url;
+
+    while (*p == '/')
+        p++;
+
+    if (base_len > 0 && base[base_len - 1] == '/')
+    {
+        if (asprintf(&url, "%s%s", base, p) < 0)
+            return NULL;
+    }
+    else
+    {
+        if (asprintf(&url, "%s/%s", base, p) < 0)
+            return NULL;
+    }
+    return url;
+}
+
+/* Best-effort fetch of model limits from the provider's model-info API.
+   Sets *context_window_out / *max_output_tokens_out only for values the API
+   actually provided.  Fully silent: on any error (missing key, timeout,
+   HTTP error, unparseable response) it just returns without printing, and
+   the caller fills the gaps from the registry. */
+static void
+yo_fetch_model_info_from_api(const char *provider, const char *model,
+                             long *context_window_out, long *max_output_tokens_out)
+{
+    char *url = NULL;
+    char *path;
+    struct curl_slist *headers = NULL;
+    char auth_header[300];
+    char *response;
+    cJSON *root;
+
+    if (!yo_api_key || !*yo_api_key || !model || !*model)
+        return;
+
+    if (strcmp(provider, "openrouter") == 0)
+    {
+        /* GET {base_url or https://openrouter.ai/api/v1}/model/{model}
+           (note: OpenRouter uses the SINGULAR "model" path)
+           Response: {"data": {"context_length": N,
+                               "top_provider": {"max_completion_tokens": M, ...}}}
+           When base_url is set it is expected to already include the version
+           path (e.g. https://openrouter.ai/api/v1/), so we append just
+           "model/{model}" to it. */
+        if (asprintf(&path, "model/%s", model) < 0)
+            return;
+        url = yo_model_info_url("https://openrouter.ai/api/v1", path);
+        free(path);
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+        headers = curl_slist_append(NULL, auth_header);
+    }
+    else if (strcmp(provider, "anthropic") == 0)
+    {
+        /* GET {base_url or https://api.anthropic.com/v1}/models/{model}
+           Best effort: use limit fields if the response happens to have them.
+           When base_url is set it is expected to already include the version
+           path, so we append just "models/{model}" to it. */
+        if (asprintf(&path, "models/%s", model) < 0)
+            return;
+        url = yo_model_info_url("https://api.anthropic.com/v1", path);
+        free(path);
+        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", yo_api_key);
+        headers = curl_slist_append(NULL, auth_header);
+        headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
+    }
+    else if (strcmp(provider, "openai") == 0)
+    {
+        /* GET {base_url or https://api.openai.com/v1}/models/{model}
+           Best effort: use limit fields if the response happens to have them.
+           When base_url is set it is expected to already include the version
+           path, so we append just "models/{model}" to it. */
+        if (asprintf(&path, "models/%s", model) < 0)
+            return;
+        url = yo_model_info_url("https://api.openai.com/v1", path);
+        free(path);
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+        headers = curl_slist_append(NULL, auth_header);
+    }
+    else if (strcmp(provider, "meta") == 0)
+    {
+        /* GET {base_url or https://api.meta.ai/v1}/models/{model}
+           Best effort: use limit fields if the response happens to have them.
+           When base_url is set it is expected to already include the version
+           path (e.g. https://api.meta.ai/v1/), so we append just
+           "models/{model}" to it (previously this produced .../v1/v1/models/...). */
+        if (asprintf(&path, "models/%s", model) < 0)
+            return;
+        url = yo_model_info_url("https://api.meta.ai/v1", path);
+        free(path);
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
+        headers = curl_slist_append(NULL, auth_header);
+    }
+    else
+    {
+        /* kimi/deepseek/qwen/zai (and anything else): no model-info API
+           attempt; go straight to the registry. */
+        return;
+    }
+
+    if (!url || !headers)
+    {
+        free(url);
+        if (headers)
+            curl_slist_free_all(headers);
+        return;
+    }
+
+    response = yo_http_get_quiet(url, headers, YO_MODEL_INFO_TIMEOUT);
+    free(url);
+    if (!response)
+        return;
+
+    root = cJSON_Parse(response);
+    free(response);
+    if (!root)
+        return;
+
+    if (strcmp(provider, "openrouter") == 0)
+    {
+        cJSON *data = cJSON_GetObjectItem(root, "data");
+        if (data && cJSON_IsObject(data))
+        {
+            yo_json_get_positive_number(data, "context_length", context_window_out);
+
+            {
+                cJSON *top_provider = cJSON_GetObjectItem(data, "top_provider");
+                if (top_provider && cJSON_IsObject(top_provider))
+                    yo_json_get_positive_number(top_provider, "max_completion_tokens",
+                                                max_output_tokens_out);
+            }
+        }
+    }
+    else
+    {
+        static const char *const context_names[] = { "context_window", "context_length", NULL };
+        static const char *const output_names[] = { "max_output_tokens", "max_tokens", NULL };
+
+        yo_json_sniff_number(root, context_names, context_window_out);
+        yo_json_sniff_number(root, output_names, max_output_tokens_out);
+    }
+
+    cJSON_Delete(root);
+}
+
+/* Resolve the current model's limits: ask the provider API when it can tell
+   us (short timeout, silent on failure) and fill whatever is missing from
+   the built-in registry. */
+static void
+yo_resolve_model_info(long *context_window_out, long *max_output_tokens_out)
+{
+    long context_window = 0;
+    long max_output_tokens = 0;
+    const char *provider = yo_provider_to_string(yo_provider);
+
+    yo_fetch_model_info_from_api(provider, yo_model, &context_window, &max_output_tokens);
+
+    {
+        long registry_context, registry_max;
+        yo_model_registry_limits(yo_model, &registry_context, &registry_max);
+        if (context_window <= 0)
+            context_window = registry_context;
+        if (max_output_tokens <= 0)
+            max_output_tokens = registry_max;
+    }
+
+    *context_window_out = context_window;
+    *max_output_tokens_out = max_output_tokens;
+}
+
+/* Get the context window and max output tokens for the current
+   (provider, model, base_url).  Values come from the provider's API when it
+   reports them, otherwise from the built-in model registry.  Results are
+   cached per (provider, model, base_url) so we do NOT re-request on every
+   LLM call — only when the user changes provider, model, or base_url in
+   ~/.yoconf.  The fetch is lazy: nothing happens until first use. */
+static void
+yo_get_model_info(long *context_window_out, long *max_output_tokens_out)
+{
+    const char *provider = yo_provider_to_string(yo_provider);
+    const char *base_url = yo_base_url ? yo_base_url : "";
+    int cache_valid = yo_model_info_cache.fetched
+        && yo_model_info_cache.key_provider
+        && yo_model_info_cache.key_model
+        && yo_model_info_cache.key_base_url
+        && yo_model
+        && strcmp(yo_model_info_cache.key_provider, provider) == 0
+        && strcmp(yo_model_info_cache.key_model, yo_model) == 0
+        && strcmp(yo_model_info_cache.key_base_url, base_url) == 0;
+
+    if (!cache_valid)
+    {
+        long context_window, max_output_tokens;
+
+        yo_resolve_model_info(&context_window, &max_output_tokens);
+
+        if (yo_model_info_cache.key_provider)
+            free(yo_model_info_cache.key_provider);
+        if (yo_model_info_cache.key_model)
+            free(yo_model_info_cache.key_model);
+        if (yo_model_info_cache.key_base_url)
+            free(yo_model_info_cache.key_base_url);
+        yo_model_info_cache.key_provider = strdup(provider);
+        yo_model_info_cache.key_model = strdup(yo_model);
+        yo_model_info_cache.key_base_url = strdup(base_url);
+        yo_model_info_cache.context_window = context_window;
+        yo_model_info_cache.max_output_tokens = max_output_tokens;
+        yo_model_info_cache.fetched = 1;
+    }
+
+    if (context_window_out)
+        *context_window_out = yo_model_info_cache.context_window;
+    if (max_output_tokens_out)
+        *max_output_tokens_out = yo_model_info_cache.max_output_tokens;
+}
+
+/* Max output tokens to request from the LLM: ~/.yoconf max_output_tokens
+   override > model/API-reported value > 16384. */
+static long
+yo_get_max_output_tokens(void)
+{
+    if (yo_config_max_output_tokens > 0)
+        return yo_config_max_output_tokens;
+
+    {
+        long context_window, max_output_tokens;
+        yo_get_model_info(&context_window, &max_output_tokens);
+        if (max_output_tokens > 0)
+            return max_output_tokens;
+    }
+
+    return YO_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS;
+}
+
+/* Context window for the current model: ~/.yoconf context_window override >
+   model/API-reported value > registry default.  (Used for context-usage
+   display and compaction thresholds.) */
+static long
+yo_get_context_window(void)
+{
+    if (yo_config_context_window > 0)
+        return yo_config_context_window;
+
+    {
+        long context_window, max_output_tokens;
+        yo_get_model_info(&context_window, &max_output_tokens);
+        if (context_window > 0)
+            return context_window;
+    }
+
+    return YO_UNKNOWN_MODEL_CONTEXT_WINDOW;
+}
+
+/* Effective context-window budget for the usage indicator and compaction:
+   ~/.yoconf context_window override > ~/.yoconf token_budget (when explicitly
+   set — it is repurposed as an alias of the context window) > the model's
+   context window (API/registry). */
+static long
+yo_get_effective_context_window(void)
+{
+    if (yo_config_context_window > 0)
+        return yo_config_context_window;
+
+    if (yo_token_budget_set && yo_token_budget > 0)
+        return (long)yo_token_budget;
+
+    return yo_get_context_window();
+}
+
+/* Estimated request size as a percentage of the context window, clamped to
+   [0, 99] (the indicator never reads "100%"). */
+static int
+yo_usage_percent(long estimate, long window)
+{
+    long pct;
+
+    if (window <= 0)
+        return 0;
+
+    pct = estimate * 100 / window;
+    if (pct < 0)
+        pct = 0;
+    if (pct > 99)
+        pct = 99;
+
+    return (int)pct;
+}
+
 /* **************************************************************** */
 /*                                                                  */
 /*              Anthropic: Request Building & Response Parsing       */
 /*                                                                  */
 /* **************************************************************** */
 
+/* Add an Anthropic prompt-caching breakpoint — "cache_control":{"type":"ephemeral"}
+   — to a JSON object (a tool definition, a system text block, or a message
+   content block).  Anthropic caches only what is explicitly marked, up to 4
+   breakpoints per request; anything unmarked is re-sent and re-billed as
+   fresh input tokens on every call. */
+static void
+yo_anthropic_mark_cache_breakpoint(cJSON *obj)
+{
+    cJSON *cache_control;
+
+    if (!obj || !cJSON_IsObject(obj))
+        return;
+
+    cache_control = cJSON_CreateObject();
+    cJSON_AddStringToObject(cache_control, "type", "ephemeral");
+    cJSON_AddItemToObject(obj, "cache_control", cache_control);
+}
+
+/* Mark the last content block of the last message in the messages array with
+   an Anthropic cache_control breakpoint (see yo_build_anthropic_request).
+   The last message's content may be a plain string (typical final user
+   message) or an array of blocks (e.g. a tool_result turn); both are handled.
+   Skips silently when the messages array is empty or malformed. */
+static void
+yo_anthropic_mark_last_message_breakpoint(cJSON *messages)
+{
+    cJSON *last_msg;
+    cJSON *content;
+    int msg_count;
+
+    if (!messages || !cJSON_IsArray(messages))
+        return;
+
+    msg_count = cJSON_GetArraySize(messages);
+    if (msg_count <= 0)
+        return;
+
+    last_msg = cJSON_GetArrayItem(messages, msg_count - 1);
+    if (!last_msg)
+        return;
+
+    content = cJSON_GetObjectItem(last_msg, "content");
+    if (content && cJSON_IsString(content))
+    {
+        /* Plain string content: convert to a one-element text-block array
+           carrying the breakpoint. */
+        cJSON *blocks = cJSON_CreateArray();
+        cJSON *block = cJSON_CreateObject();
+
+        cJSON_AddStringToObject(block, "type", "text");
+        cJSON_AddStringToObject(block, "text", content->valuestring);
+        yo_anthropic_mark_cache_breakpoint(block);
+        cJSON_AddItemToArray(blocks, block);
+        /* Replaces (and frees) the old string content item. */
+        cJSON_ReplaceItemInObject(last_msg, "content", blocks);
+    }
+    else if (content && cJSON_IsArray(content) && cJSON_GetArraySize(content) > 0)
+    {
+        yo_anthropic_mark_cache_breakpoint(
+            cJSON_GetArrayItem(content, cJSON_GetArraySize(content) - 1));
+    }
+}
+
 /* Build Anthropic request body, URL, and headers from provider-native messages.
+   include_tools: 1 for normal requests (tools array + tool_choice "any" +
+   server-side web tools); 0 for tools-less requests (the context-compaction
+   summarizer) — no tools array, no tool_choice, and no web-search beta
+   header.  The tools prompt-caching breakpoint is skipped when there are no
+   tools; the system and final-message breakpoints still apply.
+   system_override: when non-NULL, replaces the yosh shell system prompt (and
+   the "You are powered by" wrapper) — used by the compaction summarizer.
+   max_output_override: when > 0, overrides yo_get_max_output_tokens().
+   Extended thinking (~/.yoconf "thinking") is enabled only for normal
+   requests: "thinking":{"type":"enabled","budget_tokens":B} is added and
+   "tool_choice" is OMITTED (Anthropic rejects forced tool choice together
+   with extended thinking); tools are still sent and the model chooses.
+   max_tokens is raised to B + 1024 when it would not exceed B (Anthropic
+   requires max_tokens > budget_tokens).
    Returns malloc'd request body string.  Sets *url_out and *headers_out.
    Caller must free the request body and the headers (via curl_slist_free_all). */
 static char *
-yo_build_anthropic_request(cJSON *messages,
+yo_build_anthropic_request_ex(cJSON *messages,
                            const char **url_out, struct curl_slist **headers_out,
-                           long *timeout_out)
+                           long *timeout_out,
+                           int include_tools,
+                           const char *system_override,
+                           long max_output_override)
 {
     cJSON *request_json;
-    cJSON *tools;
+    cJSON *tools = NULL;
     cJSON *tool_choice;
     char *request_body;
     char auth_header[300];
     struct curl_slist *headers = NULL;
-    int web_enabled = yo_server_web_enabled;
+    int web_enabled = yo_server_web_enabled && include_tools;
+    long max_output = (max_output_override > 0) ? max_output_override
+                                                : yo_get_max_output_tokens();
+    int thinking_enabled = include_tools && yo_thinking_enabled();
+    long thinking_budget = 0;
+
+    if (thinking_enabled)
+    {
+        thinking_budget = yo_thinking_budget_tokens(yo_config_thinking);
+
+        /* Anthropic requires max_tokens to be strictly greater than
+           budget_tokens.  Bump max_tokens when the configured/registry value
+           would not leave room for the thinking budget. */
+        if (max_output <= thinking_budget)
+            max_output = thinking_budget + 1024;
+    }
 
     ZASSERT(yo_model);
 
     /* Build tools array */
-    tools = yo_build_tools_anthropic();
+    if (include_tools)
+    {
+        tools = yo_build_tools_anthropic();
+
+        /* Prompt caching breakpoint #1: mark the LAST CUSTOM tool so the
+           tools-array prefix gets cached.  Custom tools are plain
+           {name,description,input_schema} objects without a top-level "type"
+           field; server tools (web_search/web_fetch) carry "type" and come
+           last, and Anthropic's acceptance of cache_control on server-tool
+           definitions is unverified — so walk from the end and mark the last
+           object that has no "type".  When no custom tool exists (defensive),
+           the tools breakpoint is skipped entirely. */
+        {
+            int tool_count = cJSON_GetArraySize(tools);
+            int ti;
+
+            for (ti = tool_count - 1; ti >= 0; ti--)
+            {
+                cJSON *tool = cJSON_GetArrayItem(tools, ti);
+
+                if (tool && cJSON_IsObject(tool)
+                    && !cJSON_GetObjectItem(tool, "type"))
+                {
+                    yo_anthropic_mark_cache_breakpoint(tool);
+                    break;
+                }
+            }
+        }
+    }
 
     /* Build request JSON */
     request_json = cJSON_CreateObject();
     cJSON_AddStringToObject(request_json, "model", yo_model);
-    cJSON_AddNumberToObject(request_json, "max_tokens", web_enabled ? 4096 : YO_MAX_TOKENS);
+    cJSON_AddNumberToObject(request_json, "max_tokens", max_output);
+
+    /* Extended thinking, when the user configured a thinking level (normal
+       requests only — see above).  Placed right after max_tokens so the
+       request shape stays stable. */
+    if (thinking_enabled)
+    {
+        cJSON *thinking = cJSON_CreateObject();
+        cJSON_AddStringToObject(thinking, "type", "enabled");
+        cJSON_AddNumberToObject(thinking, "budget_tokens", thinking_budget);
+        cJSON_AddItemToObject(request_json, "thinking", thinking);
+    }
 
     {
         char *base_prompt;
-        asprintf(&base_prompt, "You are powered by %s (provider: anthropic).\n\n%s",
-                 yo_model, yo_system_prompt);
+        char *system_prompt;
+        cJSON *system_blocks;
+        cJSON *system_block;
 
-        if (web_enabled)
+        if (system_override)
         {
-            char *full_prompt;
-            asprintf(&full_prompt, "%s\n\n"
-                "When you need up-to-date information from the internet (current events, latest docs,\n"
-                "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
-                "These run automatically when you use them - just search or fetch as needed before\n"
-                "choosing your final response tool (command or chat).\n"
-                "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
-                "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
-                "inline citations or reference markers - the user does not need source attribution.",
-                base_prompt);
-            cJSON_AddStringToObject(request_json, "system", full_prompt);
-            free(full_prompt);
+            system_prompt = strdup(system_override);
         }
         else
         {
-            cJSON_AddStringToObject(request_json, "system", base_prompt);
+            asprintf(&base_prompt, "You are powered by %s (provider: anthropic).\n\n%s",
+                     yo_model, yo_system_prompt);
+
+            if (web_enabled)
+            {
+                asprintf(&system_prompt, "%s\n\n"
+                    "When you need up-to-date information from the internet (current events, latest docs,\n"
+                    "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
+                    "These run automatically when you use them - just search or fetch as needed before\n"
+                    "choosing your final response tool (command or chat).\n"
+                    "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
+                    "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
+                    "inline citations or reference markers - the user does not need source attribution.",
+                    base_prompt);
+                free(base_prompt);
+            }
+            else
+            {
+                system_prompt = base_prompt;
+            }
         }
-        free(base_prompt);
+
+        /* Prompt caching breakpoint #2: send "system" as a content-block
+           array whose text block carries the cache_control breakpoint. */
+        system_blocks = cJSON_CreateArray();
+        system_block = cJSON_CreateObject();
+        cJSON_AddStringToObject(system_block, "type", "text");
+        cJSON_AddStringToObject(system_block, "text", system_prompt);
+        yo_anthropic_mark_cache_breakpoint(system_block);
+        cJSON_AddItemToArray(system_blocks, system_block);
+        cJSON_AddItemToObject(request_json, "system", system_blocks);
+        free(system_prompt);
     }
 
     /* Add messages array to request (takes ownership) */
     cJSON_AddItemToObject(request_json, "messages", messages);
 
-    /* Add tools array (takes ownership) */
-    cJSON_AddItemToObject(request_json, "tools", tools);
+    /* Prompt caching breakpoint #3: mark the LAST content block of the LAST
+       message (the conversation tail).  Together with the tool and system
+       breakpoints this forms a rolling cache: each request's prefix overlaps
+       the previous request's cached prefix.  Done here, after the messages
+       array is attached to the request JSON, so it applies no matter which
+       builder produced the messages. */
+    yo_anthropic_mark_last_message_breakpoint(
+        cJSON_GetObjectItem(request_json, "messages"));
 
-    /* Force tool use with tool_choice: {"type": "any"} */
-    tool_choice = cJSON_CreateObject();
-    cJSON_AddStringToObject(tool_choice, "type", "any");
-    cJSON_AddItemToObject(request_json, "tool_choice", tool_choice);
+    /* Add tools array (takes ownership) and force tool use with
+       tool_choice: {"type": "any"} — only for normal (tools-ful) requests.
+       With extended thinking enabled, tool_choice is OMITTED: Anthropic
+       rejects the combination ("may not be used with tool_choice"), so the
+       model chooses freely (tools are still sent). */
+    if (tools)
+    {
+        cJSON_AddItemToObject(request_json, "tools", tools);
+
+        if (!thinking_enabled)
+        {
+            tool_choice = cJSON_CreateObject();
+            cJSON_AddStringToObject(tool_choice, "type", "any");
+            cJSON_AddItemToObject(request_json, "tool_choice", tool_choice);
+        }
+    }
 
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
@@ -3383,7 +4710,7 @@ yo_build_anthropic_request(cJSON *messages,
 
     if (!*url_out)
     {
-        cJSON_Delete(request_json);
+        free(request_body);
         curl_slist_free_all(headers);
         return NULL;
     }
@@ -3526,12 +4853,14 @@ yo_provider_to_string(yo_provider_t provider)
 {
     switch (provider)
     {
-        case YO_PROVIDER_ANTHROPIC: return "anthropic";
-        case YO_PROVIDER_OPENAI:    return "openai";
-        case YO_PROVIDER_KIMI:      return "kimi";
-        case YO_PROVIDER_DEEPSEEK:  return "deepseek";
-        case YO_PROVIDER_QWEN:      return "qwen";
-        case YO_PROVIDER_ZAI:       return "zai";
+        case YO_PROVIDER_ANTHROPIC:  return "anthropic";
+        case YO_PROVIDER_OPENAI:     return "openai";
+        case YO_PROVIDER_KIMI:       return "kimi";
+        case YO_PROVIDER_DEEPSEEK:   return "deepseek";
+        case YO_PROVIDER_QWEN:       return "qwen";
+        case YO_PROVIDER_ZAI:        return "zai";
+        case YO_PROVIDER_META:       return "meta";
+        case YO_PROVIDER_OPENROUTER: return "openrouter";
     }
     ZASSERT(!"unknown provider");
     return "unknown";
@@ -3540,10 +4869,28 @@ yo_provider_to_string(yo_provider_t provider)
 static int
 yo_provider_uses_chat_completions_api(yo_provider_t provider)
 {
+    /* OpenRouter supports both API styles; the configured openrouter_api
+       directive decides which one is used. */
+    if (provider == YO_PROVIDER_OPENROUTER)
+        return yo_openrouter_api_style == YO_OPENROUTER_API_CHAT;
+
     return provider == YO_PROVIDER_KIMI
         || provider == YO_PROVIDER_DEEPSEEK
         || provider == YO_PROVIDER_QWEN
         || provider == YO_PROVIDER_ZAI;
+}
+
+/* True when the provider (with its configured API style) expects OpenAI
+   Responses API message shapes: flat function_call / function_call_output
+   items instead of role-based messages. */
+static int
+yo_provider_uses_responses_api(yo_provider_t provider)
+{
+    if (provider == YO_PROVIDER_OPENAI || provider == YO_PROVIDER_META)
+        return 1;
+    if (provider == YO_PROVIDER_OPENROUTER)
+        return yo_openrouter_api_style == YO_OPENROUTER_API_RESPONSES;
+    return 0;
 }
 
 static const char *
@@ -3551,18 +4898,26 @@ yo_default_chat_completions_url(yo_provider_t provider)
 {
     switch (provider)
     {
-        case YO_PROVIDER_KIMI:     return "https://api.moonshot.ai/v1/chat/completions";
-        case YO_PROVIDER_DEEPSEEK: return "https://api.deepseek.com/chat/completions";
-        case YO_PROVIDER_QWEN:     return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-        case YO_PROVIDER_ZAI:      return "https://api.z.ai/api/paas/v4/chat/completions";
-        default:                   ZASSERT(!"not a chat completions provider"); return NULL;
+        case YO_PROVIDER_KIMI:       return "https://api.moonshot.ai/v1/chat/completions";
+        case YO_PROVIDER_DEEPSEEK:   return "https://api.deepseek.com/chat/completions";
+        case YO_PROVIDER_QWEN:       return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+        case YO_PROVIDER_ZAI:        return "https://api.z.ai/api/paas/v4/chat/completions";
+        case YO_PROVIDER_OPENROUTER: return "https://openrouter.ai/api/v1/chat/completions";
+        default:                     ZASSERT(!"not a chat completions provider"); return NULL;
     }
 }
 
+/* Build the system prompt tuned for OpenAI Responses API providers.
+   provider_name is used in the "powered by" line.
+   include_web_paragraph: append the web-search availability paragraph (only
+   when web search is actually enabled).  Providers that never receive a
+   web_search tool (e.g. OpenRouter) pass 0 so the prompt does not claim
+   capabilities it does not have. */
 static char *
-yo_build_openai_tuned_prompt(const char *provider_name)
+yo_build_openai_tuned_prompt(const char *provider_name, int include_web_paragraph)
 {
     char *prompt;
+    int mention_web = include_web_paragraph && yo_server_web_enabled;
 
     ZASSERT(yo_model);
 
@@ -3624,7 +4979,7 @@ yo_build_openai_tuned_prompt(const char *provider_name)
         "  (pending=true), then decide based on output"
         "%s",
         yo_model, provider_name, yo_system_prompt, yo_name, yo_name, yo_name,
-        yo_server_web_enabled
+        mention_web
             ? "\n\nYou have web search available. When you find the answer to the user's question "
               "via web search (weather, news, sports scores, prices, current events, etc.), "
               "relay the information directly using chat. Do NOT suggest a curl/wget command "
@@ -3713,20 +5068,64 @@ yo_build_kimi_tuned_prompt(const char *provider_name)
     return prompt;
 }
 
+/* Heuristic: does this OpenAI model plausibly emit reasoning items?
+   Mirrors brainstorm-3's model_supports_reasoning?: true for the o-series
+   (o1/o3/o4/...) and for gpt-<n> with n >= 5 (gpt-5, gpt-5.2, gpt-6, ...).
+   Case-insensitive. */
+static int
+yo_openai_model_supports_reasoning(const char *model)
+{
+    long major = 0;
+
+    if (!model || !*model)
+        return 0;
+
+    if (*model == 'o' || *model == 'O')
+        return 1;  /* o1, o3, o4-mini, ... */
+
+    if (strncasecmp(model, "gpt-", 4) != 0)
+        return 0;
+    model += 4;
+
+    while (*model >= '0' && *model <= '9')
+        major = major * 10 + (*model++ - '0');
+
+    return major >= 5;
+}
+
 /* **************************************************************** */
 /*                                                                  */
 /*               Responses API: Request Building & Response Parsing        */
 /*                                                                  */
 /* **************************************************************** */
 
+/* Flags controlling provider-specific extras in the Responses API request.
+   All Responses API providers share the base shape (model, max_output_tokens,
+   reasoning, instructions, input, tools, store:false); the flags toggle the
+   parts not every provider supports. */
+#define YO_RESPONSES_FLAG_STRICT_TOOLS         (1 << 0)  /* "strict":true + "additionalProperties":false in tool schemas (OpenAI only) */
+#define YO_RESPONSES_FLAG_TOOL_CHOICE_REQUIRED (1 << 1)  /* send "tool_choice":"required" (OpenAI, OpenRouter; Meta rejects it with HTTP 400) */
+#define YO_RESPONSES_FLAG_WEB_SEARCH           (1 << 2)  /* include {"type":"web_search"} tool when yo_server_web_enabled (OpenAI, Meta) */
+#define YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT    (1 << 3)  /* mention web search availability in the tuned prompt (never for OpenRouter) */
+#define YO_RESPONSES_FLAG_INCLUDE_REASONING    (1 << 4)  /* send "include":["reasoning.encrypted_content"] so reasoning can be replayed on later turns */
+#define YO_RESPONSES_FLAG_META_CACHE_RETENTION (1 << 5)  /* send "prompt_cache_retention":"in_memory" (Meta Muse in-memory cache tier; OpenAI/OpenRouter 400 on unknown params) */
+#define YO_RESPONSES_FLAG_NO_TOOLS             (1 << 6)  /* tools-less request (context-compaction summarizer): no tools array, no tool_choice, no web_search */
+
 /* Build Responses API request body, URL, and headers from provider-native messages.
    The system prompt is prepended as top-level instructions.
+   flags selects provider-specific extras (see YO_RESPONSES_FLAG_* above).
+   system_override: when non-NULL, replaces the tuned yosh system prompt in
+   "instructions" (used by the compaction summarizer).
+   max_output_override: when > 0, overrides yo_get_max_output_tokens().
    Returns malloc'd request body string.  Sets *url_out and *headers_out.
    Caller must free the request body and the headers. */
 static char *
-yo_build_responses_api_request(cJSON *messages,
+yo_build_responses_api_request_ex(cJSON *messages,
                         const char **url_out, struct curl_slist **headers_out,
-                        long *timeout_out)
+                        long *timeout_out,
+                        unsigned flags,
+                        const char *system_override,
+                        long max_output_override)
 {
     cJSON *request_json;
     cJSON *tools;
@@ -3734,27 +5133,44 @@ yo_build_responses_api_request(cJSON *messages,
     char auth_header[300];
     struct curl_slist *headers = NULL;
     char *tuned_prompt;
-    int max_tokens = YO_MAX_TOKENS;
+    const char *default_url;
+    long max_output = (max_output_override > 0) ? max_output_override
+                                                : yo_get_max_output_tokens();
 
     ZASSERT(yo_model);
 
     /* Build tools array in Responses API format */
-    tools = yo_build_tools_responses_api();
+    if (flags & YO_RESPONSES_FLAG_NO_TOOLS)
+        tools = NULL;
+    else if (flags & YO_RESPONSES_FLAG_STRICT_TOOLS)
+        tools = yo_build_tools_responses_api();
+    else
+        tools = yo_build_tools_responses_api_compat(
+            (flags & YO_RESPONSES_FLAG_WEB_SEARCH) ? 1 : 0);
 
     /* Build tuned system instructions.
        Append additional guidance to strongly bias toward command responses,
        since Responses API models tend to over-use chat for things a shell assistant
        should answer with commands. */
-    tuned_prompt = yo_build_openai_tuned_prompt(yo_provider_to_string(yo_provider));
-
-    /* When web search is enabled, bump max tokens */
-    if (yo_server_web_enabled)
-        max_tokens = 4096;
+    if (system_override)
+        tuned_prompt = strdup(system_override);
+    else
+        tuned_prompt = yo_build_openai_tuned_prompt(yo_provider_to_string(yo_provider),
+                                                    (flags & YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT) ? 1 : 0);
 
     /* Build Responses API request JSON */
     request_json = cJSON_CreateObject();
     cJSON_AddStringToObject(request_json, "model", yo_model);
-    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_tokens);
+    cJSON_AddNumberToObject(request_json, "max_output_tokens", max_output);
+
+    /* Reasoning effort, when the user configured a thinking level */
+    if (yo_thinking_enabled())
+    {
+        cJSON *reasoning = cJSON_CreateObject();
+        cJSON_AddStringToObject(reasoning, "effort",
+                                yo_thinking_level_string(yo_config_thinking));
+        cJSON_AddItemToObject(request_json, "reasoning", reasoning);
+    }
 
     /* System prompt goes in top-level "instructions" field */
     cJSON_AddStringToObject(request_json, "instructions", tuned_prompt);
@@ -3763,14 +5179,40 @@ yo_build_responses_api_request(cJSON *messages,
     /* Add input array (conversation messages — takes ownership) */
     cJSON_AddItemToObject(request_json, "input", messages);
 
-    /* Add tools array (takes ownership) */
-    cJSON_AddItemToObject(request_json, "tools", tools);
+    /* Add tools array (takes ownership) — omitted for tools-less requests */
+    if (tools)
+        cJSON_AddItemToObject(request_json, "tools", tools);
 
-    /* Force tool use */
-    cJSON_AddStringToObject(request_json, "tool_choice", "required");
+    /* Force tool use (not for Meta, which only supports the default auto
+       tool_choice and returns HTTP 400 for "required"; never for tools-less
+       requests) */
+    if ((flags & YO_RESPONSES_FLAG_TOOL_CHOICE_REQUIRED) && tools)
+        cJSON_AddStringToObject(request_json, "tool_choice", "required");
+
+    /* Ask for encrypted reasoning content so it can be replayed on later turns
+       (Meta Muse Responses protocol: "Reasoning items in multi-turn input").
+       Works with store:true or store:false and is never combined with
+       previous_response_id (which yosh never uses). */
+    if (flags & YO_RESPONSES_FLAG_INCLUDE_REASONING)
+    {
+        cJSON *include = cJSON_CreateArray();
+        cJSON_AddItemToArray(include, cJSON_CreateString("reasoning.encrypted_content"));
+        cJSON_AddItemToObject(request_json, "include", include);
+    }
 
     /* Privacy: don't store responses */
     cJSON_AddFalseToObject(request_json, "store");
+
+    /* Prompt caching: OpenAI/Meta/OpenRouter cache request prefixes
+       automatically; "prompt_cache_key" groups our requests together so the
+       vendor's cache matches them (documented for both OpenAI and Meta). */
+    cJSON_AddStringToObject(request_json, "prompt_cache_key", "yosh");
+
+    /* Meta Muse only: keep the cached prefix in memory (lowest-latency cache
+       tier).  Never sent to OpenAI or OpenRouter, which reject unknown
+       parameters with HTTP 400. */
+    if (flags & YO_RESPONSES_FLAG_META_CACHE_RETENTION)
+        cJSON_AddStringToObject(request_json, "prompt_cache_retention", "in_memory");
 
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
@@ -3779,8 +5221,17 @@ yo_build_responses_api_request(cJSON *messages,
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (yo_provider == YO_PROVIDER_OPENROUTER)
+        headers = curl_slist_append(headers, "X-Title: yosh");
 
     /* Build URL: use base_url if set, otherwise default */
+    if (yo_provider == YO_PROVIDER_OPENROUTER)
+        default_url = "https://openrouter.ai/api/v1/responses";
+    else if (yo_provider == YO_PROVIDER_META)
+        default_url = "https://api.meta.ai/v1/responses";
+    else
+        default_url = "https://api.openai.com/v1/responses";
+
     if (yo_base_url)
     {
         /* Ensure base_url ends with / */
@@ -3802,7 +5253,7 @@ yo_build_responses_api_request(cJSON *messages,
     }
     else
     {
-        *url_out = strdup("https://api.openai.com/v1/responses");
+        *url_out = strdup(default_url);
     }
 
     if (!*url_out)
@@ -3818,15 +5269,92 @@ yo_build_responses_api_request(cJSON *messages,
     return request_body;
 }
 
+/* Build a Responses API request for OpenAI (unchanged legacy behavior:
+   strict tool schemas, tool_choice "required", web_search when enabled).
+   Encrypted reasoning content is requested when the model plausibly
+   supports reasoning, or when `include_reasoning 1` is configured. */
+static char *
+yo_build_responses_api_request(cJSON *messages,
+                        const char **url_out, struct curl_slist **headers_out,
+                        long *timeout_out)
+{
+    int include_reasoning;
+
+    if (yo_include_reasoning == 0)
+        include_reasoning = 0;  /* user explicitly disabled */
+    else if (yo_include_reasoning == 1)
+        include_reasoning = 1;  /* user explicitly enabled */
+    else
+        include_reasoning = yo_openai_model_supports_reasoning(yo_model);
+
+    return yo_build_responses_api_request_ex(messages, url_out, headers_out, timeout_out,
+                                             YO_RESPONSES_FLAG_STRICT_TOOLS
+                                             | YO_RESPONSES_FLAG_TOOL_CHOICE_REQUIRED
+                                             | YO_RESPONSES_FLAG_WEB_SEARCH
+                                             | YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT
+                                             | (include_reasoning
+                                                ? YO_RESPONSES_FLAG_INCLUDE_REASONING : 0),
+                                             NULL, 0);
+}
+
+/* Build a Responses API request for Meta Muse.
+   Meta speaks the OpenAI Responses API, but: no "tool_choice" (only the
+   default auto is supported; sending "required" returns HTTP 400), no
+   "strict"/"additionalProperties" in tool schemas, and web_search grounding
+   is available (so the prompt may mention web search).
+   Meta also accepts "prompt_cache_retention":"in_memory" (its in-memory
+   prompt-cache tier); only Meta gets that parameter.
+   Encrypted reasoning content is always requested (Muse Spark is a reasoning
+   model) unless `include_reasoning 0` is configured. */
+static char *
+yo_build_meta_request(cJSON *messages,
+                      const char **url_out, struct curl_slist **headers_out,
+                      long *timeout_out)
+{
+    return yo_build_responses_api_request_ex(messages, url_out, headers_out, timeout_out,
+                                             YO_RESPONSES_FLAG_WEB_SEARCH
+                                             | YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT
+                                             | YO_RESPONSES_FLAG_META_CACHE_RETENTION
+                                             | (yo_include_reasoning == 0
+                                                ? 0 : YO_RESPONSES_FLAG_INCLUDE_REASONING),
+                                             NULL, 0);
+}
+
+/* Build a Responses API request for OpenRouter (Responses API style).
+   OpenRouter supports tool_choice "required" but takes plain (non-strict)
+   tool schemas, and yosh sends no web_search tool through OpenRouter.
+   Encrypted reasoning content is requested only when the ~/.yoconf
+   `include_reasoning 1` directive is set: OpenRouter forwards encrypted
+   reasoning for only some models, and sending "include" for the rest can
+   return HTTP 400. */
+static char *
+yo_build_openrouter_responses_request(cJSON *messages,
+                                      const char **url_out, struct curl_slist **headers_out,
+                                      long *timeout_out)
+{
+    return yo_build_responses_api_request_ex(messages, url_out, headers_out, timeout_out,
+                                             YO_RESPONSES_FLAG_TOOL_CHOICE_REQUIRED
+                                             | (yo_include_reasoning == 1
+                                                ? YO_RESPONSES_FLAG_INCLUDE_REASONING : 0),
+                                             NULL, 0);
+}
+
 /* Build Chat Completions API request body, URL, and headers.
    Uses the Chat Completions API format with `messages` array.
    Unlike the Responses API, this uses role-based messages.
+   include_tools: 1 for normal requests; 0 for tools-less requests (the
+   context-compaction summarizer) — no tools array is sent.
+   system_override: when non-NULL, replaces the Kimi-tuned system prompt.
+   max_output_override: when > 0, overrides yo_get_max_output_tokens().
    Returns malloc'd request body string.  Sets *url_out and *headers_out.
    Caller must free the request body and the headers. */
 static char *
 yo_build_chat_completions_api_request(cJSON *messages,
                       const char **url_out, struct curl_slist **headers_out,
-                      long *timeout_out)
+                      long *timeout_out,
+                      int include_tools,
+                      const char *system_override,
+                      long max_output_override)
 {
     cJSON *request_json;
     cJSON *tools;
@@ -3834,19 +5362,52 @@ yo_build_chat_completions_api_request(cJSON *messages,
     char auth_header[300];
     struct curl_slist *headers = NULL;
     char *system_prompt;
+    long max_output = (max_output_override > 0) ? max_output_override
+                                                : yo_get_max_output_tokens();
 
     ZASSERT(yo_model);
 
+    /* Prompt caching: nothing is sent for Chat Completions API providers.
+       Kimi, DeepSeek, Qwen, z.ai, and OpenRouter(chat) get automatic
+       server-side prompt caching from their vendors (prefix cache keyed on
+       the request itself); none of these vendors accepts cache-control
+       request parameters, so the request shape is left untouched. */
+
     /* Build tools array for Chat Completions API providers (no strict mode, no additionalProperties) */
-    tools = yo_build_tools_chat_completions_api();
+    tools = include_tools ? yo_build_tools_chat_completions_api() : NULL;
 
     /* Build system instructions */
-    system_prompt = yo_build_kimi_tuned_prompt(yo_provider_to_string(yo_provider));
+    if (system_override)
+        system_prompt = strdup(system_override);
+    else
+        system_prompt = yo_build_kimi_tuned_prompt(yo_provider_to_string(yo_provider));
 
     /* Build request JSON for Chat Completions API */
     request_json = cJSON_CreateObject();
     cJSON_AddStringToObject(request_json, "model", yo_model);
-    cJSON_AddNumberToObject(request_json, "max_tokens", YO_MAX_TOKENS);
+    cJSON_AddNumberToObject(request_json, "max_tokens", max_output);
+
+    /* Thinking/reasoning parameters, when the user configured a thinking level.
+       Mirrors brainstorm-3 openai_client.rb: z.ai uses the native `thinking`
+       property (with clear_thinking:false and reasoning_effort for GLM-5.2+),
+       while Kimi/DeepSeek/Qwen take `reasoning_effort`. */
+    if (yo_thinking_enabled())
+    {
+        if (yo_provider == YO_PROVIDER_ZAI)
+        {
+            cJSON *thinking = cJSON_CreateObject();
+            cJSON_AddStringToObject(thinking, "type", "enabled");
+            cJSON_AddFalseToObject(thinking, "clear_thinking");
+            cJSON_AddItemToObject(request_json, "thinking", thinking);
+            if (yo_zai_supports_reasoning_effort(yo_model))
+                cJSON_AddStringToObject(request_json, "reasoning_effort", "max");
+        }
+        else
+        {
+            cJSON_AddStringToObject(request_json, "reasoning_effort",
+                                    yo_thinking_level_string(yo_config_thinking));
+        }
+    }
 
     /* Build messages array with system prompt as first message */
     {
@@ -3925,8 +5486,9 @@ yo_build_chat_completions_api_request(cJSON *messages,
     
     free(system_prompt);
 
-    /* Add tools array (takes ownership) */
-    cJSON_AddItemToObject(request_json, "tools", tools);
+    /* Add tools array (takes ownership) — omitted for tools-less requests */
+    if (tools)
+        cJSON_AddItemToObject(request_json, "tools", tools);
 
     /* Note: Chat Completions API providers don't support tool_choice field, so we omit it */
 
@@ -3937,6 +5499,8 @@ yo_build_chat_completions_api_request(cJSON *messages,
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", yo_api_key);
     headers = curl_slist_append(headers, auth_header);
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (yo_provider == YO_PROVIDER_OPENROUTER)
+        headers = curl_slist_append(headers, "X-Title: yosh");
 
     /* Build URL: use base_url if set, otherwise default */
     if (yo_base_url)
@@ -4134,15 +5698,79 @@ yo_parse_chat_completions_api_response(const char *response_data)
     return result;
 }
 
+/* Collect replayable reasoning items from a Responses API output[] array.
+   Per the Meta Muse Responses protocol ("Reasoning items in multi-turn
+   input"), output[] can contain {"type":"reasoning","id":"rs_...",
+   "summary":[...],"encrypted_content":"..."} items.  Items without a
+   non-empty encrypted_content cannot be replayed and are dropped.
+   Returns a new cJSON array of shallow-cleaned items
+   {"type":"reasoning","id":<string or omitted>,"summary":<array, [] when
+   absent>,"encrypted_content":<string>} — the items are never rewritten
+   beyond this shallow cleaning (replaying is opaque).  Returns NULL when no
+   replayable items were found.  Caller must cJSON_Delete the result. */
+static cJSON *
+yo_collect_reasoning_items(cJSON *output_array)
+{
+    cJSON *item;
+    cJSON *result = NULL;
+
+    cJSON_ArrayForEach(item, output_array)
+    {
+        cJSON *type_item = cJSON_GetObjectItem(item, "type");
+        cJSON *encrypted_item;
+        cJSON *clean;
+
+        if (!type_item || !cJSON_IsString(type_item)
+            || strcmp(type_item->valuestring, "reasoning") != 0)
+            continue;
+
+        encrypted_item = cJSON_GetObjectItem(item, "encrypted_content");
+        if (!encrypted_item || !cJSON_IsString(encrypted_item)
+            || !encrypted_item->valuestring || !*encrypted_item->valuestring)
+            continue;  /* cannot be replayed — always droppable */
+
+        clean = cJSON_CreateObject();
+        cJSON_AddStringToObject(clean, "type", "reasoning");
+
+        {
+            cJSON *id_item = cJSON_GetObjectItem(item, "id");
+            if (id_item && cJSON_IsString(id_item) && id_item->valuestring)
+                cJSON_AddStringToObject(clean, "id", id_item->valuestring);
+            /* id is optional — omit when the provider did not send one */
+        }
+
+        {
+            cJSON *summary = cJSON_GetObjectItem(item, "summary");
+            if (summary && cJSON_IsArray(summary))
+                cJSON_AddItemToObject(clean, "summary", cJSON_Duplicate(summary, 1));
+            else
+                cJSON_AddItemToObject(clean, "summary", cJSON_CreateArray());
+            /* summary is required in replayed items; may be empty */
+        }
+
+        cJSON_AddStringToObject(clean, "encrypted_content", encrypted_item->valuestring);
+
+        if (!result)
+            result = cJSON_CreateArray();
+        cJSON_AddItemToArray(result, clean);
+    }
+
+    return result;
+}
+
 /* Parse Responses API output → normalized tool_use cJSON.
    Extracts function_call items from the output[] array.
    Falls back to message items for text content.
+   Reasoning items with encrypted_content are collected onto the normalized
+   tool_use under "reasoning_items" (a JSON array) so they can be replayed on
+   later turns.
    Caller must free the returned cJSON with cJSON_Delete. */
 static cJSON *
 yo_parse_responses_api_response(const char *response_data)
 {
     cJSON *response_json;
     cJSON *output_array;
+    cJSON *reasoning_items = NULL;
     cJSON *result = NULL;
 
     response_json = cJSON_Parse(response_data);
@@ -4185,6 +5813,9 @@ yo_parse_responses_api_response(const char *response_data)
         cJSON_Delete(response_json);
         return NULL;
     }
+
+    /* Collect ALL replayable reasoning items from output[] */
+    reasoning_items = yo_collect_reasoning_items(output_array);
 
     /* Find first function_call item in the output array */
     {
@@ -4265,6 +5896,12 @@ yo_parse_responses_api_response(const char *response_data)
         }
     }
 
+    /* Attach replayable reasoning items (if any) to the normalized tool_use */
+    if (result && reasoning_items && cJSON_GetArraySize(reasoning_items) > 0)
+        cJSON_AddItemToObject(result, "reasoning_items", reasoning_items);
+    else if (reasoning_items)
+        cJSON_Delete(reasoning_items);
+
     cJSON_Delete(response_json);
     return result;
 }
@@ -4277,6 +5914,7 @@ yo_parse_responses_api_response(const char *response_data)
 
 /* Forward declaration for retry logic */
 static cJSON *yo_call_api_with_messages_internal(cJSON *messages, int is_retry);
+static cJSON *yo_call_api_with_messages_internal_ex(cJSON *messages, int is_retry, int no_tools);
 
 /* Internal function to call LLM API with pre-built messages array.
    Messages must be in the current provider's native format.
@@ -4291,25 +5929,97 @@ yo_call_api_with_messages(cJSON *messages)
 static cJSON *
 yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
 {
+    return yo_call_api_with_messages_internal_ex(messages, is_retry, 0);
+}
+
+/* Compaction summarizer call: like yo_call_api_with_messages_internal but the
+   request is built WITHOUT tools/tool_choice, with a minimal summarizer
+   system prompt, and with the max output tokens capped at
+   YO_SUMMARY_MAX_OUTPUT_TOKENS (a 300-word summary needs only a few hundred
+   tokens, and a giant configured max_output_tokens must not let a runaway
+   summary eat the window space compaction just freed — the cap is
+   min(2048, the configured/resolved max)).  The reply is parsed with the
+   normal provider parsers, which wrap plain text as a synthetic chat
+   tool_use.  Messages are consumed. */
+static cJSON *
+yo_call_api_summarize(cJSON *messages)
+{
+    return yo_call_api_with_messages_internal_ex(messages, 0, 1);
+}
+
+static cJSON *
+yo_call_api_with_messages_internal_ex(cJSON *messages, int is_retry, int no_tools)
+{
     char *url;
     struct curl_slist *headers = NULL;
     long timeout;
     char *request_body;
     char *response_data;
     cJSON *result;
+    long max_output_override = 0;
+
+    if (no_tools)
+    {
+        max_output_override = yo_get_max_output_tokens();
+        if (max_output_override <= 0 || max_output_override > YO_SUMMARY_MAX_OUTPUT_TOKENS)
+            max_output_override = YO_SUMMARY_MAX_OUTPUT_TOKENS;
+    }
 
     /* Provider-specific request building */
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (no_tools)
+    {
+        /* Context-compaction summarizer: no tools, no tool_choice, minimal
+           system prompt, capped output.  Keeps the provider's usual URL,
+           headers, and cache-request shape (prompt_cache_key, store:false,
+           Anthropic system/final-message cache breakpoints). */
+        if (yo_provider_uses_responses_api(yo_provider))
+        {
+            /* OpenAI, Meta, and OpenRouter with `openrouter_api responses`.
+               Meta's in-memory cache retention flag stays off: the
+               summarizer is a one-off request. */
+            request_body = yo_build_responses_api_request_ex(messages,
+                (const char **)&url, &headers, &timeout,
+                YO_RESPONSES_FLAG_NO_TOOLS,
+                YO_SUMMARIZER_SYSTEM_PROMPT, max_output_override);
+        }
+        else if (yo_provider_uses_chat_completions_api(yo_provider))
+        {
+            /* Kimi, DeepSeek, Qwen, z.ai, and OpenRouter with `openrouter_api chat` */
+            request_body = yo_build_chat_completions_api_request(messages,
+                (const char **)&url, &headers, &timeout,
+                0, YO_SUMMARIZER_SYSTEM_PROMPT, max_output_override);
+        }
+        else
+        {
+            /* Anthropic Messages API style */
+            request_body = yo_build_anthropic_request_ex(messages,
+                (const char **)&url, &headers, &timeout,
+                0, YO_SUMMARIZER_SYSTEM_PROMPT, max_output_override);
+        }
+    }
+    else if (yo_provider == YO_PROVIDER_OPENAI)
     {
         request_body = yo_build_responses_api_request(messages, (const char **)&url, &headers, &timeout);
     }
+    else if (yo_provider == YO_PROVIDER_META)
+    {
+        request_body = yo_build_meta_request(messages, (const char **)&url, &headers, &timeout);
+    }
     else if (yo_provider_uses_chat_completions_api(yo_provider))
     {
-        request_body = yo_build_chat_completions_api_request(messages, (const char **)&url, &headers, &timeout);
+        /* Kimi, DeepSeek, Qwen, z.ai, and OpenRouter with `openrouter_api chat` */
+        request_body = yo_build_chat_completions_api_request(messages, (const char **)&url, &headers, &timeout,
+                                                             1, NULL, 0);
+    }
+    else if (yo_provider == YO_PROVIDER_OPENROUTER)
+    {
+        /* OpenRouter with `openrouter_api responses` */
+        request_body = yo_build_openrouter_responses_request(messages, (const char **)&url, &headers, &timeout);
     }
     else
     {
-        request_body = yo_build_anthropic_request(messages, (const char **)&url, &headers, &timeout);
+        request_body = yo_build_anthropic_request_ex(messages, (const char **)&url, &headers, &timeout,
+                                                     1, NULL, 0);
     }
     /* Note: messages is now owned by the request JSON and freed with it */
 
@@ -4349,13 +6059,17 @@ yo_call_api_with_messages_internal(cJSON *messages, int is_retry)
     /* Provider-specific response parsing */
     if (yo_provider_uses_chat_completions_api(yo_provider))
     {
+        /* Kimi, DeepSeek, Qwen, z.ai, and OpenRouter with `openrouter_api chat` */
         result = yo_parse_chat_completions_api_response(response_data);
         free(response_data);
         free(url);
         return result;
     }
-    else if (yo_provider == YO_PROVIDER_OPENAI)
+    else if (yo_provider == YO_PROVIDER_OPENAI
+             || yo_provider == YO_PROVIDER_META
+             || yo_provider == YO_PROVIDER_OPENROUTER)
     {
+        /* OpenAI, Meta, and OpenRouter with `openrouter_api responses` */
         result = yo_parse_responses_api_response(response_data);
         free(response_data);
         free(url);
@@ -4409,11 +6123,13 @@ static cJSON *
 yo_call_api_with_scrollback(const char *query,
                             const char *scrollback_request, const char *scrollback_data,
                             const char *scrollback_tool_id,
-                            const char *reasoning_content)
+                            const char *reasoning_content,
+                            const char *reasoning_items_json)
 {
     cJSON *messages = yo_build_messages_with_scrollback(query, scrollback_request,
                                                         scrollback_data, scrollback_tool_id,
-                                                        reasoning_content);
+                                                        reasoning_content,
+                                                        reasoning_items_json);
     return yo_call_api_with_messages(messages);
 }
 
@@ -4458,7 +6174,17 @@ yo_retry_for_explanation(const char *query, cJSON *original_tool_use)
         cJSON *input_copy = input_item ? cJSON_Duplicate(input_item, 1) : cJSON_CreateObject();
         cJSON *reasoning_item = cJSON_GetObjectItem(original_tool_use, "reasoning_content");
         const char *reasoning = (reasoning_item && cJSON_IsString(reasoning_item)) ? reasoning_item->valuestring : NULL;
-        yo_msg_add_tool_use(messages, tool_use_id, tool_name, input_copy, reasoning);
+        cJSON *reasoning_items_item = cJSON_GetObjectItem(original_tool_use, "reasoning_items");
+        char *reasoning_items_json = NULL;
+
+        if (reasoning_items_item && cJSON_IsArray(reasoning_items_item)
+            && cJSON_GetArraySize(reasoning_items_item) > 0)
+            reasoning_items_json = cJSON_PrintUnformatted(reasoning_items_item);
+
+        yo_msg_add_tool_use(messages, tool_use_id, tool_name, input_copy, reasoning,
+                            reasoning_items_json);
+        if (reasoning_items_json)
+            free(reasoning_items_json);
         cJSON_Delete(input_copy);
     }
 
@@ -4511,6 +6237,7 @@ yo_response_free(yo_response_t *resp)
     if (resp->tool_use_id)  { free(resp->tool_use_id);  resp->tool_use_id = NULL; }
     if (resp->raw_tool_use) { cJSON_Delete(resp->raw_tool_use); resp->raw_tool_use = NULL; }
     if (resp->reasoning_content) { free(resp->reasoning_content); resp->reasoning_content = NULL; }
+    if (resp->reasoning_items_json) { free(resp->reasoning_items_json); resp->reasoning_items_json = NULL; }
     resp->type = YO_RESPONSE_ERROR;
     resp->pending = 0;
 }
@@ -4542,6 +6269,7 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
     resp->tool_use_id = NULL;
     resp->pending = 0;
     resp->reasoning_content = NULL;
+    resp->reasoning_items_json = NULL;
     /* Note: resp->raw_tool_use is NOT touched here - caller manages it */
 
     if (!tool_use)
@@ -4564,6 +6292,16 @@ yo_parse_response(cJSON *tool_use, yo_response_t *resp)
         cJSON *reasoning_item = cJSON_GetObjectItem(tool_use, "reasoning_content");
         if (reasoning_item && cJSON_IsString(reasoning_item) && reasoning_item->valuestring)
             resp->reasoning_content = strdup(reasoning_item->valuestring);
+    }
+
+    /* Extract replayable reasoning items if present (Responses API reasoning
+       replay).  The normalized tool_use carries them as a JSON array under
+       "reasoning_items"; serialize for storage/threading. */
+    {
+        cJSON *reasoning_items = cJSON_GetObjectItem(tool_use, "reasoning_items");
+        if (reasoning_items && cJSON_IsArray(reasoning_items)
+            && cJSON_GetArraySize(reasoning_items) > 0)
+            resp->reasoning_items_json = cJSON_PrintUnformatted(reasoning_items);
     }
 
     /* Extract input object */
@@ -5126,10 +6864,15 @@ yo_print_error(const char *msg, ...)
     va_end(args);
 }
 
+/* Print the thinking indicator: "[<pct>%] Thinking..." -- pct is the
+   estimated request size as a percentage of the effective context window.
+   Same chat_prefix/color styling as chat output; no newline (the line is
+   erased by yo_clear_thinking). */
 static void
-yo_print_thinking(void)
+yo_print_thinking(int pct)
 {
-    fprintf(rl_outstream, "%s%sThinking...%s", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+    fprintf(rl_outstream, "%s%s[%d%%] Thinking...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(), pct, yo_get_color_reset());
     fflush(rl_outstream);
 }
 
@@ -5158,7 +6901,7 @@ yo_report_parse_error(cJSON *tool_use)
 /* **************************************************************** */
 
 static void
-yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content)
+yo_history_add(const char *query, yo_response_type_t type, const char *response, const char *tool_use_id, int executed, int pending, const char *reasoning_content, const char *reasoning_items_json)
 {
     /* Prune if necessary */
     yo_history_prune();
@@ -5182,6 +6925,7 @@ yo_history_add(const char *query, yo_response_type_t type, const char *response,
     yo_history[yo_history_count].executed = executed;
     yo_history[yo_history_count].pending = pending;
     yo_history[yo_history_count].reasoning_content = reasoning_content ? strdup(reasoning_content) : NULL;
+    yo_history[yo_history_count].reasoning_items_json = reasoning_items_json ? strdup(reasoning_items_json) : NULL;
     yo_history_count++;
 }
 
@@ -5200,27 +6944,16 @@ yo_history_prune(void)
             free(yo_history[0].tool_use_id);
         if (yo_history[0].reasoning_content)
             free(yo_history[0].reasoning_content);
+        if (yo_history[0].reasoning_items_json)
+            free(yo_history[0].reasoning_items_json);
 
         memmove(&yo_history[0], &yo_history[1], (yo_history_count - 1) * sizeof(yo_exchange_t));
         yo_history_count--;
     }
 
-    /* Check token budget */
-    while (yo_history_count > 0 && yo_estimate_tokens() > yo_token_budget)
-    {
-        /* Remove oldest entry */
-        if (yo_history[0].query)
-            free(yo_history[0].query);
-        if (yo_history[0].response)
-            free(yo_history[0].response);
-        if (yo_history[0].tool_use_id)
-            free(yo_history[0].tool_use_id);
-        if (yo_history[0].reasoning_content)
-            free(yo_history[0].reasoning_content);
-
-        memmove(&yo_history[0], &yo_history[1], (yo_history_count - 1) * sizeof(yo_exchange_t));
-        yo_history_count--;
-    }
+    /* Note: the old token-budget round-robin prune was removed — history
+       size is now managed by context compaction (yo_compact_history), which
+       summarizes the old part of the conversation instead of discarding it. */
 }
 
 static int
@@ -5241,19 +6974,76 @@ yo_estimate_tokens(void)
     return total / 4;
 }
 
+/* Rough estimate (4 chars per token, same as yo_estimate_tokens) of the size
+   of a full request for `query`: the session history plus the system prompt,
+   the query itself, and a fixed slack of 64 tokens for the JSON structure
+   (roles, tool_use wrappers, tool results, etc.). */
+static int
+yo_estimate_request_tokens(const char *query)
+{
+    int total = yo_estimate_tokens();
+
+    if (yo_system_prompt)
+        total += (int)(strlen(yo_system_prompt) / 4);
+    if (query)
+        total += (int)(strlen(query) / 4);
+
+    return total + 64;
+}
+
+/* Per-entry token estimate, consistent with yo_estimate_tokens (4 chars per
+   token over the query and response strings). */
+static int
+yo_history_entry_tokens(int idx)
+{
+    int total = 0;
+
+    if (yo_history[idx].query)
+        total += (int)strlen(yo_history[idx].query);
+    if (yo_history[idx].response)
+        total += (int)strlen(yo_history[idx].response);
+
+    return total / 4;
+}
+
 /* Add an assistant message with a single tool use to the messages array.
    For Anthropic: content array with tool_use block.
-   For OpenAI Responses API: flat function_call item, no role wrapper.
-   For Chat Completions API: assistant message with tool_calls array.
+   For Responses API providers (OpenAI, Meta, OpenRouter): replayed reasoning
+   items (when reasoning_items_json is set) followed by a flat function_call
+   item, no role wrapper.  Per the Meta Muse Responses protocol ("Reasoning
+   items in multi-turn input"), every reasoning input item must be followed by
+   an assistant message or a function_call item before the next
+   user/system/developer message — the function_call added here satisfies
+   that.  Reasoning items are opaque: they are replayed verbatim (whole item
+   or dropped), never rewritten.
+   For Chat Completions API providers (Kimi, DeepSeek, Qwen, z.ai, OpenRouter):
+   assistant message with tool_calls array; reasoning_items_json is ignored
+   (Kimi's reasoning_content string handling is separate).
    The input object is NOT consumed (it is duplicated). */
 static void
 yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
                     const char *tool_name, cJSON *input,
-                    const char *reasoning_content)
+                    const char *reasoning_content,
+                    const char *reasoning_items_json)
 {
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider_uses_responses_api(yo_provider))
     {
-        /* OpenAI Responses API: flat function_call item, no role wrapper */
+        /* Responses API: replay the assistant's reasoning items before the
+           function_call item */
+        if (reasoning_items_json && *reasoning_items_json)
+        {
+            cJSON *items = cJSON_Parse(reasoning_items_json);
+            if (items && cJSON_IsArray(items))
+            {
+                cJSON *item;
+                cJSON_ArrayForEach(item, items)
+                    cJSON_AddItemToArray(messages, cJSON_Duplicate(item, 1));
+            }
+            if (items)
+                cJSON_Delete(items);
+        }
+
+        /* Responses API: flat function_call item, no role wrapper */
         cJSON *msg = cJSON_CreateObject();
         char *args;
 
@@ -5314,17 +7104,17 @@ yo_msg_add_tool_use(cJSON *messages, const char *tool_use_id,
 
 /* Add a tool result message to the messages array.
    For Anthropic: user message with tool_result content block.
-   For OpenAI Responses API: function_call_output item.
-   For Chat Completions API: tool message with tool_call_id. */
+   For Responses API providers: function_call_output item.
+   For Chat Completions API providers: tool message with tool_call_id. */
 static void
 yo_msg_add_tool_result(cJSON *messages, const char *tool_use_id,
                        const char *result_content)
 {
     cJSON *msg = cJSON_CreateObject();
 
-    if (yo_provider == YO_PROVIDER_OPENAI)
+    if (yo_provider_uses_responses_api(yo_provider))
     {
-        /* OpenAI Responses API: function_call_output item */
+        /* Responses API: function_call_output item */
         cJSON_AddStringToObject(msg, "type", "function_call_output");
         cJSON_AddStringToObject(msg, "call_id", tool_use_id);
         cJSON_AddStringToObject(msg, "output", result_content);
@@ -5373,14 +7163,21 @@ yo_build_history_tool_input(int idx)
     return input;
 }
 
-/* Shared helper: add session history entries to a messages array.
+/* Shared helper: add session history entries [from, to) to a messages array.
    Uses yo_msg_add_tool_use / yo_msg_add_tool_result, which produce
-   provider-native format based on yo_provider. */
+   provider-native format based on yo_provider.  (yo_add_history_to_messages
+   adds the whole history.  Context compaction does NOT use this helper: the
+   summarizer request is tools-less, so its history is flattened to a plain
+   text transcript instead — see yo_build_summary_transcript.) */
 static void
-yo_add_history_to_messages(cJSON *messages)
+yo_add_history_range_to_messages(cJSON *messages, int from, int to)
 {
     int i;
-    for (i = 0; i < yo_history_count; i++)
+
+    if (to > yo_history_count)
+        to = yo_history_count;
+
+    for (i = from; i < to; i++)
     {
         cJSON *msg;
         cJSON *input;
@@ -5395,7 +7192,8 @@ yo_add_history_to_messages(cJSON *messages)
         input = yo_build_history_tool_input(i);
         yo_msg_add_tool_use(messages, yo_history[i].tool_use_id,
                             yo_response_type_to_string(yo_history[i].response_type),
-                            input, yo_history[i].reasoning_content);
+                            input, yo_history[i].reasoning_content,
+                            yo_history[i].reasoning_items_json);
         cJSON_Delete(input);
 
         /* Tool result (provider-native) */
@@ -5409,6 +7207,320 @@ yo_add_history_to_messages(cJSON *messages)
             yo_msg_add_tool_result(messages, yo_history[i].tool_use_id, "Acknowledged");
         }
     }
+}
+
+static void
+yo_add_history_to_messages(cJSON *messages)
+{
+    yo_add_history_range_to_messages(messages, 0, yo_history_count);
+}
+
+/* Render one history entry's assistant text for the summary transcript:
+   "Suggested command: <cmd> (the user <executed|did not execute> it)" for
+   command responses, the raw response text otherwise (reasoning
+   content/items are deliberately left out — they are not needed for a
+   summary).  Returns a malloc'd string, or NULL on allocation failure. */
+static char *
+yo_summary_assistant_text(int idx)
+{
+    const char *resp = yo_history[idx].response ? yo_history[idx].response : "";
+
+    if (yo_history[idx].response_type == YO_RESPONSE_COMMAND)
+    {
+        char *out = NULL;
+
+        if (asprintf(&out, "Suggested command: %s (the user %s it)",
+                     resp,
+                     yo_history[idx].executed ? "executed" : "did not execute") < 0)
+            return NULL;
+        return out;
+    }
+
+    return strdup(resp);
+}
+
+/* Build a plain-text transcript of the session history entries [from, to) for
+   the compaction summarizer request.  The summarizer is sent WITHOUT a tools
+   array, so the old conversation cannot be replayed as native tool_use /
+   tool_result blocks (Anthropic rejects tool blocks that reference tools the
+   request does not define, and Responses-style servers can reject unpaired or
+   unregistered function calls).  Following the brainstorm-3 reference
+   implementation (format_messages_for_summary), each entry is flattened to
+   two plain text lines, all joined by blank lines:
+
+     [USER] <query>
+
+     [ASSISTANT] <assistant text>
+
+   Returns a malloc'd string ("" when the range is empty), or NULL on
+   allocation failure. */
+static char *
+yo_build_summary_transcript(int from, int to)
+{
+    char *transcript = NULL;
+    size_t len = 0;
+    int i;
+
+    if (to > yo_history_count)
+        to = yo_history_count;
+
+    for (i = from; i < to; i++)
+    {
+        const char *query = yo_history[i].query ? yo_history[i].query : "";
+        char *assistant = yo_summary_assistant_text(i);
+        char *user_line = NULL;
+        char *asst_line = NULL;
+        size_t ulen, alen, sep;
+        char *grown;
+
+        if (!assistant)
+        {
+            free(transcript);
+            return NULL;
+        }
+
+        if (asprintf(&user_line, "[USER] %s", query) < 0)
+        {
+            free(assistant);
+            free(transcript);
+            return NULL;
+        }
+        if (asprintf(&asst_line, "[ASSISTANT] %s", assistant) < 0)
+        {
+            free(user_line);
+            free(assistant);
+            free(transcript);
+            return NULL;
+        }
+        free(assistant);
+
+        /* Append both lines, separated from any previous content by a blank
+           line (the transcript is one flat list of "[ROLE] text" lines). */
+        ulen = strlen(user_line);
+        alen = strlen(asst_line);
+        sep = transcript ? 2 : 0;
+        grown = realloc(transcript, len + sep + 2 + ulen + 2 + alen + 1);
+        if (!grown)
+        {
+            free(user_line);
+            free(asst_line);
+            free(transcript);
+            return NULL;
+        }
+        transcript = grown;
+        if (sep)
+        {
+            memcpy(transcript + len, "\n\n", 2);
+            len += 2;
+        }
+        memcpy(transcript + len, user_line, ulen);
+        len += ulen;
+        memcpy(transcript + len, "\n\n", 2);
+        len += 2;
+        memcpy(transcript + len, asst_line, alen);
+        len += alen;
+        transcript[len] = 0;
+
+        free(user_line);
+        free(asst_line);
+    }
+
+    if (!transcript)
+        transcript = strdup("");
+
+    return transcript;
+}
+
+/* **************************************************************** */
+/*                                                                  */
+/*                     Context Compaction                           */
+/*                                                                  */
+/* **************************************************************** */
+
+/* Replace the old part of the session history with a single LLM-generated
+   summary exchange (context compaction).
+
+   Trigger: yo_call_llm calls this when the estimated request size exceeds
+   half of the effective context window (see yo_get_effective_context_window).
+
+   Protocol:
+     - Requires at least 2 history entries totaling at least
+       YO_COMPACTION_MIN_TOKENS estimated tokens; otherwise nothing happens.
+     - Split point: the first YO_COMPACTION_OLD_PART_PCT% (75%) of the
+       estimated history tokens is the "old" part; the remaining ~25% (at
+       least one entry) is kept verbatim.
+     - The old part is flattened to a plain-text transcript
+       (yo_build_summary_transcript: "[USER] <query>" / "[ASSISTANT]
+       <content>" lines) and sent as ONE user message (the YO_COMPACTION_PROMPT
+       instruction followed by the transcript) to a tools-less summarization
+       request (yo_call_api_summarize: no tools array, no tool_choice, minimal
+       system prompt, output capped at YO_SUMMARY_MAX_OUTPUT_TOKENS).  The
+       transcript must be plain text because the request defines no tools:
+       replaying native tool_use/tool_result blocks would reference undefined
+       tools and be rejected by the API.
+     - The plain-text summary is extracted from the synthetic chat tool_use
+       the provider parsers produce for text replies.
+     - The history is rebuilt as ONE summary exchange (query
+       YO_COMPACTION_QUERY, YO_RESPONSE_CHAT with the summary text,
+       tool_use_id YO_COMPACTION_TOOL_USE_ID, executed=1) followed by the
+       kept entries.  Later requests replay it as: user "[context
+       compacted]..." → assistant chat tool_use → tool_result "Acknowledged".
+
+   Display: prints "Compacting..." (chat_prefix/color styling, no newline)
+   when it actually attempts the summarization; the caller redraws the
+   "[N%] Thinking..." usage indicator afterwards.
+
+   Returns 1 if the history was compacted, 0 if not (too little history, or
+   the summarization call failed/was cancelled — errors are printed by the
+   HTTP layer; the history is left untouched and the caller proceeds
+   best-effort without compaction). */
+static int
+yo_compact_history(void)
+{
+    int total, split, i, keep, new_count;
+    long acc, target;
+    cJSON *messages, *msg, *result, *input, *response_item;
+    yo_exchange_t *new_history;
+    char *summary;
+
+    /* Need something worth summarizing. */
+    if (yo_history_count < 2)
+        return 0;
+
+    total = yo_estimate_tokens();
+    if (total < YO_COMPACTION_MIN_TOKENS)
+        return 0;
+
+    yo_clear_thinking();
+    fprintf(rl_outstream, "%s%sCompacting...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+    fflush(rl_outstream);
+
+    /* Split point: walk the entries accumulating per-entry tokens until the
+       accumulated amount exceeds 75% of the total; the entries before that
+       point are the old (summarized) part.  If the 75% point never arrives
+       (the last entry alone holds the excess), everything but the last
+       entry is summarized.  Clamp to [1, count - 1] so both parts are
+       non-empty. */
+    target = (long)total * YO_COMPACTION_OLD_PART_PCT / 100;
+    acc = 0;
+    split = yo_history_count - 1;
+    for (i = 0; i < yo_history_count; i++)
+    {
+        if (acc > target)
+        {
+            split = i;
+            break;
+        }
+        acc += yo_history_entry_tokens(i);
+    }
+    if (split < 1)
+        split = 1;
+    if (split > yo_history_count - 1)
+        split = yo_history_count - 1;
+
+    /* Build the summarization request: ONE user message holding the
+       [compaction] instruction followed by the flattened transcript of the
+       old part of the history.  No tools exist in this request, so the old
+       conversation is flattened to plain text instead of being replayed as
+       native tool_use/tool_result blocks (the request builder still marks the
+       Anthropic system/final-message cache breakpoints on this message). */
+    {
+        char *transcript = yo_build_summary_transcript(0, split);
+        char *content = NULL;
+
+        if (!transcript)
+            return 0;
+
+        if (asprintf(&content, "%s\n\n%s", YO_COMPACTION_PROMPT, transcript) < 0)
+        {
+            free(transcript);
+            return 0;
+        }
+        free(transcript);
+
+        messages = cJSON_CreateArray();
+        msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(msg, "role", "user");
+        cJSON_AddStringToObject(msg, "content", content);
+        cJSON_AddItemToArray(messages, msg);
+        free(content);
+    }
+
+    result = yo_call_api_summarize(messages);  /* consumes messages */
+    if (!result)
+        return 0;  /* HTTP error/cancel already printed; caller redraws indicator */
+
+    /* Extract the summary text from the normalized tool_use.  Text replies
+       arrive as a synthetic chat tool_use with input.response set; anything
+       else (e.g. a stray real tool_use) is not usable as a summary. */
+    summary = NULL;
+    input = cJSON_GetObjectItem(result, "input");
+    response_item = input ? cJSON_GetObjectItem(input, "response") : NULL;
+    if (response_item && cJSON_IsString(response_item)
+        && response_item->valuestring && *response_item->valuestring)
+        summary = strdup(response_item->valuestring);
+    cJSON_Delete(result);
+
+    if (!summary)
+        return 0;
+
+    /* Rebuild the history: one summary exchange followed by the kept
+       entries [split, count).  The kept entries' strings are transferred
+       (shallow struct copy) into the new array; the old-part entries are
+       freed along with the old array. */
+    keep = yo_history_count - split;
+    new_count = 1 + keep;
+    new_history = malloc((size_t)new_count * sizeof(yo_exchange_t));
+    if (!new_history)
+    {
+        free(summary);
+        return 0;
+    }
+
+    new_history[0].query = strdup(YO_COMPACTION_QUERY);
+    new_history[0].response_type = YO_RESPONSE_CHAT;
+    new_history[0].response = summary;
+    new_history[0].tool_use_id = strdup(YO_COMPACTION_TOOL_USE_ID);
+    new_history[0].executed = 1;
+    new_history[0].pending = 0;
+    new_history[0].reasoning_content = NULL;
+    new_history[0].reasoning_items_json = NULL;
+
+    if (!new_history[0].query || !new_history[0].tool_use_id)
+    {
+        if (new_history[0].query)
+            free(new_history[0].query);
+        free(summary);
+        if (new_history[0].tool_use_id)
+            free(new_history[0].tool_use_id);
+        free(new_history);
+        return 0;
+    }
+
+    for (i = 0; i < keep; i++)
+        new_history[1 + i] = yo_history[split + i];
+
+    for (i = 0; i < split; i++)
+    {
+        if (yo_history[i].query)
+            free(yo_history[i].query);
+        if (yo_history[i].response)
+            free(yo_history[i].response);
+        if (yo_history[i].tool_use_id)
+            free(yo_history[i].tool_use_id);
+        if (yo_history[i].reasoning_content)
+            free(yo_history[i].reasoning_content);
+        if (yo_history[i].reasoning_items_json)
+            free(yo_history[i].reasoning_items_json);
+    }
+    free(yo_history);
+
+    yo_history = new_history;
+    yo_history_count = new_count;
+    yo_history_capacity = new_count;
+
+    return 1;
 }
 
 static cJSON *
@@ -5432,7 +7544,8 @@ yo_build_messages(const char *current_query)
 static cJSON *
 yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
                                   const char *scrollback_data, const char *scrollback_tool_id,
-                                  const char *reasoning_content)
+                                  const char *reasoning_content,
+                                  const char *reasoning_items_json)
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
@@ -5451,11 +7564,13 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
-    /* Add assistant's scrollback tool_use (provider-native) */
+    /* Add assistant's scrollback tool_use (provider-native; Responses API
+       providers also replay this turn's reasoning items) */
     {
         cJSON *input = cJSON_CreateObject();
         cJSON_AddNumberToObject(input, "lines", lines_requested);
-        yo_msg_add_tool_use(messages, scrollback_tool_id, "scrollback", input, reasoning_content);
+        yo_msg_add_tool_use(messages, scrollback_tool_id, "scrollback", input,
+                            reasoning_content, reasoning_items_json);
         cJSON_Delete(input);
     }
 
@@ -5471,9 +7586,9 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
                  clean);
         free(clean);
     }
-    else if (yo_provider == YO_PROVIDER_OPENAI)
+    else if (yo_provider_uses_responses_api(yo_provider))
     {
-        /* OpenAI gets sanitized scrollback without the temporality reminder */
+        /* Responses API providers get sanitized scrollback without the temporality reminder */
         char *clean = yo_sanitize_scrollback(scrollback_data);
         asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped):\n```\n%s\n```",
@@ -5497,7 +7612,8 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 static cJSON *
 yo_build_messages_with_docs(const char *current_query, const char *docs_request,
                             const char *docs_tool_id,
-                            const char *reasoning_content)
+                            const char *reasoning_content,
+                            const char *reasoning_items_json)
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
@@ -5524,10 +7640,12 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     cJSON_AddStringToObject(msg, "content", current_query);
     cJSON_AddItemToArray(messages, msg);
 
-    /* Add assistant's docs tool_use (provider-native) */
+    /* Add assistant's docs tool_use (provider-native; Responses API providers
+       also replay this turn's reasoning items) */
     {
         cJSON *input = cJSON_CreateObject();
-        yo_msg_add_tool_use(messages, docs_tool_id, "docs", input, reasoning_content);
+        yo_msg_add_tool_use(messages, docs_tool_id, "docs", input,
+                            reasoning_content, reasoning_items_json);
         cJSON_Delete(input);
     }
 
@@ -5546,9 +7664,11 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 static cJSON *
 yo_call_api_with_docs(const char *query, const char *docs_request,
                       const char *docs_tool_id,
-                      const char *reasoning_content)
+                      const char *reasoning_content,
+                      const char *reasoning_items_json)
 {
     cJSON *messages = yo_build_messages_with_docs(query, docs_request, docs_tool_id,
-                                                  reasoning_content);
+                                                  reasoning_content,
+                                                  reasoning_items_json);
     return yo_call_api_with_messages(messages);
 }

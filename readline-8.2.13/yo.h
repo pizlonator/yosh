@@ -39,14 +39,26 @@ extern "C" {
    The caller is responsible for freeing the returned pointer. */
 typedef const char *(*rl_yo_docs_callback_t)(const char *provider, const char *model);
 
+/* Callback type for supplying shell-specific tuned prompt text. Called with
+   the current provider and model, returns a newly allocated additional-prompt
+   string that the yo request builders append to their prompt core (caller
+   frees; may be an empty string).  The big "You are a SHELL assistant..."
+   tuning text lives in the shell, not in readline, so the library stays
+   shell-agnostic. */
+typedef const char *(*rl_yo_prompt_callback_t)(const char *provider, const char *model);
+
 /* Enable "yo" LLM features. Call this to opt-in (like using_history()).
    Binds Enter key to yo-aware accept-line and loads config from env vars.
    The system_prompt parameter is the prompt sent to the LLM - the shell
    should provide this to give context about the environment.
    The documentation_callback is a function that returns comprehensive docs
    about the shell. It receives the current provider and model so the
-   documentation can be customized for different LLMs. */
-extern void rl_yo_enable (const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback);
+   documentation can be customized for different LLMs.
+   The prompt_callback is a function that returns shell-specific tuned prompt
+   text (the "You are a SHELL assistant..." guidance). It receives the current
+   provider and model so the text can be tuned per model; returning an empty
+   string (or NULL) adds nothing to the prompt. Both callbacks may be NULL. */
+extern void rl_yo_enable (const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback, rl_yo_prompt_callback_t prompt_callback);
 
 /* Check if yo is currently enabled. Returns non-zero if enabled. */
 extern int rl_yo_enabled (void);

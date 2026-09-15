@@ -150,7 +150,7 @@ All settings are configured in `~/.yoconf`. The file is re-read on each `yo` com
 | Directive | Default | Description |
 |-----------|---------|-------------|
 | `history_limit` | `10` | Max conversation exchanges to remember |
-| `token_budget` | (unset) | Alias of `context_window`: when set, it overrides the context budget used for the `[N%]` usage indicator and compaction (see below) |
+| `token_budget` | (unset) | Alias of `context_window`: when set, it overrides the context budget used for the `[N.N%]` usage indicator and compaction (see below) |
 | `scrollback_enabled` | `1` | Set to `0` to disable terminal scrollback capture (startup only) |
 | `scrollback_bytes` | `1048576` | Max scrollback buffer size in bytes (startup only) |
 | `scrollback_lines` | `1000` | Max lines to return to the LLM (startup only) |
@@ -180,9 +180,10 @@ These directives control the ANSI escape sequences used for rendering markdown f
 
 ### Context Compaction
 
-While the LLM is working, yosh prints `[N%] Thinking...`, where N is a rough
+While the LLM is working, yosh prints `[N.N%] Thinking...`, where N.N is a rough
 estimate of the request size (session history + system prompt + your query, at
-~4 characters per token) as a percentage of the context window.
+~4 characters per token) as a percentage of the context window, shown with one
+decimal digit.
 
 When the estimate crosses 50% of the context window, yosh compacts the session
 history before sending the request:
@@ -192,8 +193,8 @@ history before sending the request:
    (its output is capped at 2048 tokens).
 2. The summary replaces those exchanges as a single `[context compacted]`
    exchange; the most recent ~25% of the history is kept verbatim.
-3. The terminal shows the sequence `[62%] Thinking...` → `Compacting...` →
-   `[49%] Thinking...`.
+3. The terminal shows the sequence `[62.4%] Thinking...` → `Compacting...` →
+   `[49.1%] Thinking...`.
 
 Compaction is best-effort on failure: if the summarization request fails (for
 example an HTTP error), the original request proceeds with the uncompacted
@@ -202,6 +203,28 @@ history. Pressing Ctrl-C during compaction aborts the whole operation with
 again. The context window comes from
 the model registry (or the provider's model-info API); the `context_window`
 directive — or the legacy `token_budget` directive — overrides it.
+
+### Model Info Fetching
+
+The context window and max output tokens are resolved from the provider's
+model-info API (when it reports them) or a built-in model registry, and cached
+per (provider, model, base_url). When yosh performs a network (re)fetch — the
+first use, or after you change `provider`/`model`/`base_url` in `~/.yoconf` —
+the terminal shows `Fetching model info...` until the request's
+`[N.N%] Thinking...` indicator replaces it. Registry-only providers (kimi,
+deepseek, qwen, z.ai) never fetch and never show it.
+
+### What the LLM Is Told
+
+Every yo request's system prompt opens with a "You are powered by `<model>`
+(provider: `<provider>`)." line followed by a short factual block describing
+the shell's LLM configuration: the context window (with a note that context is
+compacted automatically above 50% usage), the max output tokens per response,
+whether server-side web search is enabled, the configured thinking level, and
+that prompt caching is enabled (plus the API base URL, when one is set). The
+shell then appends its own tuning text for the provider/model (see the
+`rl_yo_enable` prompt callback in `bash-5.2.32/bashline.c`). The compaction
+summarizer request is exempt: it uses a minimal system prompt only.
 
 ## Usage
 

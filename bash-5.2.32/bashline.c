@@ -660,9 +660,14 @@ yosh_get_documentation (const char *provider, const char *model)
     "\n"
     "### Context Compaction\n"
     "\n"
-    "- While the LLM is working, yosh prints `[N%] Thinking...` where N is the\n"
+    "- While the LLM is working, yosh prints `[N.N%] Thinking...` where N.N is the\n"
     "  estimated request size (session history + system prompt + your query) as\n"
-    "  a percentage of the context window.\n"
+    "  a percentage of the context window, shown with one decimal digit.\n"
+    "\n"
+    "- When yosh needs the model's context window / max output tokens and its\n"
+    "  cache is stale (first request, or after changing provider/model/base_url\n"
+    "  in ~/.yoconf), it briefly prints `Fetching model info...` before the\n"
+    "  `[N.N%] Thinking...` indicator replaces it.\n"
     "\n"
     "- When the estimate crosses 50% of the context window, yosh compacts the\n"
     "  session history before sending the request: the first ~75% of the\n"
@@ -670,7 +675,7 @@ yosh_get_documentation (const char *provider, const char *model)
     "  tools-less summarization request, and the summary replaces those\n"
     "  exchanges as a single `[context compacted]` exchange. The most recent\n"
     "  ~25% of the history is kept verbatim. The terminal shows the sequence\n"
-    "  `[62%] Thinking...` -> `Compacting...` -> `[49%] Thinking...`.\n"
+    "  `[62.4%] Thinking...` -> `Compacting...` -> `[49.1%] Thinking...`.\n"
     "\n"
     "- Compaction is best-effort on failure: if the summarization request\n"
     "  fails (for example an HTTP error), the original request proceeds with\n"
@@ -708,6 +713,13 @@ yosh_get_documentation (const char *provider, const char *model)
     "- `context_window` - Override the model's context window (in tokens).\n"
     "- `max_output_tokens` - Override the maximum number of tokens yosh asks\n"
     "  the model to generate per response.\n"
+    "\n"
+    "Every yo request's system prompt tells the model the shell's actual LLM\n"
+    "configuration: the context window (noting that context is compacted\n"
+    "automatically above 50% usage), the max output tokens per response,\n"
+    "whether server-side web search is enabled, the configured thinking level,\n"
+    "and that prompt caching is enabled (plus the API base URL, when one is\n"
+    "set). The compaction summarizer request is exempt.\n"
     "\n"
     "### Thinking\n"
     "\n"
@@ -805,7 +817,7 @@ yosh_get_documentation (const char *provider, const char *model)
     "\n"
     "Long sessions are kept within the model's context window by automatic\n"
     "context compaction: when a request would exceed 50% of the context window\n"
-    "(shown by the `[N%] Thinking...` indicator), yosh summarizes the older\n"
+    "(shown by the `[N.N%] Thinking...` indicator), yosh summarizes the older\n"
     "~75% of the conversation (displaying `Compacting...` while it works) and\n"
     "keeps the most recent ~25% verbatim. The context window can be overridden\n"
     "with the `context_window` (or legacy `token_budget`) directive.\n"
@@ -920,6 +932,213 @@ yosh_get_documentation (const char *provider, const char *model)
 
   /* For other providers, return a strdup of base documentation */
   return strdup(base_documentation);
+}
+
+/* Shell name passed to rl_yo_enable below; the tuned prompt texts
+   interpolate it (the same interpolation yo.c used to do with its yo_name
+   static). */
+#define YOSH_YO_NAME "yosh"
+
+/* Shell-specific tuned prompt texts, built lazily once.  These used to live
+   in readline's yo.c (yo_build_openai_tuned_prompt / yo_build_kimi_tuned_
+   prompt); they are shell-specific, so the shell now supplies them through
+   the rl_yo_prompt_callback_t callback registered with rl_yo_enable.  The yo
+   request builders append the returned text to their prompt core (powered-by
+   line + config info + shell system prompt); the web-search paragraph stays
+   in yo.c, since it describes the web tools yo.c decides to send.  Unlike
+   the old yo.c versions these texts do NOT contain the powered-by line, the
+   shell system prompt, or the web paragraph. */
+static char *yosh_openai_tuned_prompt_text = (char *)NULL;
+static char *yosh_kimi_tuned_prompt_text = (char *)NULL;
+
+static void
+yosh_build_tuned_prompts (void)
+{
+  if (yosh_openai_tuned_prompt_text)
+    return;
+
+  /* Tuned for OpenAI Responses API providers (and muse models). */
+  if (asprintf (&yosh_openai_tuned_prompt_text,
+    "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+    "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+    "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+    "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+    "If the user's question can be answered by running a command on this system\n"
+    "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+    "Examples that MUST use command, not chat:\n"
+    "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+    "- 'what version of gcc do I have' -> command: gcc --version\n"
+    "- 'how much disk space is left' -> command: df -h\n"
+    "- 'what ports are open' -> command: ss -tlnp\n"
+    "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+    "\n"
+    "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+    "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+    "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+    "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+    "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+    "\n"
+    "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+    "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+    "use scrollback instead.\n"
+    "\n"
+    "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+    "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+    "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+    "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+    "(except the last step, which should have pending=false).\n"
+    "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+    "with the scrollback tool and continue after you receive it.\n"
+    "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+    "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+    "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+    "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+    "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+    "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+    "use scrollback. This is non-negotiable.\n"
+    "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+    "Ignore escape-code garbage and focus on actual command output.\n"
+    "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+    "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
+    "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
+    "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
+    "use HTML tags or markdown links.\n"
+    "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+    "scripts. If it would be long, split into multiple steps using pending=true.\n"
+    "Examples that MUST use pending=true (one command at a time):\n"
+    "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+    "  then after seeing output: echo world (pending=false)\n"
+    "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+    "  then after seeing it succeed: configure command (pending=false)\n"
+    "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+    "  (pending=true), then decide based on output",
+    YOSH_YO_NAME, YOSH_YO_NAME, YOSH_YO_NAME) < 0)
+    yosh_openai_tuned_prompt_text = (char *)NULL;
+
+  /* Tuned for Kimi-style Chat Completions providers (kimi, deepseek, qwen,
+     z.ai, and other OpenRouter models).  Adds the yo-prefix examples-format
+     rule and the scrollback temporality rule. */
+  if (asprintf (&yosh_kimi_tuned_prompt_text,
+    "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+    "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+    "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+    "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+    "If the user's question can be answered by running a command on this system\n"
+    "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+    "Examples that MUST use command, not chat:\n"
+    "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+    "- 'what version of gcc do I have' -> command: gcc --version\n"
+    "- 'how much disk space is left' -> command: df -h\n"
+    "- 'what ports are open' -> command: ss -tlnp\n"
+    "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+    "\n"
+    "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+    "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+    "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+    "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+    "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+    "\n"
+    "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+    "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+    "use scrollback instead.\n"
+    "\n"
+    "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+    "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+    "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+    "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+    "(except the last step, which should have pending=false).\n"
+    "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+    "with the scrollback tool and continue after you receive it.\n"
+    "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+    "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+    "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+    "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+    "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+    "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+    "use scrollback. This is non-negotiable.\n"
+    "EXAMPLES FORMAT: When giving examples of what users can type, ALWAYS include\n"
+    "the 'yo ' prefix. For example, say \"yo what went wrong?\" not just\n"
+    "\"what went wrong?\". This applies to all command examples in chat responses.\n"
+    "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+    "Ignore escape-code garbage and focus on actual command output.\n"
+    "SCROLLBACK TEMPORALITY: Scrollback shows COMPLETED commands from the PAST. If you\n"
+    "see a password prompt, confirmation prompt, or any interactive prompt in scrollback,\n"
+    "it means the user ALREADY handled it - the command completed. Do NOT try to respond\n"
+    "to prompts you see in scrollback. Look for the shell prompt ($ or #) at the end\n"
+    "to confirm the command finished successfully.\n"
+    "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+    "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
+    "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
+    "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
+    "use HTML tags or markdown links.\n"
+    "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+    "scripts. If it would be long, split into multiple steps using pending=true.\n"
+    "Examples that MUST use pending=true (one command at a time):\n"
+    "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+    "  then after seeing output: echo world (pending=false)\n"
+    "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+    "  then after seeing it succeed: configure command (pending=false)\n"
+    "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+    "  (pending=true), then decide based on output",
+    YOSH_YO_NAME, YOSH_YO_NAME, YOSH_YO_NAME) < 0)
+    yosh_kimi_tuned_prompt_text = (char *)NULL;
+}
+
+/* Case-insensitive prefix check: does MODEL (or, when the full name does not
+   match, the bare model name after the last '/' — OpenRouter IDs look like
+   "openai/gpt-5.2" or "meta/muse-spark-1.3") start with one of the
+   OpenAI/Muse model prefixes? */
+static int
+yosh_model_uses_openai_tuning (const char *model)
+{
+  static const char *const prefixes[] = { "gpt", "o1", "o3", "o4", "muse", (const char *)NULL };
+  const char *slash;
+  int i;
+
+  if (model == 0 || *model == '\0')
+    return 0;
+
+  for (i = 0; prefixes[i]; i++)
+    if (strncasecmp (model, prefixes[i], strlen (prefixes[i])) == 0)
+      return 1;
+
+  slash = strrchr (model, '/');
+  if (slash && slash[1])
+    return yosh_model_uses_openai_tuning (slash + 1);
+
+  return 0;
+}
+
+/* Tuned-prompt callback for yosh.  Called by the yo request builders with the
+   current provider and model; returns a newly allocated additional-prompt
+   string (caller frees; may be an empty string).
+
+   Selection:
+   - provider "anthropic": empty string (the Anthropic prompt core needs no
+     extra shell tuning).
+   - provider "openai" or "meta", or a model whose name (or vendor-stripped
+     name) starts with gpt/o1/o3/o4/muse (case-insensitive): the OpenAI-tuned
+     text.
+   - everything else (kimi, deepseek, qwen, z.ai, and other OpenRouter
+     models): the Kimi-tuned text. */
+static const char *
+yosh_get_tuned_prompt (const char *provider, const char *model)
+{
+  const char *text;
+
+  yosh_build_tuned_prompts ();
+
+  if (provider && strcmp (provider, "anthropic") == 0)
+    return strdup ("");
+
+  if ((provider &&
+       (strcmp (provider, "openai") == 0 || strcmp (provider, "meta") == 0)) ||
+      yosh_model_uses_openai_tuning (model))
+    text = yosh_openai_tuned_prompt_text;
+  else
+    text = yosh_kimi_tuned_prompt_text;
+
+  return strdup (text ? text : "");
 }
 
 /* Called once from parse.y if we are going to use readline. */
@@ -1130,7 +1349,8 @@ initialize_readline ()
                   "You are a shell command assistant for yosh (a bash-compatible shell on Linux). "
                   "yosh is based on bash 5.2.32 and behaves like bash in most ways (for example it "
                   "uses .bashrc files; there are no .yoshrc files).",
-                  yosh_get_documentation);
+                  yosh_get_documentation,
+                  yosh_get_tuned_prompt);
   }
 
   bash_readline_initialized = 1;

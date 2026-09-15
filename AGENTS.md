@@ -34,9 +34,9 @@ yosh/
 
 ### Architecture
 
-The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)`.
+The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)` plus two callbacks: a docs callback (`rl_yo_docs_callback_t`) and a tuned-prompt callback (`rl_yo_prompt_callback_t`) that returns the shell-specific "You are a SHELL assistant..." prompt text (implemented in `bash-5.2.32/bashline.c`; see "Request Prompt Composition" below).
 
-**Multi-provider support**: yo supports Anthropic (Claude), OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta (Muse), and OpenRouter APIs. The provider is selected via `~/.yoconf`. Anthropic, OpenAI, and Kimi each have their own API style; DeepSeek, Qwen, and z.ai use the Chat Completions API style (defaulting to the Kimi-tuned prompt); Meta and OpenRouter speak the OpenAI Responses API style (OpenRouter can also use Chat Completions — see `openrouter_api` below). The architecture keeps provider-specific code separated:
+**Multi-provider support**: yo supports Anthropic (Claude), OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta (Muse), and OpenRouter APIs. The provider is selected via `~/.yoconf`. Anthropic, OpenAI, and Kimi each have their own API style; DeepSeek, Qwen, and z.ai use the Chat Completions API style; Meta and OpenRouter speak the OpenAI Responses API style (OpenRouter can also use Chat Completions — see `openrouter_api` below). The tuned prompt a request carries is selected MODEL-PREFIX-based, not API-style-based — see "Request Prompt Composition" step 4. The architecture keeps provider-specific code separated:
 - Message building uses provider-aware helpers (`yo_msg_add_tool_use`, `yo_msg_add_tool_result`) that produce native JSON for each provider from C parameters
 - HTTP infrastructure is shared (`yo_http_post`) with curl multi-handle and Ctrl-C cancellation
 - Request building is per-API-style (`yo_build_anthropic_request`, `yo_build_responses_api_request`, `yo_build_chat_completions_api_request`) with thin per-provider wrappers (`yo_build_meta_request`, `yo_build_openrouter_responses_request`)
@@ -46,16 +46,16 @@ The yo feature is an **opt-in readline extension** (like history). Readline prov
 - Anthropic uses the Messages API (`/v1/messages`) with server-side tools (`web_search_20250305`, `web_fetch_20250910`) and `tool_choice {"type":"any"}`
 - OpenAI uses the Responses API (`/v1/responses`, NOT Chat Completions) with `{"type":"web_search"}` tool for web search
 - Kimi uses the Chat Completions API (`/v1/chat/completions`)
-- DeepSeek uses the Chat Completions API (`/chat/completions`) and the Kimi-tuned prompt
-- Qwen uses the Chat Completions API (`/v1/chat/completions`) and the Kimi-tuned prompt
-- z.ai uses the Chat Completions API (`/api/paas/v4/chat/completions`) and the Kimi-tuned prompt
+- DeepSeek uses the Chat Completions API (`/chat/completions`)
+- Qwen uses the Chat Completions API (`/v1/chat/completions`)
+- z.ai uses the Chat Completions API (`/api/paas/v4/chat/completions`)
 - Meta uses the OpenAI Responses API (`/v1/responses`, default model `muse-spark-1.3`): no `tool_choice` (only the default auto; sending `"required"` returns HTTP 400), non-strict (compat) tool schemas, web_search grounding, `prompt_cache_retention: "in_memory"`, and `include: ["reasoning.encrypted_content"]` (Muse Spark is a reasoning model)
-- OpenRouter uses `https://openrouter.ai/api/v1/` and sends an `X-Title: yosh` header. Default style is Chat Completions (`/chat/completions`, Kimi-tuned prompt, no tool_choice); `openrouter_api responses` switches to the Responses API (`/responses`, OpenAI-tuned prompt, `tool_choice: "required"`, non-strict tools, no web_search tool). No server-side web tools and no web-search prompt paragraph are sent through OpenRouter
+- OpenRouter uses `https://openrouter.ai/api/v1/` and sends an `X-Title: yosh` header. Default style is Chat Completions (`/chat/completions`, no tool_choice); `openrouter_api responses` switches to the Responses API (`/responses`, `tool_choice: "required"`, non-strict tools, no web_search tool). The tuned prompt follows the MODEL, not the API style: the default model `meta/muse-spark-1.3` prefix-matches `muse`, so OpenRouter **chat** carries the OPENAI-tuned text, while `anthropic/claude-*` models carry the KIMI-tuned text in either style (see "Request Prompt Composition" step 4). No server-side web tools and no web-search prompt paragraph are sent through OpenRouter
 - The Responses API always returns `"error": null` on success — error checking must use `cJSON_IsNull()` to avoid false positives
 - OpenAI Responses API uses flat items in `input[]` (`{"type":"function_call",...}`, `{"type":"function_call_output",...}`) rather than role-based messages for tool interactions
 - OpenAI Responses API uses `"instructions"` for system prompt (not a system message in the input array), `"input"` instead of `"messages"`, `"max_output_tokens"` instead of `"max_completion_tokens"`, and `"output[]"` instead of `"choices[].message"`
 - Tool definitions are built separately per provider. OpenAI tools are stricter (e.g., `command.pending` is required and descriptions strongly bias toward command/tool use); Meta, OpenRouter, and Chat Completions providers get the non-strict "compat" schemas
-- OpenAI scrollback is sanitized (ANSI/escape sequences stripped) before sending it to the model; Anthropic receives raw scrollback. Chat Completions providers additionally get a "SCROLLBACK TEMPORALITY" reminder (the output shows completed commands from the past)
+- OpenAI scrollback is sanitized (ANSI/escape sequences stripped) before sending it to the model; Anthropic receives raw scrollback. The "SCROLLBACK TEMPORALITY" reminder (the output shows completed commands from the past) and the "EXAMPLES FORMAT" reminder ride ONLY in the KIMI-tuned prompt text: models selected for the OPENAI-tuned text (openai/meta providers and any gpt/o1/o3/o4/muse-prefixed model — including `meta/muse-spark-1.3` on OpenRouter chat) intentionally do NOT get them. This is a deliberate consequence of the model-prefix-based tuned-prompt selection (see "Request Prompt Composition" step 4)
 
 Response types from the LLM:
 - **command** — `{"type":"command","command":"...","explanation":"..."}` — prefills the command in the prompt for the user to review/edit/execute.
@@ -128,7 +128,7 @@ key sk-ant-api03-...
 **Additional config directives** (all in `~/.yoconf`, re-read on each yo command unless noted):
 - **history_limit**: Max conversation exchanges to remember (default 10)
 - **token_budget**: REPURPOSED as an alias of the context window: when set, it overrides the model's context window for the usage indicator and the compaction threshold (the old round-robin history pruning by token budget is gone — compaction replaced it). `context_window` takes precedence when both are set.
-- **context_window**: Override the model's context window (tokens). Used for the `[N%] Thinking...` usage indicator and the compaction trigger. Default: API/registry value for the model (unknown model: 131072).
+- **context_window**: Override the model's context window (tokens). Used for the `[N.N%] Thinking...` usage indicator and the compaction trigger. Default: API/registry value for the model (unknown model: 131072).
 - **max_output_tokens**: Override the max tokens requested from the LLM (`max_tokens` / `max_output_tokens`). Default: API/registry value for the model (unknown model: 16384).
 - **thinking**: Extended thinking / reasoning effort: `off`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Unset = disabled. Wired per provider (see "Thinking / Extended Reasoning" below).
 - **include_reasoning**: `1`/`0` — force on/off the Responses API `"include": ["reasoning.encrypted_content"]` request. Unset = per-provider default (OpenAI: yes when the model plausibly supports reasoning; Meta: always; OpenRouter: no — sending `include` for models that do not forward encrypted reasoning can 400).
@@ -170,22 +170,34 @@ Responses API reasoning items (`output[]` entries with `"type": "reasoning"` and
 
 `yo_get_model_info()` resolves the current model's context window and max output tokens. Resolution order per value: `~/.yoconf` override (`context_window` / `max_output_tokens`) > provider model-info API > built-in registry (ported from brainstorm-3 `lib/shared/model_registry.rb`, case-insensitive prefix match, first match wins; vendor-prefixed IDs like OpenRouter's `meta/muse-spark-1.3` retry with the bare model name after the last `/` when the full string matches nothing) > unknown-model defaults (context 131072, output 16384).
 
-API fetch (best effort, 10s timeout, fully silent on failure), cached per `(provider, model, base_url)` and fetched lazily on first use — NOT re-fetched on every LLM call, and nothing is fetched at startup:
+API fetch (best effort, 10s timeout, fully silent on failure), cached per `(provider, model, base_url)` and fetched lazily on first use — NOT re-fetched on every LLM call, and nothing is fetched at startup. When a real network fetch is about to happen (providers with a model-info API, and only on a cache miss), the terminal shows `Fetching model info...` (same styling as the thinking indicator, no newline, prefixed with `\r\033[K` so it safely replaces whatever is on the line); it is erased/replaced when `[N.N%] Thinking...` is printed. Registry-only providers (kimi/deepseek/qwen/z.ai) never show it, and cache hits never re-show it:
 - **openrouter**: `GET {base}/model/{id}` (singular `model`); reads `data.context_length` and `data.top_provider.max_completion_tokens`
 - **anthropic / openai / meta**: `GET {base}/models/{id}`; sniffs `context_window`/`context_length` and `max_output_tokens`/`max_tokens` at the top level and inside `data`, `data.top_provider`, `top_provider`, and `model` objects
 - **kimi / deepseek / qwen / z.ai**: no model-info API; registry only
 
 `max_tokens`/`max_output_tokens` sent in requests = `max_output_tokens` override > API/registry value. The compaction summarizer caps its request at `min(2048, resolved max_output_tokens)`.
 
+### Request Prompt Composition
+
+All three request builders (`yo_build_anthropic_request_ex`, `yo_build_responses_api_request_ex`, `yo_build_chat_completions_api_request`) compose the system prompt for NORMAL requests via `yo_build_prompt_core()`, then append provider-specific paragraphs:
+
+1. `You are powered by <model> (provider: <provider>).`
+2. Blank line, then the config-info lines (`yo_build_config_info_lines()`): `Context window: <N> tokens (context is compacted automatically above 50% usage).` / `Max output tokens per response: <N>.` / `Server-side web search: <enabled|disabled>.` / `Thinking level: <level|provider default>.` / `Prompt caching: enabled.` (plus `API base URL: <url>.` when `base_url` is set)
+3. Blank line, then the shell system prompt (`yo_system_prompt` — the four-tools guidance + shell intro + OS info)
+4. Blank line, then the shell's tuned-prompt text (`yo_shell_tuned_prompt()` — the `rl_yo_prompt_callback_t` callback registered by `bash-5.2.32/bashline.c` as `yosh_get_tuned_prompt`; empty for the anthropic provider, the OpenAI-tuned text for openai/meta providers and for gpt/o1/o3/o4/muse-prefixed models (case-insensitive, also tried on the vendor-stripped name after the last `/`), the Kimi-tuned text otherwise). The two tuned texts live in bashline.c, not in yo.c — yo.c only composes. Selection is deliberately MODEL-PREFIX-based, NOT API-style-based. Consequences: OpenRouter chat with the default model `meta/muse-spark-1.3` gets the OPENAI-tuned text (the vendor-stripped name starts with `muse`); `anthropic/claude-*` models through OpenRouter get the KIMI-tuned text in either API style; muse/gpt/o-series models on Chat Completions providers get the OpenAI-tuned text, which therefore LACKS the "EXAMPLES FORMAT" and "SCROLLBACK TEMPORALITY" reminders (those ride only in the Kimi-tuned text). This asymmetry is intentional, per the model-prefix-based selection spec.
+5. The web-search paragraph where it applies today: the Anthropic builder appends its web_search/web_fetch paragraph when `yo_server_web_enabled` and tools are included; the Responses API builder appends the "You have web search available..." paragraph when the provider sends a web_search tool (OpenAI/Meta) and web search is enabled (never for OpenRouter); the Chat Completions builder has none.
+
+The compaction summarizer request is exempt: it passes its own minimal summarizer system prompt via `system_override`, and the builders skip the whole composition in that case (no powered-by line, no config info, no tuned text).
+
 ### Context Compaction & Usage Indicator
 
-`yo_call_llm()` prints `[N%] Thinking...` before every request, where N is the estimated request size (history + system prompt + query + JSON slack) as a percentage of the EFFECTIVE context window (`context_window` override > `token_budget` when set > API/registry context window).
+`yo_call_llm()` prints `[N.N%] Thinking...` before every request, where N.N is the estimated request size (history + system prompt + query + JSON slack) as a percentage of the EFFECTIVE context window (`context_window` override > `token_budget` when set > API/registry context window), computed in per-mille (`yo_usage_permille`) so the indicator carries one decimal digit. Before printing it, `yo_call_llm` resolves BOTH model-info accessors (`yo_get_effective_context_window()` and `yo_get_max_output_tokens()`) — either can trigger the lazy model-info fetch (a `context_window`/`token_budget` override skips the context-window lookup, so the max-output-tokens lookup can still be the first cache miss). The fetch prints its own "Fetching model info..." indicator, which the thinking indicator then replaces; `yo_print_fetching()` is additionally a NO-OP while the thinking line is visible (`yo_thinking_shown`), so a hypothetical late cache miss can never erase the thinking indicator mid-wait.
 
 When the estimate exceeds half of the effective window, `yo_compact_history()` runs (requires ≥2 history entries totaling ≥256 estimated tokens, otherwise it is skipped):
 1. Prints `Compacting...` (chat styling, no newline)
 2. Sends the oldest ~75% of the history (by estimated tokens) as a FLATTENED PLAIN-TEXT transcript (`yo_build_summary_transcript`: `[USER] <query>` / `[ASSISTANT] <content>` lines — commands rendered as `Suggested command: <cmd> (the user <executed|did not execute> it)` — joined by blank lines) in ONE user message together with the `[compaction] Summarize the following conversation transcript...` instruction to a TOOLS-LESS request (`yo_call_api_summarize`: no tools array, no tool_choice, minimal summarizer system prompt, output capped at 2048; the Anthropic variant also skips the web-search beta header and keeps the system/final-message cache breakpoints). The transcript must be plain text because the summarizer request defines no tools — replaying native tool_use/tool_result blocks would reference undefined tools and be rejected (Responses-style servers likewise reject unpaired function calls)
 3. Rebuilds the history as ONE synthetic summary exchange (query `[context compacted] Summary of the earlier conversation:`, chat response with the summary text, tool_use id `compaction_summary`, executed=1) followed by the kept ~25% of entries
-4. `yo_call_llm()` redraws the indicator as `[M%] Thinking...` with the post-compaction estimate
+4. `yo_call_llm()` redraws the indicator as `[M.N%] Thinking...` with the post-compaction estimate
 
 Compaction is best-effort: if the summarizer call fails for a non-cancel reason (e.g. HTTP 500), the history is left untouched and the original estimate stands. If the summarizer request is Ctrl-C CANCELLED, `yo_call_llm` aborts the whole operation (returns 0 without redrawing the thinking indicator and without sending the main request) — "Cancelled" was already printed by the HTTP layer and the user must not have to press Ctrl-C twice.
 
@@ -236,8 +248,8 @@ Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches bo
 | File | Purpose |
 |------|---------|
 | `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi + DeepSeek + Qwen + z.ai + Meta + OpenRouter), model registry, compaction, session memory, PTY proxy, scrollback, continuation |
-| `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
-| `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt |
+| `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_docs_callback_t`, `rl_yo_prompt_callback_t`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
+| `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt, docs callback (`yosh_get_documentation`), and tuned-prompt callback (`yosh_get_tuned_prompt` — the shell-specific "CRITICAL: You are a SHELL assistant..." texts) |
 | `bash-5.2.32/shell.c` | Main shell init; readline must init before job control |
 
 ## Development Workflow

@@ -217,6 +217,7 @@ static char *yo_model = NULL;
 static char *yo_system_prompt = NULL;
 static const char *yo_name = NULL;
 static rl_yo_docs_callback_t yo_documentation_callback = NULL;
+static rl_yo_prompt_callback_t yo_prompt_callback = NULL;
 static int yo_server_web_enabled = 1;
 static yo_provider_t yo_provider = YO_PROVIDER_ANTHROPIC;
 static char *yo_api_key = NULL;
@@ -259,6 +260,18 @@ static int yo_include_reasoning = YO_INCLUDE_REASONING_UNSET;
 
 /* Track if last command from yo was executed */
 static int yo_last_was_command = 0;
+
+/* 1 while the "Fetching model info..." indicator is on screen (see
+   yo_print_fetching / yo_clear_fetching). */
+static int yo_fetching_shown = 0;
+
+/* 1 while the "[N.N%] Thinking..." indicator is on screen (set by
+   yo_print_thinking, cleared by yo_clear_thinking; every code path that
+   erases the thinking line goes through yo_clear_thinking, so the flag
+   cannot go stale).  yo_print_fetching refuses to print while this is set:
+   its leading "\r\033[K" would erase the thinking line, and nothing would
+   redraw it until the LLM response arrives. */
+static int yo_thinking_shown = 0;
 
 /* Continuation state for multi-step command sequences */
 static int yo_continuation_active = 0;     /* 1 if mid-plan (LLM returned pending:true) */
@@ -344,7 +357,8 @@ static void yo_history_prune(void);
 static int yo_estimate_tokens(void);
 static int yo_estimate_request_tokens(const char *query);
 static long yo_get_effective_context_window(void);
-static int yo_usage_percent(long estimate, long window);
+static long yo_get_max_output_tokens(void);
+static long yo_usage_permille(long estimate, long window);
 static int yo_compact_history(void);
 static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
@@ -360,6 +374,12 @@ static void yo_print_error_no_newline(const char *msg, ...);
 static void yo_print_error(const char *msg, ...);
 static void yo_print_thinking(int pct);
 static void yo_clear_thinking(void);
+static void yo_print_fetching(void);
+static void yo_clear_fetching(void);
+static char *yo_build_config_info_lines(void);
+static char *yo_shell_tuned_prompt(void);
+static char *yo_prompt_append_paragraph(char *prompt, const char *para);
+static char *yo_build_prompt_core(void);
 static void yo_report_parse_error(cJSON *tool_use);
 static const char *yo_get_chat_prefix(void);
 static const char *yo_get_color_prefix(void);
@@ -1067,7 +1087,7 @@ yo_detect_distro(void)
     char *pretty_name = NULL;
     char *name = NULL;
     char *version = NULL;
-    char *result;
+    char *result = NULL;
 
     fp = fopen("/etc/os-release", "r");
     if (!fp)
@@ -1128,7 +1148,10 @@ yo_detect_distro(void)
     else if (name && *name)
     {
         if (version && *version)
-            asprintf(&result, "%s %s", name, version);
+        {
+            if (asprintf(&result, "%s %s", name, version) < 0)
+                result = name;  /* asprintf failed: fall back to the bare name */
+        }
         else
             result = name;
     }
@@ -1141,7 +1164,8 @@ yo_detect_distro(void)
 }
 
 void
-rl_yo_enable(const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback)
+rl_yo_enable(const char* name, const char *system_prompt, rl_yo_docs_callback_t documentation_callback,
+             rl_yo_prompt_callback_t prompt_callback)
 {
     if (yo_is_enabled)
         return;
@@ -1151,6 +1175,7 @@ rl_yo_enable(const char* name, const char *system_prompt, rl_yo_docs_callback_t 
 
     yo_name = name;
     yo_documentation_callback = documentation_callback;
+    yo_prompt_callback = prompt_callback;
 
     /* Store system prompt from caller. Tool definitions handle the response format;
        the system prompt provides behavioral guidance. */
@@ -1474,18 +1499,35 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
 {
     cJSON *tool_use;
     long window;
-    int est, pct;
+    int est;
+    long pct;
 
     memset(resp, 0, sizeof(*resp));
 
     /* Context-usage estimate + thinking indicator.  The indicator lives here
        (not at the call sites) so it can be redrawn when history compaction
        runs.  pct = estimated request size (history + system prompt + query
-       + JSON slack) as a percentage of the effective context window. */
+       + JSON slack) in per-mille of the effective context window.
+
+       BOTH model-info accessors are resolved BEFORE the thinking indicator
+       prints: yo_get_effective_context_window() and yo_get_max_output_tokens()
+       can each trigger the lazy model-info fetch (which prints its own
+       "Fetching model info..." indicator, whose leading "\r\033[K" erases
+       whatever line is current).  A ~/.yoconf context_window/token_budget
+       override makes the context-window lookup an early return WITHOUT
+       touching the cache, so the max-output-tokens lookup can still be the
+       first to hit the cache miss -- and without the warm-up below it would
+       fire from the request builders AFTER thinking is visible, erasing it
+       for the whole LLM wait.  Warming both accessors up front guarantees
+       the fetch (if any) always happens -- and is replaced -- before
+       thinking prints; the builders' own lookups are then cache hits.  As a
+       belt-and-braces guard, yo_print_fetching() is a no-op while the
+       thinking line is visible (yo_thinking_shown). */
     est = yo_estimate_request_tokens(query);
     window = yo_get_effective_context_window();
-    pct = yo_usage_percent(est, window);
-    yo_print_thinking(pct);
+    (void)yo_get_max_output_tokens();  /* warm the model-info cache pre-thinking */
+    pct = yo_usage_permille(est, window);
+    yo_print_thinking((int)pct);
 
     /* Compact the session history when this request would exceed half of the
        effective context window.  yo_compact_history() prints its own
@@ -1504,7 +1546,7 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
         if (yo_compact_history())
         {
             est = yo_estimate_request_tokens(query);
-            pct = yo_usage_percent(est, window);
+            pct = yo_usage_permille(est, window);
         }
         else if (yo_cancelled)
         {
@@ -1515,11 +1557,11 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
                yo_continuation_hook) redisplay the prompt on a 0 return. */
             return 0;
         }
-        /* Redraw the indicator: "[M%] Thinking..." with the post-compaction
-           usage on success, the original "[N%] Thinking..." after a
+        /* Redraw the indicator: "[M.N%] Thinking..." with the post-compaction
+           usage on success, the original "[N.N%] Thinking..." after a
            best-effort (non-cancel) failure. */
         yo_clear_thinking();
-        yo_print_thinking(pct);
+        yo_print_thinking((int)pct);
     }
 
     /* Step 1: Call LLM API */
@@ -1777,7 +1819,7 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry
-       (yo_call_llm prints the "[N%] Thinking..." indicator itself) */
+       (yo_call_llm prints the "[N.N%] Thinking..." indicator itself) */
     memset(&resp, 0, sizeof(resp));
     if (!yo_call_llm(saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
     {
@@ -3006,12 +3048,14 @@ yo_build_tools_anthropic(void)
 
     /* Tool: docs */
     tool = cJSON_CreateObject();
-    asprintf(&docs_desc,
+    if (asprintf(&docs_desc,
              "Request %s documentation to answer questions about %s features, configuration, "
              "environment variables, LLM provider/model or API key setup, or usage.",
-             yo_name, yo_name);
+             yo_name, yo_name) < 0)
+        docs_desc = NULL;  /* asprintf failed: omit the description below */
     cJSON_AddStringToObject(tool, "name", "docs");
-    cJSON_AddStringToObject(tool, "description", docs_desc);
+    if (docs_desc)
+        cJSON_AddStringToObject(tool, "description", docs_desc);
     free(docs_desc);
     schema = cJSON_CreateObject();
     cJSON_AddStringToObject(schema, "type", "object");
@@ -3153,11 +3197,13 @@ yo_build_tools_chat_completions_api(void)
     cJSON_AddStringToObject(tool, "type", "function");
     func = cJSON_CreateObject();
     cJSON_AddStringToObject(func, "name", "docs");
-    asprintf(&docs_desc,
+    if (asprintf(&docs_desc,
              "Request %s documentation to answer questions about %s features, configuration, "
              "environment variables, LLM provider/model or API key setup, or usage.",
-             yo_name, yo_name);
-    cJSON_AddStringToObject(func, "description", docs_desc);
+             yo_name, yo_name) < 0)
+        docs_desc = NULL;  /* asprintf failed: omit the description below */
+    if (docs_desc)
+        cJSON_AddStringToObject(func, "description", docs_desc);
     free(docs_desc);
     /* For parameter-less functions, omit the parameters field entirely for Chat Completions API providers */
     cJSON_AddItemToObject(tool, "function", func);
@@ -3283,11 +3329,13 @@ yo_build_tools_responses_api_ex(int strict, int include_web_search)
     tool = cJSON_CreateObject();
     cJSON_AddStringToObject(tool, "type", "function");
     cJSON_AddStringToObject(tool, "name", "docs");
-    asprintf(&docs_desc,
+    if (asprintf(&docs_desc,
              "Request %s documentation to answer questions about %s features, configuration, "
              "environment variables, LLM provider/model or API key setup, or usage.",
-             yo_name, yo_name);
-    cJSON_AddStringToObject(tool, "description", docs_desc);
+             yo_name, yo_name) < 0)
+        docs_desc = NULL;  /* asprintf failed: omit the description below */
+    if (docs_desc)
+        cJSON_AddStringToObject(tool, "description", docs_desc);
     free(docs_desc);
     params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "type", "object");
@@ -4313,12 +4361,30 @@ yo_resolve_model_info(long *context_window_out, long *max_output_tokens_out)
     *max_output_tokens_out = max_output_tokens;
 }
 
+/* True when this provider has a model-info API that
+   yo_fetch_model_info_from_api will actually try (registry-only providers
+   return 0 — nothing is fetched for them). */
+static int
+yo_provider_fetches_model_info(const char *provider)
+{
+    return strcmp(provider, "openrouter") == 0
+        || strcmp(provider, "anthropic") == 0
+        || strcmp(provider, "openai") == 0
+        || strcmp(provider, "meta") == 0;
+}
+
 /* Get the context window and max output tokens for the current
    (provider, model, base_url).  Values come from the provider's API when it
    reports them, otherwise from the built-in model registry.  Results are
    cached per (provider, model, base_url) so we do NOT re-request on every
    LLM call — only when the user changes provider, model, or base_url in
-   ~/.yoconf.  The fetch is lazy: nothing happens until first use. */
+   ~/.yoconf.  The fetch is lazy: nothing happens until first use.
+   When a real network fetch is about to happen (providers with a model-info
+   API, and only on a cache miss) the "Fetching model info..." indicator is
+   printed; it disappears when the thinking indicator is printed
+   (yo_print_thinking calls yo_clear_fetching), and yo_print_fetching is a
+   no-op while the thinking indicator is visible -- a late cache miss can
+   never erase it. */
 static void
 yo_get_model_info(long *context_window_out, long *max_output_tokens_out)
 {
@@ -4336,6 +4402,9 @@ yo_get_model_info(long *context_window_out, long *max_output_tokens_out)
     if (!cache_valid)
     {
         long context_window, max_output_tokens;
+
+        if (yo_provider_fetches_model_info(provider))
+            yo_print_fetching();
 
         yo_resolve_model_info(&context_window, &max_output_tokens);
 
@@ -4412,23 +4481,24 @@ yo_get_effective_context_window(void)
     return yo_get_context_window();
 }
 
-/* Estimated request size as a percentage of the context window, clamped to
-   [0, 99] (the indicator never reads "100%"). */
-static int
-yo_usage_percent(long estimate, long window)
+/* Estimated request size in per-mille (tenths of a percent) of the context
+   window, clamped to [0, 999] (the indicator never reads "100.0%").  One
+   decimal digit of precision: per-mille/10 and per-mille%10 form "[N.N%]". */
+static long
+yo_usage_permille(long estimate, long window)
 {
-    long pct;
+    long permille;
 
     if (window <= 0)
         return 0;
 
-    pct = estimate * 100 / window;
-    if (pct < 0)
-        pct = 0;
-    if (pct > 99)
-        pct = 99;
+    permille = estimate * 1000 / window;
+    if (permille < 0)
+        permille = 0;
+    if (permille > 999)
+        permille = 999;
 
-    return (int)pct;
+    return permille;
 }
 
 /* **************************************************************** */
@@ -4609,12 +4679,17 @@ yo_build_anthropic_request_ex(cJSON *messages,
         }
         else
         {
-            asprintf(&base_prompt, "You are powered by %s (provider: anthropic).\n\n%s",
-                     yo_model, yo_system_prompt);
+            /* Prompt core: powered-by line + config info lines + shell system
+               prompt + shell tuned prompt text (yo_build_prompt_core). */
+            base_prompt = yo_build_prompt_core();
 
             if (web_enabled)
             {
-                asprintf(&system_prompt, "%s\n\n"
+                /* Same failure handling as yo_build_config_info_lines: on
+                   asprintf failure fall back to a valid string (the core
+                   without the web paragraph) so system_prompt is never an
+                   uninitialized/garbage pointer. */
+                if (asprintf(&system_prompt, "%s\n\n"
                     "When you need up-to-date information from the internet (current events, latest docs,\n"
                     "real-time data, etc.), you also have access to web_search and web_fetch server tools.\n"
                     "These run automatically when you use them - just search or fetch as needed before\n"
@@ -4622,14 +4697,19 @@ yo_build_anthropic_request_ex(cJSON *messages,
                     "IMPORTANT: Your output is displayed in a terminal. Never use HTML tags like <cite>,\n"
                     "<source>, <ref>, etc. in your responses. Just write plain text. Do not include\n"
                     "inline citations or reference markers - the user does not need source attribution.",
-                    base_prompt);
-                free(base_prompt);
+                    base_prompt) < 0)
+                    system_prompt = base_prompt;  /* asprintf failed: send the core un-augmented */
+                else
+                    free(base_prompt);
             }
             else
             {
                 system_prompt = base_prompt;
             }
         }
+
+        if (!system_prompt)
+            system_prompt = strdup("");  /* always a valid C string */
 
         /* Prompt caching breakpoint #2: send "system" as a content-block
            array whose text block carries the cache_control breakpoint. */
@@ -4907,165 +4987,118 @@ yo_default_chat_completions_url(yo_provider_t provider)
     }
 }
 
-/* Build the system prompt tuned for OpenAI Responses API providers.
-   provider_name is used in the "powered by" line.
-   include_web_paragraph: append the web-search availability paragraph (only
-   when web search is actually enabled).  Providers that never receive a
-   web_search tool (e.g. OpenRouter) pass 0 so the prompt does not claim
-   capabilities it does not have. */
+/* Additional prompt text supplied by the shell via the rl_yo_prompt_callback_t
+   callback (bashline.c registers the big "You are a SHELL assistant..." tuned
+   texts there).  NULL callback == always empty.  Returns a malloc'd string
+   (possibly empty; caller frees). */
 static char *
-yo_build_openai_tuned_prompt(const char *provider_name, int include_web_paragraph)
+yo_shell_tuned_prompt(void)
 {
-    char *prompt;
-    int mention_web = include_web_paragraph && yo_server_web_enabled;
+    char *text;
 
-    ZASSERT(yo_model);
+    if (!yo_prompt_callback)
+        return strdup("");
 
-    asprintf(&prompt,
-        "You are powered by %s (provider: %s).\n\n"
-        "%s\n\n"
-        "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
-        "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
-        "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
-        "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
-        "If the user's question can be answered by running a command on this system\n"
-        "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
-        "Examples that MUST use command, not chat:\n"
-        "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
-        "- 'what version of gcc do I have' -> command: gcc --version\n"
-        "- 'how much disk space is left' -> command: df -h\n"
-        "- 'what ports are open' -> command: ss -tlnp\n"
-        "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
-        "\n"
-        "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
-        "environment variables, how to change provider/model/API key, or usage — you MUST\n"
-        "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
-        "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
-        "files with cat/grep. Use docs first, then answer based on what it returns.\n"
-        "\n"
-        "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
-        "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
-        "use scrollback instead.\n"
-        "\n"
-        "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
-        "output before deciding the next action, you MUST use pending=true and issue ONE\n"
-        "command at a time. NEVER combine steps into a single compound command (no && chains\n"
-        "or semicolons to merge steps). Each step should be its own command with pending=true\n"
-        "(except the last step, which should have pending=false).\n"
-        "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
-        "with the scrollback tool and continue after you receive it.\n"
-        "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
-        "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
-        "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
-        "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
-        "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
-        "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
-        "use scrollback. This is non-negotiable.\n"
-        "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
-        "Ignore escape-code garbage and focus on actual command output.\n"
-        "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
-        "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
-        "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
-        "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
-        "use HTML tags or markdown links.\n"
-        "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
-        "scripts. If it would be long, split into multiple steps using pending=true.\n"
-        "Examples that MUST use pending=true (one command at a time):\n"
-        "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
-        "  then after seeing output: echo world (pending=false)\n"
-        "- 'install foo and then configure it' -> first: install command (pending=true),\n"
-        "  then after seeing it succeed: configure command (pending=false)\n"
-        "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
-        "  (pending=true), then decide based on output"
-        "%s",
-        yo_model, provider_name, yo_system_prompt, yo_name, yo_name, yo_name,
-        mention_web
-            ? "\n\nYou have web search available. When you find the answer to the user's question "
-              "via web search (weather, news, sports scores, prices, current events, etc.), "
-              "relay the information directly using chat. Do NOT suggest a curl/wget command "
-              "when you already have the answer from web search.\n"
-              "When citing web sources, use plain text references only. Do not use HTML tags "
-              "or markdown link syntax in citations."
-            : "");
+    text = (char *)yo_prompt_callback(yo_provider_to_string(yo_provider), yo_model);
+    if (!text)
+        return strdup("");
 
-    return prompt;
+    return text;
 }
 
+/* Factual lines describing the shell's current LLM configuration, embedded in
+   every normal request's prompt so the model knows the limits it is operating
+   under.  Returns a malloc'd string with no trailing newline (caller frees).
+   The model-info lookups here are cache-hits in practice (the builders
+   already resolved max output tokens), but on a cache miss they may print the
+   "Fetching model info..." indicator. */
 static char *
-yo_build_kimi_tuned_prompt(const char *provider_name)
+yo_build_config_info_lines(void)
 {
-    char *prompt;
+    const char *thinking_level = yo_thinking_level_string(yo_config_thinking);
+    char *lines = NULL;
+    char *tail = NULL;
+
+    if (yo_base_url && *yo_base_url)
+    {
+        if (asprintf(&tail, "API base URL: %s.", yo_base_url) < 0)
+            tail = NULL;
+    }
+
+    if (asprintf(&lines,
+                 "Context window: %ld tokens (context is compacted automatically above 50%% usage).\n"
+                 "Max output tokens per response: %ld.\n"
+                 "Server-side web search: %s.\n"
+                 "Thinking level: %s.\n"
+                 "Prompt caching: enabled.%s%s",
+                 yo_get_effective_context_window(),
+                 yo_get_max_output_tokens(),
+                 yo_server_web_enabled ? "enabled" : "disabled",
+                 thinking_level ? thinking_level : "provider default",
+                 tail ? "\n" : "",
+                 tail ? tail : "") < 0)
+        lines = NULL;
+
+    free(tail);
+    return lines ? lines : strdup("");
+}
+
+/* Append `para` to `prompt` as its own paragraph ("\n\n" separator).
+   Consumes `prompt` (frees it) and returns the joined string; an empty or
+   NULL `para` returns `prompt` unchanged. */
+static char *
+yo_prompt_append_paragraph(char *prompt, const char *para)
+{
+    char *joined;
+
+    if (!para || !*para)
+        return prompt;
+    if (!prompt)
+        return strdup(para);
+    if (asprintf(&joined, "%s\n\n%s", prompt, para) < 0)
+        return prompt;
+    free(prompt);
+    return joined;
+}
+
+/* Shared prompt core for all three request builders (Anthropic Messages,
+   Responses API, Chat Completions), used for NORMAL requests only — the
+   compaction summarizer passes its own system_override and never sees this:
+
+       You are powered by <model> (provider: <provider>).
+
+       <config info lines>
+
+       <shell system prompt (tools guidance, OS info)>
+
+       <shell tuned prompt text, when the shell's callback supplies one>
+
+   Returns a malloc'd string; callers append their provider-specific
+   paragraphs (e.g. the web-search paragraph) afterwards. */
+static char *
+yo_build_prompt_core(void)
+{
+    char *powered = NULL;
+    char *config_info;
+    char *extra;
+    char *core;
 
     ZASSERT(yo_model);
 
-    asprintf(&prompt,
-        "You are powered by %s (provider: %s).\n\n"
-        "%s\n\n"
-        "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
-        "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
-        "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
-        "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
-        "If the user's question can be answered by running a command on this system\n"
-        "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
-        "Examples that MUST use command, not chat:\n"
-        "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
-        "- 'what version of gcc do I have' -> command: gcc --version\n"
-        "- 'how much disk space is left' -> command: df -h\n"
-        "- 'what ports are open' -> command: ss -tlnp\n"
-        "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
-        "\n"
-        "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
-        "environment variables, how to change provider/model/API key, or usage — you MUST\n"
-        "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
-        "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
-        "files with cat/grep. Use docs first, then answer based on what it returns.\n"
-        "\n"
-        "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
-        "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
-        "use scrollback instead.\n"
-        "\n"
-        "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
-        "output before deciding the next action, you MUST use pending=true and issue ONE\n"
-        "command at a time. NEVER combine steps into a single compound command (no && chains\n"
-        "or semicolons to merge steps). Each step should be its own command with pending=true\n"
-        "(except the last step, which should have pending=false).\n"
-        "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
-        "with the scrollback tool and continue after you receive it.\n"
-        "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
-        "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
-        "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
-        "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
-        "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
-        "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
-        "use scrollback. This is non-negotiable.\n"
-        "EXAMPLES FORMAT: When giving examples of what users can type, ALWAYS include\n"
-        "the 'yo ' prefix. For example, say \"yo what went wrong?\" not just\n"
-        "\"what went wrong?\". This applies to all command examples in chat responses.\n"
-        "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
-        "Ignore escape-code garbage and focus on actual command output.\n"
-        "SCROLLBACK TEMPORALITY: Scrollback shows COMPLETED commands from the PAST. If you\n"
-        "see a password prompt, confirmation prompt, or any interactive prompt in scrollback,\n"
-        "it means the user ALREADY handled it - the command completed. Do NOT try to respond\n"
-        "to prompts you see in scrollback. Look for the shell prompt ($ or #) at the end\n"
-        "to confirm the command finished successfully.\n"
-        "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
-        "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
-        "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
-        "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
-        "use HTML tags or markdown links.\n"
-        "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
-        "scripts. If it would be long, split into multiple steps using pending=true.\n"
-        "Examples that MUST use pending=true (one command at a time):\n"
-        "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
-        "  then after seeing output: echo world (pending=false)\n"
-        "- 'install foo and then configure it' -> first: install command (pending=true),\n"
-        "  then after seeing it succeed: configure command (pending=false)\n"
-        "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
-        "  (pending=true), then decide based on output",
-        yo_model, provider_name, yo_system_prompt,
-        yo_name, yo_name, yo_name);
+    config_info = yo_build_config_info_lines();
+    extra = yo_shell_tuned_prompt();
 
-    return prompt;
+    if (asprintf(&powered, "You are powered by %s (provider: %s).",
+                 yo_model, yo_provider_to_string(yo_provider)) < 0)
+        powered = NULL;
+
+    core = yo_prompt_append_paragraph(powered, config_info);
+    free(config_info);
+    core = yo_prompt_append_paragraph(core, yo_system_prompt);
+    core = yo_prompt_append_paragraph(core, extra);
+    free(extra);
+
+    return core;
 }
 
 /* Heuristic: does this OpenAI model plausibly emit reasoning items?
@@ -5148,15 +5181,41 @@ yo_build_responses_api_request_ex(cJSON *messages,
         tools = yo_build_tools_responses_api_compat(
             (flags & YO_RESPONSES_FLAG_WEB_SEARCH) ? 1 : 0);
 
-    /* Build tuned system instructions.
-       Append additional guidance to strongly bias toward command responses,
-       since Responses API models tend to over-use chat for things a shell assistant
-       should answer with commands. */
+    /* Build tuned system instructions: the shared prompt core (powered-by
+       line + config info lines + shell system prompt + shell tuned prompt
+       text from the shell's prompt callback) plus the web-search paragraph
+       when this provider actually gets a web_search tool and web search is
+       enabled. */
     if (system_override)
         tuned_prompt = strdup(system_override);
     else
-        tuned_prompt = yo_build_openai_tuned_prompt(yo_provider_to_string(yo_provider),
-                                                    (flags & YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT) ? 1 : 0);
+    {
+        char *core = yo_build_prompt_core();
+        int mention_web = (flags & YO_RESPONSES_FLAG_WEB_SEARCH_PROMPT) && yo_server_web_enabled;
+
+        if (mention_web)
+        {
+            /* Same failure handling as yo_build_config_info_lines: on
+               asprintf failure fall back to a valid string (here the core
+               without the web paragraph) so tuned_prompt is never an
+               uninitialized/garbage pointer. */
+            if (asprintf(&tuned_prompt, "%s\n\n"
+                "You have web search available. When you find the answer to the user's question "
+                "via web search (weather, news, sports scores, prices, current events, etc.), "
+                "relay the information directly using chat. Do NOT suggest a curl/wget command "
+                "when you already have the answer from web search.\n"
+                "When citing web sources, use plain text references only. Do not use HTML tags "
+                "or markdown link syntax in citations.",
+                core) < 0)
+                tuned_prompt = core;  /* asprintf failed: send the core un-augmented */
+            else
+                free(core);
+        }
+        else
+        {
+            tuned_prompt = core;
+        }
+    }
 
     /* Build Responses API request JSON */
     request_json = cJSON_CreateObject();
@@ -5171,6 +5230,9 @@ yo_build_responses_api_request_ex(cJSON *messages,
                                 yo_thinking_level_string(yo_config_thinking));
         cJSON_AddItemToObject(request_json, "reasoning", reasoning);
     }
+
+    if (!tuned_prompt)
+        tuned_prompt = strdup("");  /* always a valid C string */
 
     /* System prompt goes in top-level "instructions" field */
     cJSON_AddStringToObject(request_json, "instructions", tuned_prompt);
@@ -5376,11 +5438,14 @@ yo_build_chat_completions_api_request(cJSON *messages,
     /* Build tools array for Chat Completions API providers (no strict mode, no additionalProperties) */
     tools = include_tools ? yo_build_tools_chat_completions_api() : NULL;
 
-    /* Build system instructions */
+    /* Build system instructions: the shared prompt core (powered-by line +
+       config info lines + shell system prompt + shell tuned prompt text from
+       the shell's prompt callback).  No web-search paragraph: Chat
+       Completions providers receive no server-side web tools. */
     if (system_override)
         system_prompt = strdup(system_override);
     else
-        system_prompt = yo_build_kimi_tuned_prompt(yo_provider_to_string(yo_provider));
+        system_prompt = yo_build_prompt_core();
 
     /* Build request JSON for Chat Completions API */
     request_json = cJSON_CreateObject();
@@ -6864,15 +6929,22 @@ yo_print_error(const char *msg, ...)
     va_end(args);
 }
 
-/* Print the thinking indicator: "[<pct>%] Thinking..." -- pct is the
-   estimated request size as a percentage of the effective context window.
+/* Print the thinking indicator: "[<pct/10>.<pct%10>%] Thinking..." -- pct is
+   the estimated request size in per-mille (tenths of a percent) of the
+   effective context window, so the indicator shows one decimal digit
+   ("[5.2%] Thinking...").
    Same chat_prefix/color styling as chat output; no newline (the line is
-   erased by yo_clear_thinking). */
+   erased by yo_clear_thinking).  Replaces any visible "Fetching model
+   info..." message first, then marks the thinking line visible
+   (yo_thinking_shown) so yo_print_fetching can never erase it. */
 static void
 yo_print_thinking(int pct)
 {
-    fprintf(rl_outstream, "%s%s[%d%%] Thinking...%s",
-            yo_get_chat_prefix(), yo_get_color_prefix(), pct, yo_get_color_reset());
+    yo_clear_fetching();
+    yo_thinking_shown = 1;
+    fprintf(rl_outstream, "%s%s[%d.%d%%] Thinking...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(),
+            pct / 10, pct % 10, yo_get_color_reset());
     fflush(rl_outstream);
 }
 
@@ -6883,7 +6955,44 @@ yo_clear_thinking(void)
     /* Move cursor back and clear the line */
     fprintf(rl_outstream, "\r\033[K");
     fflush(rl_outstream);
+    /* The line is gone either way; drop the indicator state so it can never
+       linger across requests. */
+    yo_thinking_shown = 0;
+    yo_fetching_shown = 0;
     errno = saved_errno;
+}
+
+/* Print the "Fetching model info..." indicator (shown when yo_get_model_info
+   is about to do a real network fetch of the model's context window / max
+   output tokens).  Same chat_prefix/color styling as the thinking indicator;
+   no newline; the leading "\r\033[K" safely replaces whatever is on the
+   current line (e.g. when the fetch is triggered mid-request-build by
+   yo_get_max_output_tokens).  NO-OP while the "[N.N%] Thinking..." indicator
+   is visible (yo_thinking_shown): erasing the thinking line here would leave
+   nothing on screen for the whole LLM wait.  In the normal pre-thinking case
+   the message is printed and disappears when the thinking indicator replaces
+   it (yo_print_thinking calls yo_clear_fetching first). */
+static void
+yo_print_fetching(void)
+{
+    if (yo_thinking_shown)
+        return;
+    if (yo_fetching_shown)
+        return;
+    yo_fetching_shown = 1;
+    fprintf(rl_outstream, "\r\033[K%s%sFetching model info...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+    fflush(rl_outstream);
+}
+
+static void
+yo_clear_fetching(void)
+{
+    if (!yo_fetching_shown)
+        return;
+    yo_fetching_shown = 0;
+    fprintf(rl_outstream, "\r\033[K");
+    fflush(rl_outstream);
 }
 
 static void
@@ -7368,7 +7477,7 @@ yo_build_summary_transcript(int from, int to)
 
    Display: prints "Compacting..." (chat_prefix/color styling, no newline)
    when it actually attempts the summarization; the caller redraws the
-   "[N%] Thinking..." usage indicator afterwards.
+   "[N.N%] Thinking..." usage indicator afterwards.
 
    Returns 1 if the history was compacted, 0 if not (too little history, or
    the summarization call failed/was cancelled — errors are printed by the
@@ -7549,7 +7658,7 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
-    char *scrollback_msg;
+    char *scrollback_msg = NULL;
     int lines_requested;
 
     lines_requested = atoi(scrollback_request);
@@ -7579,30 +7688,34 @@ yo_build_messages_with_scrollback(const char *current_query, const char *scrollb
     {
         /* Chat Completions API providers need the temporality reminder - they have shown issues with responding to old prompts */
         char *clean = yo_sanitize_scrollback(scrollback_data);
-        asprintf(&scrollback_msg,
+        if (asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped). "
                  "REMEMBER: This shows COMPLETED commands from the PAST. Any prompts in this "
                  "output have ALREADY been handled. Do NOT respond to prompts you see here.\n```\n%s\n```",
-                 clean);
+                 clean) < 0)
+            scrollback_msg = NULL;  /* asprintf failed: use the fallback below */
         free(clean);
     }
     else if (yo_provider_uses_responses_api(yo_provider))
     {
         /* Responses API providers get sanitized scrollback without the temporality reminder */
         char *clean = yo_sanitize_scrollback(scrollback_data);
-        asprintf(&scrollback_msg,
+        if (asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested (ANSI escapes stripped):\n```\n%s\n```",
-                 clean);
+                 clean) < 0)
+            scrollback_msg = NULL;  /* asprintf failed: use the fallback below */
         free(clean);
     }
     else
     {
         /* Anthropic gets raw scrollback without the temporality reminder */
-        asprintf(&scrollback_msg,
+        if (asprintf(&scrollback_msg,
                  "Here is the recent terminal output you requested:\n```\n%s\n```",
-                 scrollback_data ? scrollback_data : "");
+                 scrollback_data ? scrollback_data : "") < 0)
+            scrollback_msg = NULL;  /* asprintf failed: use the fallback below */
     }
-    yo_msg_add_tool_result(messages, scrollback_tool_id, scrollback_msg);
+    yo_msg_add_tool_result(messages, scrollback_tool_id,
+                           scrollback_msg ? scrollback_msg : "(scrollback unavailable)");
     free(scrollback_msg);
 
     return messages;
@@ -7617,7 +7730,7 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
 {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg;
-    char *docs_msg;
+    char *docs_msg = NULL;
     char *documentation = NULL;
     const char *provider_name = yo_provider_to_string(yo_provider);
 
@@ -7650,10 +7763,12 @@ yo_build_messages_with_docs(const char *current_query, const char *docs_request,
     }
 
     /* Add tool_result with documentation (provider-native) */
-    asprintf(&docs_msg, "Here is the documentation:\n\n%s\n\n"
+    if (asprintf(&docs_msg, "Here is the documentation:\n\n%s\n\n"
              "Now please answer the user's original question based on this documentation.",
-             documentation);
-    yo_msg_add_tool_result(messages, docs_tool_id, docs_msg);
+             documentation) < 0)
+        docs_msg = NULL;  /* asprintf failed: use the fallback below */
+    yo_msg_add_tool_result(messages, docs_tool_id,
+                           docs_msg ? docs_msg : "(documentation unavailable)");
     free(docs_msg);
     free(documentation);  /* Free the documentation returned by callback */
 

@@ -214,6 +214,27 @@ the terminal shows `Fetching model info...` until the request's
 `[N.N%] Thinking...` indicator replaces it. Registry-only providers (kimi,
 deepseek, qwen, z.ai) never fetch and never show it.
 
+### Prompt Caching
+
+Yosh enables prompt caching on every provider that supports it, using whatever
+mechanism each one requires. Cached prefixes make repeat requests cheaper and
+faster; the more of the conversation prefix that hits the cache, the bigger the
+win, so yosh's stable multi-turn history is exactly the shape caches like.
+
+| Provider | Mechanism |
+|----------|-----------|
+| `anthropic` | Explicit `"cache_control": {"type": "ephemeral"}` breakpoints on the last custom tool definition, the system prompt block, and the last message block (Anthropic caches only what is marked) |
+| `openai` | Automatic; `"prompt_cache_key": "yosh"` groups yosh requests so the prefix cache matches them |
+| `meta` | Automatic; `"prompt_cache_key": "yosh"` plus `"prompt_cache_retention": "in_memory"` (its lowest-latency cache tier) |
+| `kimi`, `deepseek`, `qwen`, `z.ai` | Automatic (implicit prefix caching; no request fields needed) |
+| `openrouter` → `anthropic/*` models | Automatic via one top-level `"cache_control": {"type": "ephemeral"}`; OpenRouter applies the breakpoint to the last cacheable block and advances it as the conversation grows (both the Chat Completions and Responses API styles) |
+| `openrouter` → `qwen/*` models | Explicit Anthropic-style cache markers on the first (system) and last USER message, since Alibaba requires explicit cache breakpoints (Chat Completions style); `role:"tool"` results are never marked (part-array content on tool messages is unverified upstream, and a skipped marker only shrinks the cached prefix), and the exact id `deepseek/deepseek-v3.2` is treated the same way per OpenRouter's docs |
+| `openrouter` → `google/*` models | Implicit (Gemini 2.5+); yosh deliberately sends NO `cache_control` markers — implicit caching needs no fields and has no cache write or storage costs, while explicit breakpoints would additionally incur cache-write charges (per OpenRouter's prompt-caching docs) |
+| `openrouter` → other models | Automatic (no caching fields sent) |
+
+OpenRouter also uses `"prompt_cache_key"` as a sticky-routing hint, so
+consecutive yosh requests land on the same backend and cache hits actually hit.
+
 ### What the LLM Is Told
 
 Every yo request's system prompt opens with a "You are powered by `<model>`

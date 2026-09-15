@@ -4525,30 +4525,24 @@ yo_anthropic_mark_cache_breakpoint(cJSON *obj)
     cJSON_AddItemToObject(obj, "cache_control", cache_control);
 }
 
-/* Mark the last content block of the last message in the messages array with
-   an Anthropic cache_control breakpoint (see yo_build_anthropic_request).
-   The last message's content may be a plain string (typical final user
-   message) or an array of blocks (e.g. a tool_result turn); both are handled.
-   Skips silently when the messages array is empty or malformed. */
+/* Mark the LAST content block of a single message's "content" with an
+   Anthropic-style cache_control breakpoint.  Plain string content is
+   converted to a one-element text-block array carrying the breakpoint (the
+   content-part shape is the same on the Anthropic Messages API and
+   OpenAI-style Chat Completions — part key "text"); array content gets the
+   breakpoint on its last element.  Only the "content" field is touched:
+   tool-call / function-call structures (tool_calls, function) are semantic
+   fields and are never modified.  Skips silently when the message has no
+   markable content. */
 static void
-yo_anthropic_mark_last_message_breakpoint(cJSON *messages)
+yo_mark_message_content_breakpoint(cJSON *msg)
 {
-    cJSON *last_msg;
     cJSON *content;
-    int msg_count;
 
-    if (!messages || !cJSON_IsArray(messages))
+    if (!msg || !cJSON_IsObject(msg))
         return;
 
-    msg_count = cJSON_GetArraySize(messages);
-    if (msg_count <= 0)
-        return;
-
-    last_msg = cJSON_GetArrayItem(messages, msg_count - 1);
-    if (!last_msg)
-        return;
-
-    content = cJSON_GetObjectItem(last_msg, "content");
+    content = cJSON_GetObjectItem(msg, "content");
     if (content && cJSON_IsString(content))
     {
         /* Plain string content: convert to a one-element text-block array
@@ -4561,13 +4555,35 @@ yo_anthropic_mark_last_message_breakpoint(cJSON *messages)
         yo_anthropic_mark_cache_breakpoint(block);
         cJSON_AddItemToArray(blocks, block);
         /* Replaces (and frees) the old string content item. */
-        cJSON_ReplaceItemInObject(last_msg, "content", blocks);
+        cJSON_ReplaceItemInObject(msg, "content", blocks);
     }
     else if (content && cJSON_IsArray(content) && cJSON_GetArraySize(content) > 0)
     {
         yo_anthropic_mark_cache_breakpoint(
             cJSON_GetArrayItem(content, cJSON_GetArraySize(content) - 1));
     }
+}
+
+/* Mark the last content block of the last message in the messages array with
+   an Anthropic cache_control breakpoint (see yo_build_anthropic_request).
+   The last message's content may be a plain string (typical final user
+   message) or an array of blocks (e.g. a tool_result turn); both are handled.
+   Skips silently when the messages array is empty or malformed. */
+static void
+yo_anthropic_mark_last_message_breakpoint(cJSON *messages)
+{
+    cJSON *last_msg;
+    int msg_count;
+
+    if (!messages || !cJSON_IsArray(messages))
+        return;
+
+    msg_count = cJSON_GetArraySize(messages);
+    if (msg_count <= 0)
+        return;
+
+    last_msg = cJSON_GetArrayItem(messages, msg_count - 1);
+    yo_mark_message_content_breakpoint(last_msg);
 }
 
 /* Build Anthropic request body, URL, and headers from provider-native messages.
@@ -5126,6 +5142,44 @@ yo_openai_model_supports_reasoning(const char *model)
     return major >= 5;
 }
 
+/* OpenRouter model IDs are vendor-prefixed: "anthropic/claude-opus-5",
+   "qwen/qwen-plus", "moonshotai/kimi-k3", "meta/muse-spark-1.3".  Return a
+   malloc'd LOWERCASE copy of the vendor part before the FIRST '/' so callers
+   can pick vendor-specific request fields — OpenRouter's prompt-caching
+   fields are vendor-dependent (Anthropic-routed models take a top-level
+   cache_control switch, Alibaba/Qwen-routed models need explicit per-block
+   breakpoints, everything else caches automatically).  NULL when yo_model
+   has no vendor prefix (no '/' or an empty one): callers treat that as
+   "vendor unknown" and send no caching fields.  The copy is lowercased so
+   call sites can use plain case-sensitive strcmp.  Caller frees. */
+static char *
+yo_openrouter_model_vendor(void)
+{
+    const char *slash;
+    char *vendor;
+    char *p;
+    size_t len;
+
+    if (!yo_model)
+        return NULL;
+
+    slash = strchr(yo_model, '/');
+    if (!slash || slash == yo_model)
+        return NULL;
+
+    len = (size_t)(slash - yo_model);
+    vendor = malloc(len + 1);
+    if (!vendor)
+        return NULL;
+    memcpy(vendor, yo_model, len);
+    vendor[len] = '\0';
+    for (p = vendor; *p; p++)
+        if (*p >= 'A' && *p <= 'Z')
+            *p = (char)(*p - 'A' + 'a');
+
+    return vendor;
+}
+
 /* **************************************************************** */
 /*                                                                  */
 /*               Responses API: Request Building & Response Parsing        */
@@ -5143,6 +5197,7 @@ yo_openai_model_supports_reasoning(const char *model)
 #define YO_RESPONSES_FLAG_INCLUDE_REASONING    (1 << 4)  /* send "include":["reasoning.encrypted_content"] so reasoning can be replayed on later turns */
 #define YO_RESPONSES_FLAG_META_CACHE_RETENTION (1 << 5)  /* send "prompt_cache_retention":"in_memory" (Meta Muse in-memory cache tier; OpenAI/OpenRouter 400 on unknown params) */
 #define YO_RESPONSES_FLAG_NO_TOOLS             (1 << 6)  /* tools-less request (context-compaction summarizer): no tools array, no tool_choice, no web_search */
+#define YO_RESPONSES_FLAG_CACHE_CONTROL        (1 << 7)  /* send top-level "cache_control":{"type":"ephemeral"} (OpenRouter Anthropic-routed models: automatic prompt caching with an advancing breakpoint) */
 
 /* Build Responses API request body, URL, and headers from provider-native messages.
    The system prompt is prepended as top-level instructions.
@@ -5276,6 +5331,21 @@ yo_build_responses_api_request_ex(cJSON *messages,
     if (flags & YO_RESPONSES_FLAG_META_CACHE_RETENTION)
         cJSON_AddStringToObject(request_json, "prompt_cache_retention", "in_memory");
 
+    /* OpenRouter only, Anthropic-routed models: a single TOP-LEVEL
+       "cache_control":{"type":"ephemeral"} switches on automatic prompt
+       caching — OpenRouter applies the breakpoint to the last cacheable
+       block and advances it forward as the conversation grows (documented
+       for the Responses API too; per-block Anthropic-style markers are NOT
+       exposed in Responses "input", so the top-level form is the only
+       supported shape).  Every other routed vendor caches automatically and
+       must see no caching fields. */
+    if (flags & YO_RESPONSES_FLAG_CACHE_CONTROL)
+    {
+        cJSON *cache_control = cJSON_CreateObject();
+        cJSON_AddStringToObject(cache_control, "type", "ephemeral");
+        cJSON_AddItemToObject(request_json, "cache_control", cache_control);
+    }
+
     request_body = cJSON_PrintUnformatted(request_json);
     cJSON_Delete(request_json);
 
@@ -5388,14 +5458,25 @@ yo_build_meta_request(cJSON *messages,
    Encrypted reasoning content is requested only when the ~/.yoconf
    `include_reasoning 1` directive is set: OpenRouter forwards encrypted
    reasoning for only some models, and sending "include" for the rest can
-   return HTTP 400. */
+   return HTTP 400.
+   Prompt caching is vendor-dependent (model IDs are "vendor/model"): for
+   Anthropic-routed models a top-level "cache_control":{"type":"ephemeral"}
+   is sent (OpenRouter's automatic-caching switch, supported on the Responses
+   API); every other vendor caches automatically and gets no caching fields. */
 static char *
 yo_build_openrouter_responses_request(cJSON *messages,
                                       const char **url_out, struct curl_slist **headers_out,
                                       long *timeout_out)
 {
+    char *vendor = yo_openrouter_model_vendor();
+    int anthropic_vendor = vendor && strcmp(vendor, "anthropic") == 0;
+
+    free(vendor);
+
     return yo_build_responses_api_request_ex(messages, url_out, headers_out, timeout_out,
                                              YO_RESPONSES_FLAG_TOOL_CHOICE_REQUIRED
+                                             | (anthropic_vendor
+                                                ? YO_RESPONSES_FLAG_CACHE_CONTROL : 0)
                                              | (yo_include_reasoning == 1
                                                 ? YO_RESPONSES_FLAG_INCLUDE_REASONING : 0),
                                              NULL, 0);
@@ -5429,11 +5510,13 @@ yo_build_chat_completions_api_request(cJSON *messages,
 
     ZASSERT(yo_model);
 
-    /* Prompt caching: nothing is sent for Chat Completions API providers.
-       Kimi, DeepSeek, Qwen, z.ai, and OpenRouter(chat) get automatic
-       server-side prompt caching from their vendors (prefix cache keyed on
-       the request itself); none of these vendors accepts cache-control
-       request parameters, so the request shape is left untouched. */
+    /* Prompt caching for Chat Completions API providers: Kimi, DeepSeek,
+       Qwen (direct DashScope), z.ai, and most OpenRouter-routed vendors get
+       automatic server-side prompt caching from their vendors (prefix cache
+       keyed on the request itself) and no cache-control request parameters,
+       so the request shape is left untouched.  The only exceptions are
+       OpenRouter-routed Anthropic and Alibaba/Qwen models — see the
+       OpenRouter block below (added once the messages array exists). */
 
     /* Build tools array for Chat Completions API providers (no strict mode, no additionalProperties) */
     tools = include_tools ? yo_build_tools_chat_completions_api() : NULL;
@@ -5550,6 +5633,83 @@ yo_build_chat_completions_api_request(cJSON *messages,
     }
     
     free(system_prompt);
+
+    /* Prompt caching through OpenRouter (chat style).  OpenRouter routes
+       each model to a vendor backend, and per OpenRouter's prompt-caching
+       docs most vendors cache automatically — but two vendor families and
+       one exact model id need request fields, and no other Chat Completions
+       provider gets anything:
+       - vendor "anthropic": add ONE top-level
+         "cache_control":{"type":"ephemeral"}.  OpenRouter then applies the
+         cache breakpoint to the last cacheable block and advances it forward
+         as the conversation grows — exactly right for yosh's multi-turn
+         history, and it means yosh never has to place per-block markers.
+       - vendor "qwen" or "alibaba", or the exact model id
+         "deepseek/deepseek-v3.2": Alibaba caching requires EXPLICIT
+         Anthropic-style cache breakpoints, so mark the FIRST message (the
+         system prompt) and the LAST message (plain string content is
+         converted to a one-element text-part array carrying the marker).
+         Only content parts are touched — tool/function-call arrays' semantic
+         fields are never modified.  (Single-message arrays are skipped for
+         the last-message mark: that message IS the first message and is
+         already marked, and a block must not carry two breakpoints.)
+         The last-message mark applies ONLY to user-role messages: in a tool
+         loop the last message is a role:"tool" tool result built with plain
+         string content, and converting that to a part array is accepted by
+         OpenRouter's schema but its acceptance by the Alibaba upstream
+         behind OpenRouter is UNVERIFIED — a rejection would 400 every
+         qwen-via-OpenRouter tool execution.  A skipped marker only shrinks
+         the cached prefix (the system marker still pins the stable prefix);
+         it never breaks the request.  ("system" can never be last — it is
+         always the first message.)
+       - any other vendor (or an unprefixed model id): nothing — automatic. */
+    if (yo_provider == YO_PROVIDER_OPENROUTER)
+    {
+        char *vendor = yo_openrouter_model_vendor();
+        cJSON *or_messages = cJSON_GetObjectItem(request_json, "messages");
+
+        if (vendor && strcmp(vendor, "anthropic") == 0)
+        {
+            cJSON *cache_control = cJSON_CreateObject();
+            cJSON_AddStringToObject(cache_control, "type", "ephemeral");
+            cJSON_AddItemToObject(request_json, "cache_control", cache_control);
+        }
+        else if (vendor
+                 && (strcmp(vendor, "qwen") == 0
+                     || strcmp(vendor, "alibaba") == 0
+                     /* One exact deepseek id is also Alibaba-hosted:
+                        OpenRouter's prompt-caching docs list it alongside
+                        the qwen ids ("Alibaba explicit caching is available
+                        on deepseek/deepseek-v3.2, qwen/qwen3-max,
+                        qwen/qwen-plus, ...").  EXACT id match (case-
+                        insensitive), not a prefix: the docs list exactly
+                        this id, and other deepseek model ids are not
+                        listed. */
+                     || strcasecmp(yo_model, "deepseek/deepseek-v3.2") == 0)
+                 && or_messages && cJSON_IsArray(or_messages)
+                 && cJSON_GetArraySize(or_messages) > 0)
+        {
+            int msg_count = cJSON_GetArraySize(or_messages);
+            cJSON *last_msg = (msg_count > 1)
+                ? cJSON_GetArrayItem(or_messages, msg_count - 1) : NULL;
+            cJSON *last_role = last_msg
+                ? cJSON_GetObjectItem(last_msg, "role") : NULL;
+
+            yo_mark_message_content_breakpoint(cJSON_GetArrayItem(or_messages, 0));
+
+            /* Last-message mark only for USER messages.  role:"tool" tool
+               results (the last message of every tool-loop turn) carry plain
+               string content; part-array content on tool messages is
+               unverified against the Alibaba upstream behind OpenRouter, so
+               sending it risks a 400 on every tool execution.  A skipped
+               marker only shrinks the cached prefix, never breaks the
+               request. */
+            if (last_role && cJSON_IsString(last_role)
+                && strcmp(last_role->valuestring, "user") == 0)
+                yo_mark_message_content_breakpoint(last_msg);
+        }
+        free(vendor);
+    }
 
     /* Add tools array (takes ownership) — omitted for tools-less requests */
     if (tools)
@@ -6036,7 +6196,9 @@ yo_call_api_with_messages_internal_ex(cJSON *messages, int is_retry, int no_tool
         /* Context-compaction summarizer: no tools, no tool_choice, minimal
            system prompt, capped output.  Keeps the provider's usual URL,
            headers, and cache-request shape (prompt_cache_key, store:false,
-           Anthropic system/final-message cache breakpoints). */
+           Anthropic system/final-message cache breakpoints).  The OpenRouter
+           anthropic-routed top-level cache_control flag stays off: the
+           summarizer is a one-off request whose prefix is never reused. */
         if (yo_provider_uses_responses_api(yo_provider))
         {
             /* OpenAI, Meta, and OpenRouter with `openrouter_api responses`.

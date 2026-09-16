@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <termios.h>
+#include <time.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pty.h>
@@ -107,6 +108,18 @@
 
 /* Timeout (seconds) for the best-effort model-info API GETs. */
 #define YO_MODEL_INFO_TIMEOUT 10L
+
+/* HTTP retry policy (mirrors brainstorm-3 lib/shared/http_client_retry.rb):
+   after the Nth failed attempt, wait min(YO_RETRY_BASE_DELAY_MS * 2^N,
+   YO_RETRY_MAX_DELAY_MS) before the next attempt, and give up after
+   YO_RETRY_MAX_ATTEMPTS attempts (so the first retry waits 1s, then 2s, 4s,
+   ... capped at 60s; the 9 in-loop waits sum to 1+2+4+8+16+32+60+60+60 =
+   243s, about 4 minutes of backoff in the worst all-transient case).
+   Only transient failure classes are retried -- see
+   yo_http_failure_retryable. */
+#define YO_RETRY_MAX_ATTEMPTS 10
+#define YO_RETRY_BASE_DELAY_MS 500
+#define YO_RETRY_MAX_DELAY_MS 60000
 
 /* Thinking levels, from the ~/.yoconf "thinking" directive.
    YO_THINKING_UNSET means the user did not configure thinking (disabled);
@@ -265,12 +278,13 @@ static int yo_last_was_command = 0;
    yo_print_fetching / yo_clear_fetching). */
 static int yo_fetching_shown = 0;
 
-/* 1 while the "[N.N%] Thinking..." indicator is on screen (set by
-   yo_print_thinking, cleared by yo_clear_thinking; every code path that
-   erases the thinking line goes through yo_clear_thinking, so the flag
-   cannot go stale).  yo_print_fetching refuses to print while this is set:
-   its leading "\r\033[K" would erase the thinking line, and nothing would
-   redraw it until the LLM response arrives. */
+/* 1 while the "Thinking..." indicator is on screen (set by yo_print_thinking
+   and by the "[attempt N/10] Thinking..." retry variant, cleared by
+   yo_clear_thinking; every code path that erases the thinking line goes
+   through yo_clear_thinking, so the flag cannot go stale).
+   yo_print_fetching refuses to print while this is set: its leading
+   "\r\033[K" would erase the thinking line, and nothing would redraw it
+   until the LLM response arrives. */
 static int yo_thinking_shown = 0;
 
 /* Continuation state for multi-step command sequences */
@@ -358,7 +372,6 @@ static int yo_estimate_tokens(void);
 static int yo_estimate_request_tokens(const char *query);
 static long yo_get_effective_context_window(void);
 static long yo_get_max_output_tokens(void);
-static long yo_usage_permille(long estimate, long window);
 static int yo_compact_history(void);
 static cJSON *yo_build_messages(const char *current_query);
 static cJSON *yo_build_messages_with_scrollback(const char *current_query, const char *scrollback_request,
@@ -372,10 +385,20 @@ static cJSON *yo_build_messages_with_docs(const char *current_query, const char 
 static void yo_print_error_no_newlinev(const char *msg, va_list args);
 static void yo_print_error_no_newline(const char *msg, ...);
 static void yo_print_error(const char *msg, ...);
-static void yo_print_thinking(int pct);
+static void yo_print_thinking(void);
 static void yo_clear_thinking(void);
 static void yo_print_fetching(void);
 static void yo_clear_fetching(void);
+static void yo_print_retry_waiting(int attempt);
+static void yo_print_retry_thinking(int attempt);
+static int yo_http_failure_retryable(int http_status, int had_transport_error);
+static int yo_http_backoff_wait(long delay_ms);
+static void yo_stash_last_response(const char *body);
+
+/* The most recent HTTP response body (defined in the HTTP infrastructure
+   section below; stashed by yo_http_perform, shown by "yo show last
+   response"). */
+static char *yo_last_response;
 static char *yo_build_config_info_lines(void);
 static char *yo_shell_tuned_prompt(void);
 static char *yo_prompt_append_paragraph(char *prompt, const char *para);
@@ -1500,14 +1523,15 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
     cJSON *tool_use;
     long window;
     int est;
-    long pct;
 
     memset(resp, 0, sizeof(*resp));
 
-    /* Context-usage estimate + thinking indicator.  The indicator lives here
-       (not at the call sites) so it can be redrawn when history compaction
-       runs.  pct = estimated request size (history + system prompt + query
-       + JSON slack) in per-mille of the effective context window.
+    /* Thinking indicator + compaction estimate.  The indicator (exactly
+       "Thinking..." -- no usage percentage) lives here (not at the call
+       sites) so it can be redrawn when history compaction runs.  est =
+       estimated request size (history + system prompt + query + JSON slack)
+       in tokens; it is NOT displayed -- it only feeds the compaction
+       threshold below (est > window/2).
 
        BOTH model-info accessors are resolved BEFORE the thinking indicator
        prints: yo_get_effective_context_window() and yo_get_max_output_tokens()
@@ -1526,14 +1550,13 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
     est = yo_estimate_request_tokens(query);
     window = yo_get_effective_context_window();
     (void)yo_get_max_output_tokens();  /* warm the model-info cache pre-thinking */
-    pct = yo_usage_permille(est, window);
-    yo_print_thinking((int)pct);
+    yo_print_thinking();
 
     /* Compact the session history when this request would exceed half of the
        effective context window.  yo_compact_history() prints its own
        "Compacting..." indicator (only when it actually attempts the
        summarization request); on failure it is best-effort — the history is
-       left alone and the original usage estimate stands.  The one exception
+       left alone and the original (uncompacted) estimate stands.  The one exception
        is Ctrl-C: a cancelled summarizer must not be followed by the main
        request (the user would have to press Ctrl-C twice, and "Cancelled"
        would be followed by the request going through anyway). */
@@ -1544,24 +1567,23 @@ yo_call_llm(const char *query, int flags, yo_response_t *resp)
         yo_cancelled = 0;
 
         if (yo_compact_history())
-        {
             est = yo_estimate_request_tokens(query);
-            pct = yo_usage_permille(est, window);
-        }
         else if (yo_cancelled)
         {
             /* The summarizer request was cancelled: the HTTP layer already
-               erased the "Compacting..." indicator and printed "Cancelled".
+               erased the "Compacting..." indicator (or one of its
+               "[attempt N/10] ..." retry variants) and printed "Cancelled".
                Abort the whole operation — no indicator redraw and no main
                request.  resp is still zeroed; the callers (rl_yo_accept_line,
                yo_continuation_hook) redisplay the prompt on a 0 return. */
             return 0;
         }
-        /* Redraw the indicator: "[M.N%] Thinking..." with the post-compaction
-           usage on success, the original "[N.N%] Thinking..." after a
-           best-effort (non-cancel) failure. */
+        /* Redraw the indicator (plain "Thinking..."): there is no usage
+           percentage to update any more, but the line must be restored
+           after "Compacting..." erased it, whether compaction succeeded or
+           proceeded best-effort. */
         yo_clear_thinking();
-        yo_print_thinking((int)pct);
+        yo_print_thinking();
     }
 
     /* Step 1: Call LLM API */
@@ -1806,6 +1828,83 @@ rl_yo_accept_line(int count, int key)
         return 0;
     }
 
+    /* Handle "yo show last response" -- dump the most recent HTTP response
+       body stashed by yo_http_perform (from ANY endpoint: LLM calls,
+       model-info GETs, ...).  Parsed directly, like "yo reset": no config
+       load, no LLM call, no markdown rendering. */
+    if (strcmp(rl_line_buffer, "yo show last response") == 0)
+    {
+        rl_crlf();
+        if (yo_last_response)
+        {
+            fprintf(rl_outstream, "%s%sLast HTTP response:\n",
+                    yo_get_chat_prefix(), yo_get_color_prefix());
+            fputs(yo_last_response, rl_outstream);  /* verbatim, raw */
+            fprintf(rl_outstream, "%s\n", yo_get_color_reset());
+        }
+        else
+        {
+            fprintf(rl_outstream, "%s%sNo response received yet.%s\n",
+                    yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+        }
+        fflush(rl_outstream);
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+        return 0;
+    }
+
+    /* Handle "yo show documentation" -- dump the shell's documentation for
+       the current provider/model via the docs callback, verbatim (raw text,
+       no markdown rendering, no LLM call).  Needs the provider/model, so it
+       parses ~/.yoconf first; on a config error the message was already
+       printed by yo_load_config.  Same contract as
+       yo_build_messages_with_docs: the callback returns newly allocated
+       memory we must free, and a NULL return means no documentation. */
+    if (strcmp(rl_line_buffer, "yo show documentation") == 0)
+    {
+        rl_crlf();
+        if (!yo_load_config(yo_load_config_on_prompt))
+        {
+            /* Config error already printed by yo_load_config */
+            rl_replace_line("", 0);
+            rl_on_new_line();
+            rl_redisplay();
+            return 0;
+        }
+        if (yo_documentation_callback)
+        {
+            char *documentation =
+                (char *)yo_documentation_callback(yo_provider_to_string(yo_provider),
+                                                  yo_model);
+            if (documentation)
+            {
+                fprintf(rl_outstream, "%s%s",
+                        yo_get_chat_prefix(), yo_get_color_prefix());
+                fputs(documentation, rl_outstream);  /* verbatim, raw */
+                fprintf(rl_outstream, "%s\n", yo_get_color_reset());
+                fflush(rl_outstream);
+                free(documentation);
+            }
+            else
+            {
+                fprintf(rl_outstream, "%s%s(no documentation available)%s\n",
+                        yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+                fflush(rl_outstream);
+            }
+        }
+        else
+        {
+            fprintf(rl_outstream, "%s%s(no documentation available)%s\n",
+                    yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+            fflush(rl_outstream);
+        }
+        rl_replace_line("", 0);
+        rl_on_new_line();
+        rl_redisplay();
+        return 0;
+    }
+
     fprintf(rl_outstream, "\n");
 
     /* Load config file fresh each time (sets provider, config_model, returns key) */
@@ -1819,7 +1918,7 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Unified LLM call: call_claude → parse → handle_requests → explanation_retry
-       (yo_call_llm prints the "[N.N%] Thinking..." indicator itself) */
+       (yo_call_llm prints the "Thinking..." indicator itself) */
     memset(&resp, 0, sizeof(resp));
     if (!yo_call_llm(saved_query, YO_LLM_RETRY_EXPLANATION_IF_PENDING, &resp))
     {
@@ -3491,13 +3590,145 @@ yo_sanitize_scrollback(const char *input)
 /*                                                                  */
 /* **************************************************************** */
 
+/* The most recent HTTP response body received from ANY endpoint (LLM calls,
+   model-info GETs, ...), kept so "yo show last response" can display it.
+   It is replaced by every subsequent response and holds the empty string
+   for a response with no body; NULL means nothing has been received yet in
+   this session. */
+static char *yo_last_response = NULL;
+
+/* Stash `body` as the most recent HTTP response.  Frees the previous stash
+   and strdups the new one (the empty string for a NULL or empty body). */
+static void
+yo_stash_last_response(const char *body)
+{
+    if (yo_last_response)
+    {
+        free(yo_last_response);
+        yo_last_response = NULL;
+    }
+    if (body && *body)
+        yo_last_response = strdup(body);
+    else
+        yo_last_response = strdup("");
+}
+
+/* Decide whether an HTTP failure is worth retrying.  `http_status` is the
+   response code (0 when none was received) and `had_transport_error` is set
+   for curl transport-level failures (resolve/connect/TLS/timeout/...).
+
+   Deliberate deviation from brainstorm-3's HttpClientRetry (the t800
+   reference): t800 retries every error class, but a deterministic 4xx (bad
+   API key, malformed request) can never succeed on retry and would only
+   make the user wait out the full ~4-minute backoff curve for nothing --
+   so yosh fails those immediately.  408 (request timeout), 429 (rate
+   limited), and every 5xx (server-side trouble) are the transient HTTP
+   classes, and transport errors are presumed transient as well. */
+static int
+yo_http_failure_retryable(int http_status, int had_transport_error)
+{
+    if (had_transport_error)
+        return 1;
+    return http_status == 408 || http_status == 429 || http_status >= 500;
+}
+
+/* Sleep `delay_ms` for the retry backoff, INTERRUPTIBLY: the SIGINT
+   self-pipe is polled so Ctrl-C ends the wait (and the whole request)
+   immediately instead of only after the delay.  The wait is tracked as a
+   CLOCK_MONOTONIC deadline: after a poll() EINTR (any other caught signal,
+   e.g. SIGWINCH on a terminal resize) the loop resumes with the REMAINING
+   delay instead of truncating the backoff, and yo_cancelled is re-checked
+   after every poll -- including timeout expiry, which can race a Ctrl-C
+   that lands between the poll's timeout decision and the next loop
+   iteration (missing it would let the next attempt's drain wipe the
+   cancellation, and cancellation is never retried).  Returns 0 when the
+   full delay elapsed, 1 when cancelled. */
+static int
+yo_http_backoff_wait(long delay_ms)
+{
+    struct pollfd pfd;
+    struct timespec now;
+
+    if (yo_cancelled)
+        return 1;
+    if (delay_ms <= 0)
+        return 0;
+
+    pfd.fd = yo_sigint_pipe[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+    {
+        /* No monotonic clock (essentially impossible): fall back to a
+           single poll of the whole delay. */
+        int rc = poll(&pfd, 1, (int)delay_ms);
+        if (rc > 0 && (pfd.revents & POLLIN))
+            return 1;  /* SIGINT arrived */
+        return yo_cancelled ? 1 : 0;
+    }
+
+    {
+        /* Deadline (monotonic ms) at which the full delay has passed. */
+        long deadline_ms = ((long)now.tv_sec * 1000 + now.tv_nsec / 1000000)
+                           + delay_ms;
+
+        for (;;)
+        {
+            long remaining_ms;
+            int rc;
+
+            if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+                return yo_cancelled ? 1 : 0;
+            remaining_ms = deadline_ms
+                           - ((long)now.tv_sec * 1000
+                              + now.tv_nsec / 1000000);
+            if (remaining_ms <= 0)
+                return yo_cancelled ? 1 : 0;  /* full delay elapsed */
+            rc = poll(&pfd, 1, (int)remaining_ms);
+            if (rc < 0)
+            {
+                if (errno == EINTR)
+                {
+                    /* Interrupted by a signal other than our SIGINT (no
+                       pipe byte was consumed): resume with the remaining
+                       delay instead of treating the backoff as elapsed. */
+                    if (yo_cancelled)
+                        return 1;
+                    continue;
+                }
+                /* Unexpected poll() failure: fall back to the flag. */
+                return yo_cancelled ? 1 : 0;
+            }
+            if (rc > 0 && (pfd.revents & POLLIN))
+                return 1;  /* SIGINT arrived */
+            if (yo_cancelled)
+                return 1;  /* raced the poll timeout (see comment above) */
+            /* This poll slice elapsed; loop and wait out the rest. */
+        }
+    }
+}
+
 /* Shared HTTP request core used by yo_http_post and yo_http_get.
-   Performs the curl multi-handle loop with Ctrl-C (self-pipe) cancellation.
+
+   Performs the curl multi-handle loop with Ctrl-C (self-pipe) cancellation
+   and t800-style retry with exponential backoff (YO_RETRY_* constants):
+   transport errors and 408/429/5xx statuses are retried, other HTTP
+   statuses fail immediately, and after the Nth failed attempt the next one
+   waits min(500 * 2^N, 60000) ms.  Cancellation is NEVER retried: Ctrl-C
+   mid-transfer or mid-backoff ends the request immediately with no further
+   attempts.  Each attempt re-initializes the response buffer and re-runs
+   the SIGINT drain/reset; the SIGINT handler install/restore wraps the
+   whole loop.
+
    `body` is the request body for POSTs (ignored when use_get is set);
    when use_get is set, a plain GET with no body is issued.
-   When quiet is set, no error/cancellation chatter is printed and the
-   thinking indicator is left alone (used for best-effort background
-   fetches such as model info).
+
+   When quiet is set (best-effort background fetches such as model info),
+   retries happen silently: no error/cancellation/indicator chatter at all,
+   and the thinking indicator is left alone -- but cancellation is still
+   checked during the backoff waits.
+
    Returns malloc'd response body on success, NULL on error/cancel.
    The caller owns the returned string and must free it.
    The headers list is freed by this function. */
@@ -3509,8 +3740,12 @@ yo_http_perform(const char *url, struct curl_slist *headers,
     CURLM *multi;
     yo_response_buffer_t response_buf = {0};
     struct sigaction sa, old_sa;
-    int still_running = 1;
+    char *result_body = NULL;
+    char *error_msg = NULL;   /* description of the failed attempt (malloc'd) */
+    int attempt;              /* 1-based attempt currently running */
+    int failures = 0;         /* failed attempts so far */
     int cancelled = 0;
+    int done = 0;
 
     /* Initialize self-pipe for Ctrl-C handling */
     if (yo_init_sigint_pipe() < 0)
@@ -3523,9 +3758,6 @@ yo_http_perform(const char *url, struct curl_slist *headers,
         curl_slist_free_all(headers);
         return NULL;
     }
-
-    /* Drain any stale signals and reset cancelled flag */
-    yo_drain_sigint_pipe();
 
     curl = curl_easy_init();
     if (!curl)
@@ -3552,7 +3784,9 @@ yo_http_perform(const char *url, struct curl_slist *headers,
         return NULL;
     }
 
-    /* Configure CURL easy handle */
+    /* Configure CURL easy handle once; the same handle is re-used for every
+       attempt (each attempt gets a fresh timeout clock when it is re-added
+       to the multi handle), and only the response buffer is reset. */
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     if (use_get)
@@ -3564,20 +3798,60 @@ yo_http_perform(const char *url, struct curl_slist *headers,
     if (timeout > 0)
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 
-    /* Add easy handle to multi handle */
-    curl_multi_add_handle(multi, curl);
-
-    /* Install our SIGINT handler for the duration of the request */
+    /* Install our SIGINT handler for the duration of the whole request:
+       every attempt AND every backoff wait between attempts. */
     sa.sa_handler = yo_sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, &old_sa);
 
-    /* Multi interface loop with curl_multi_poll() */
+    for (attempt = 1; attempt <= YO_RETRY_MAX_ATTEMPTS && !done && !cancelled;
+         attempt++)
     {
         CURLMcode mc;
-        bool had_curl_error = false;
-        while (still_running && !cancelled)
+        int still_running = 1;
+        int attempt_failed = 0;
+        int attempt_cancelled = 0;
+        int had_transport_error = 0;
+        int got_done_msg = 0;
+        long http_code = 0;
+
+        /* Each attempt builds its own error description; drop the previous
+           attempt's so retries cannot leak it. */
+        free(error_msg);
+        error_msg = NULL;
+
+        /* Cancellation is never retried: a Ctrl-C that landed after the
+           previous attempt finished -- e.g. in the window between the
+           backoff poll's timeout expiry and this loop iteration, which
+           yo_http_backoff_wait's own flag re-check can only narrow, not
+           close -- must end the request here.  This check MUST come BEFORE
+           the drain below: yo_drain_sigint_pipe() unconditionally resets
+           yo_cancelled and discards the pipe byte, so running it first
+           would make this check dead code.  The cancel path below does not
+           need to drain: the pending byte stays queued harmlessly and the
+           next request's attempt-1 drain discards it.  The first attempt
+           still drains first (no flag to honor yet), discarding signals
+           left over from earlier requests -- historical behavior. */
+        if (attempt > 1 && yo_cancelled)
+        {
+            cancelled = 1;
+            break;
+        }
+
+        /* Fresh signal state for this attempt: drain stale bytes and reset
+           the cancelled flag. */
+        yo_drain_sigint_pipe();
+
+        /* Fresh response buffer for this attempt. */
+        free(response_buf.data);
+        response_buf.data = NULL;
+        response_buf.size = 0;
+
+        curl_multi_add_handle(multi, curl);
+
+        /* Multi interface loop with curl_multi_poll() */
+        while (still_running)
         {
             int numfds;
             struct curl_waitfd extra_fd;
@@ -3586,7 +3860,10 @@ yo_http_perform(const char *url, struct curl_slist *headers,
             mc = curl_multi_perform(multi, &still_running);
             if (mc != CURLM_OK)
             {
-                had_curl_error = true;
+                if (asprintf(&error_msg, "HTTP error: %s", curl_multi_strerror(mc)) < 0)
+                    error_msg = NULL;
+                attempt_failed = 1;
+                had_transport_error = 1;
                 break;
             }
 
@@ -3602,120 +3879,186 @@ yo_http_perform(const char *url, struct curl_slist *headers,
             mc = curl_multi_poll(multi, &extra_fd, 1, 1000, &numfds);
             if (mc != CURLM_OK)
             {
-                had_curl_error = true;
+                if (asprintf(&error_msg, "HTTP error: %s", curl_multi_strerror(mc)) < 0)
+                    error_msg = NULL;
+                attempt_failed = 1;
+                had_transport_error = 1;
                 break;
             }
 
             /* Check if signal pipe has data (SIGINT was received) */
             if (extra_fd.revents & CURL_WAIT_POLLIN)
             {
-                cancelled = 1;
+                attempt_cancelled = 1;
                 break;
             }
 
-            /* Also check the flag in case signal arrived but poll didn't catch it */
+            /* Also check the flag in case signal arrived but poll didn't
+               catch it */
             if (yo_cancelled)
             {
-                cancelled = 1;
+                attempt_cancelled = 1;
                 break;
             }
         }
 
-        /* Restore original SIGINT handler */
-        sigaction(SIGINT, &old_sa, NULL);
-
-        if (had_curl_error)
+        /* Classify how this attempt ended (only when it neither failed at
+           the multi-API level nor was cancelled) */
+        if (!attempt_failed && !attempt_cancelled)
         {
-            if (!quiet)
+            CURLMsg *msg;
+            int msgs_left;
+            while ((msg = curl_multi_info_read(multi, &msgs_left)))
             {
-                yo_clear_thinking();
-                yo_print_error_no_newline("HTTP error: %s", curl_multi_strerror(mc));
-            }
-            goto http_error;
-        }
-    }
-
-    /* Handle cancellation */
-    if (cancelled)
-    {
-        if (!quiet)
-        {
-            yo_clear_thinking();
-            fprintf(rl_outstream, "%s%sCancelled%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
-            fflush(rl_outstream);
-        }
-        goto http_error;
-    }
-
-    {
-        CURLMsg *msg;
-        int msgs_left;
-        while ((msg = curl_multi_info_read(multi, &msgs_left)))
-        {
-            if (msg->msg == CURLMSG_DONE)
-            {
-                CURL *easy = msg->easy_handle;
-                ZASSERT(easy == curl);
-                CURLcode result = msg->data.result;
-
-                if (result != CURLE_OK)
+                if (msg->msg == CURLMSG_DONE)
                 {
-                    if (!quiet)
+                    CURL *easy = msg->easy_handle;
+                    ZASSERT(easy == curl);
+                    got_done_msg = 1;
+                    if (msg->data.result != CURLE_OK)
                     {
-                        yo_clear_thinking();
-                        yo_print_error_no_newline("HTTP error: %s", curl_easy_strerror(result));
+                        /* Transport-level failure (connect, resolve, TLS,
+                           timeout, ...) */
+                        if (asprintf(&error_msg, "HTTP error: %s",
+                                     curl_easy_strerror(msg->data.result)) < 0)
+                            error_msg = NULL;
+                        attempt_failed = 1;
+                        had_transport_error = 1;
                     }
-                    goto http_error;
-                }
-
-                {
-                    long http_code = 0;
-                    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
-                    if (http_code == 200)
-                        break;
-
-                    if (!quiet)
+                    else
                     {
-                        yo_clear_thinking();
-                        if (response_buf.data) {
-                            yo_print_error_no_newline(
-                                "Unexpected HTTP status code: %ld; full response: %s",
-                                http_code, response_buf.data);
-                        } else
-                            yo_print_error_no_newline("Unexpected HTTP status code: %ld", http_code);
+                        curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE,
+                                          &http_code);
                     }
-                    goto http_error;
+                    break;
                 }
             }
+
+            if (!got_done_msg)
+            {
+                /* Defensive: the transfer stopped without a completion
+                   message.  Treat it like a transport failure. */
+                error_msg = strdup("HTTP error: transfer ended without a completion message");
+                attempt_failed = 1;
+                had_transport_error = 1;
+            }
+        }
+
+        if (attempt_cancelled)
+            cancelled = 1;
+        else if (!attempt_failed && http_code == 200)
+        {
+            /* Success: an HTTP response was received -- stash it (even when
+               the body is empty) and hand the body to the caller. */
+            yo_stash_last_response(response_buf.data);
+            if (!response_buf.data)
+            {
+                error_msg = strdup("No response from API");
+                attempt_failed = 1;
+            }
+            else
+            {
+                result_body = response_buf.data;
+                response_buf.data = NULL;  /* ownership transferred */
+                done = 1;
+            }
+        }
+        else if (!attempt_failed)
+        {
+            /* Non-200 HTTP response received: stash the body, remember the
+               error text (printed only if this ends up being the FINAL
+               failure -- per-attempt errors are not printed as they
+               happen), and let the retry policy decide. */
+            yo_stash_last_response(response_buf.data);
+            if (asprintf(&error_msg, "Unexpected HTTP status code: %ld%s%s",
+                         http_code,
+                         response_buf.data ? "; full response: " : "",
+                         response_buf.data ? response_buf.data : "") < 0)
+                error_msg = NULL;
+            attempt_failed = 1;
+        }
+
+        curl_multi_remove_handle(multi, curl);
+
+        if (cancelled || done)
+            break;
+
+        if (attempt_failed)
+        {
+            long delay_ms = YO_RETRY_BASE_DELAY_MS;
+            int e;
+
+            failures++;
+
+            if (!yo_http_failure_retryable((int)http_code, had_transport_error)
+                || attempt >= YO_RETRY_MAX_ATTEMPTS)
+            {
+                /* Final failure: report it once and stop. */
+                if (!quiet)
+                {
+                    yo_clear_thinking();
+                    if (error_msg)
+                        yo_print_error_no_newline("%s", error_msg);
+                    else
+                        yo_print_error_no_newline("HTTP error");
+                }
+                break;
+            }
+
+            /* Exponential backoff before the next attempt, t800 arithmetic:
+               min(base * 2^failures, max) milliseconds. */
+            for (e = 0; e < failures; e++)
+            {
+                delay_ms *= 2;
+                if (delay_ms >= YO_RETRY_MAX_DELAY_MS)
+                {
+                    delay_ms = YO_RETRY_MAX_DELAY_MS;
+                    break;
+                }
+            }
+
+            if (quiet)
+            {
+                /* Silent retry: no indicator churn, but a Ctrl-C during the
+                   wait still cancels the whole request. */
+                if (yo_http_backoff_wait(delay_ms))
+                    cancelled = 1;
+            }
+            else
+            {
+                /* Attempt `attempt` failed; attempt `attempt + 1` is next.
+                   Clear the current line ("Thinking..." / "Compacting..." /
+                   a previous attempt's indicator), show the wait, sleep
+                   interruptibly, then show the next attempt's thinking
+                   line. */
+                yo_print_retry_waiting(attempt + 1);
+                if (yo_http_backoff_wait(delay_ms))
+                    cancelled = 1;
+                else
+                    yo_print_retry_thinking(attempt + 1);
+            }
         }
     }
 
-    /* Clean up curl handles */
-    curl_multi_remove_handle(multi, curl);
+    /* Restore original SIGINT handler (installed once around the whole
+       loop, restored once here) */
+    sigaction(SIGINT, &old_sa, NULL);
+
+    /* Cancellation is never retried and always ends the request */
+    if (cancelled && !quiet)
+    {
+        yo_clear_thinking();
+        fprintf(rl_outstream, "%s%sCancelled%s\n", yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+        fflush(rl_outstream);
+    }
+
+    free(error_msg);
+    free(response_buf.data);
     curl_multi_cleanup(multi);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    if (!response_buf.data)
-    {
-        if (!quiet)
-        {
-            yo_clear_thinking();
-            yo_print_error_no_newline("No response from API");
-        }
-        return NULL;
-    }
-
-    return response_buf.data;
-
-http_error:
-    if (response_buf.data)
-        free(response_buf.data);
-    curl_multi_remove_handle(multi, curl);
-    curl_multi_cleanup(multi);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return NULL;
+    return result_body;  /* NULL on error/cancel */
 }
 
 /* Make an HTTP POST request with curl multi-handle and Ctrl-C cancellation.
@@ -4447,8 +4790,8 @@ yo_get_max_output_tokens(void)
 }
 
 /* Context window for the current model: ~/.yoconf context_window override >
-   model/API-reported value > registry default.  (Used for context-usage
-   display and compaction thresholds.) */
+   model/API-reported value > registry default.  (Used for the compaction
+   threshold: a request is compacted when its estimate exceeds half of it.) */
 static long
 yo_get_context_window(void)
 {
@@ -4465,7 +4808,7 @@ yo_get_context_window(void)
     return YO_UNKNOWN_MODEL_CONTEXT_WINDOW;
 }
 
-/* Effective context-window budget for the usage indicator and compaction:
+/* Effective context-window budget for the compaction threshold:
    ~/.yoconf context_window override > ~/.yoconf token_budget (when explicitly
    set — it is repurposed as an alias of the context window) > the model's
    context window (API/registry). */
@@ -4479,26 +4822,6 @@ yo_get_effective_context_window(void)
         return (long)yo_token_budget;
 
     return yo_get_context_window();
-}
-
-/* Estimated request size in per-mille (tenths of a percent) of the context
-   window, clamped to [0, 999] (the indicator never reads "100.0%").  One
-   decimal digit of precision: per-mille/10 and per-mille%10 form "[N.N%]". */
-static long
-yo_usage_permille(long estimate, long window)
-{
-    long permille;
-
-    if (window <= 0)
-        return 0;
-
-    permille = estimate * 1000 / window;
-    if (permille < 0)
-        permille = 0;
-    if (permille > 999)
-        permille = 999;
-
-    return permille;
 }
 
 /* **************************************************************** */
@@ -7091,22 +7414,58 @@ yo_print_error(const char *msg, ...)
     va_end(args);
 }
 
-/* Print the thinking indicator: "[<pct/10>.<pct%10>%] Thinking..." -- pct is
-   the estimated request size in per-mille (tenths of a percent) of the
-   effective context window, so the indicator shows one decimal digit
-   ("[5.2%] Thinking...").
+/* Print the thinking indicator: exactly "Thinking..." (no usage percentage
+   -- the request-size estimate is still computed by yo_call_llm, but it
+   only feeds the compaction threshold, it is not displayed).
    Same chat_prefix/color styling as chat output; no newline (the line is
    erased by yo_clear_thinking).  Replaces any visible "Fetching model
    info..." message first, then marks the thinking line visible
    (yo_thinking_shown) so yo_print_fetching can never erase it. */
 static void
-yo_print_thinking(int pct)
+yo_print_thinking(void)
 {
     yo_clear_fetching();
     yo_thinking_shown = 1;
-    fprintf(rl_outstream, "%s%s[%d.%d%%] Thinking...%s",
+    fprintf(rl_outstream, "%s%sThinking...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
+    fflush(rl_outstream);
+}
+
+/* Print the "[attempt N/10] Waiting..." retry indicator: shown while the
+   exponential-backoff delay runs between a failed HTTP attempt and the next
+   one.  Replaces whatever the current indicator line shows ("Thinking...",
+   "Compacting...", or a previous attempt's indicator) via yo_clear_thinking;
+   same chat_prefix/color styling as the thinking indicator, no newline.
+   Does NOT mark the line as a thinking indicator (it is cleared again before
+   the next attempt's "[attempt N/10] Thinking..." print and before any
+   "Cancelled" message). */
+static void
+yo_print_retry_waiting(int attempt)
+{
+    yo_clear_thinking();
+    fprintf(rl_outstream, "%s%s[attempt %d/%d] Waiting...%s",
             yo_get_chat_prefix(), yo_get_color_prefix(),
-            pct / 10, pct % 10, yo_get_color_reset());
+            attempt, YO_RETRY_MAX_ATTEMPTS, yo_get_color_reset());
+    fflush(rl_outstream);
+}
+
+/* Print the "[attempt N/10] Thinking..." retry indicator: shown once the
+   backoff delay has elapsed, while the next attempt runs.  Clears whatever
+   the current line shows FIRST (a previous "[attempt N/10] Waiting...",
+   "Fetching model info...", etc.) -- without that the two indicators
+   concatenate on one terminal line -- mirroring yo_print_retry_waiting.
+   Like yo_print_thinking, it then marks the line as a thinking indicator
+   (yo_thinking_shown) so yo_print_fetching can never erase it mid-wait;
+   yo_clear_thinking resets the flags, the explicit re-set below restores
+   yo_thinking_shown for the line we are about to draw. */
+static void
+yo_print_retry_thinking(int attempt)
+{
+    yo_clear_thinking();
+    yo_thinking_shown = 1;
+    fprintf(rl_outstream, "%s%s[attempt %d/%d] Thinking...%s",
+            yo_get_chat_prefix(), yo_get_color_prefix(),
+            attempt, YO_RETRY_MAX_ATTEMPTS, yo_get_color_reset());
     fflush(rl_outstream);
 }
 
@@ -7129,8 +7488,8 @@ yo_clear_thinking(void)
    output tokens).  Same chat_prefix/color styling as the thinking indicator;
    no newline; the leading "\r\033[K" safely replaces whatever is on the
    current line (e.g. when the fetch is triggered mid-request-build by
-   yo_get_max_output_tokens).  NO-OP while the "[N.N%] Thinking..." indicator
-   is visible (yo_thinking_shown): erasing the thinking line here would leave
+   yo_get_max_output_tokens).  NO-OP while the "Thinking..." indicator is
+   visible (yo_thinking_shown): erasing the thinking line here would leave
    nothing on screen for the whole LLM wait.  In the normal pre-thinking case
    the message is printed and disappears when the thinking indicator replaces
    it (yo_print_thinking calls yo_clear_fetching first). */
@@ -7639,7 +7998,10 @@ yo_build_summary_transcript(int from, int to)
 
    Display: prints "Compacting..." (chat_prefix/color styling, no newline)
    when it actually attempts the summarization; the caller redraws the
-   "[N.N%] Thinking..." usage indicator afterwards.
+   "Thinking..." indicator afterwards.  If the summarizer HTTP call fails
+   with a retryable error it is retried with exponential backoff by the
+   shared HTTP core, so the line shows the "[attempt N/10] Waiting..." /
+   "[attempt N/10] Thinking..." retry variants while that happens.
 
    Returns 1 if the history was compacted, 0 if not (too little history, or
    the summarization call failed/was cancelled — errors are printed by the

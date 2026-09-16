@@ -150,7 +150,7 @@ All settings are configured in `~/.yoconf`. The file is re-read on each `yo` com
 | Directive | Default | Description |
 |-----------|---------|-------------|
 | `history_limit` | `10` | Max conversation exchanges to remember |
-| `token_budget` | (unset) | Alias of `context_window`: when set, it overrides the context budget used for the `[N.N%]` usage indicator and compaction (see below) |
+| `token_budget` | (unset) | Alias of `context_window`: when set, it overrides the context budget used for the compaction threshold (see below) |
 | `scrollback_enabled` | `1` | Set to `0` to disable terminal scrollback capture (startup only) |
 | `scrollback_bytes` | `1048576` | Max scrollback buffer size in bytes (startup only) |
 | `scrollback_lines` | `1000` | Max lines to return to the LLM (startup only) |
@@ -180,10 +180,19 @@ These directives control the ANSI escape sequences used for rendering markdown f
 
 ### Context Compaction
 
-While the LLM is working, yosh prints `[N.N%] Thinking...`, where N.N is a rough
-estimate of the request size (session history + system prompt + your query, at
-~4 characters per token) as a percentage of the context window, shown with one
-decimal digit.
+While the LLM is working, yosh prints `Thinking...`.
+
+HTTP requests are retried automatically with exponential backoff (the same
+policy as t800's HTTP client): after a failed attempt yosh waits 1s, then 2s,
+4s, 8s, ... capped at 60s, and gives up after 10 attempts. During a retry the
+indicator becomes `[attempt N/10] Waiting...` while yosh waits and
+`[attempt N/10] Thinking...` while the next attempt runs. Retried failures are
+connection/resolve/timeout/other transport errors and HTTP 408, 429, and 5xx
+responses; other HTTP errors (400, 401, 403, 404, 422, ...) fail immediately
+because they cannot succeed on retry. Pressing Ctrl-C at any point — during a
+request or during a backoff wait — cancels instantly with `Cancelled` and no
+further attempts. The last HTTP response body received from any endpoint
+(success or failure) is kept and can be shown with `yo show last response`.
 
 When the estimate crosses 50% of the context window, yosh compacts the session
 history before sending the request:
@@ -193,8 +202,8 @@ history before sending the request:
    (its output is capped at 2048 tokens).
 2. The summary replaces those exchanges as a single `[context compacted]`
    exchange; the most recent ~25% of the history is kept verbatim.
-3. The terminal shows the sequence `[62.4%] Thinking...` → `Compacting...` →
-   `[49.1%] Thinking...`.
+3. The terminal shows the sequence `Thinking...` → `Compacting...` →
+   `Thinking...`.
 
 Compaction is best-effort on failure: if the summarization request fails (for
 example an HTTP error), the original request proceeds with the uncompacted
@@ -211,7 +220,7 @@ model-info API (when it reports them) or a built-in model registry, and cached
 per (provider, model, base_url). When yosh performs a network (re)fetch — the
 first use, or after you change `provider`/`model`/`base_url` in `~/.yoconf` —
 the terminal shows `Fetching model info...` until the request's
-`[N.N%] Thinking...` indicator replaces it. Registry-only providers (kimi,
+`Thinking...` indicator replaces it. Registry-only providers (kimi,
 deepseek, qwen, z.ai) never fetch and never show it.
 
 ### Prompt Caching
@@ -266,6 +275,15 @@ yo what is the weather in mammoth?
 ```
 
 When the LLM generates a command, it appears prefilled at your prompt. Press Enter to execute it, or edit it first. Press Ctrl-C or enter an empty line to cancel.
+
+Two more commands are parsed directly by the shell (no LLM call, like `yo reset`):
+
+- `yo show last response` — prints the most recent HTTP response body received
+  from any API endpoint (LLM calls and model-info lookups alike, success or
+  failure), verbatim and un-rendered. Handy for seeing exactly what an API
+  error said. Before anything has been received it prints `No response received yet.`
+- `yo show documentation` — prints the shell's documentation for the current
+  provider and model (the same text the LLM's `docs` tool returns), verbatim.
 
 ## Source Code
 

@@ -261,7 +261,7 @@ Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches bo
 
 - `yo reset` — clears conversation context and scrollback
 - `yo show last response` — prints `Last HTTP response:` followed by the stashed most-recent HTTP response body verbatim (raw `fputs`, no markdown rendering); `No response received yet.` when nothing has been received this session
-- `yo show documentation` — loads the config (provider/model needed), then prints the `rl_yo_docs_callback_t` documentation for `(yo_provider_to_string(yo_provider), yo_model)` verbatim (raw text, no markdown, no LLM); `(no documentation available)` when no callback is set or it returns NULL
+- `yo show documentation` — loads the config (provider/model needed), then prints the `rl_yo_docs_callback_t` documentation for `(yo_provider_to_string(yo_provider), yo_model)` through the markdown renderer (`yo_display_chat`, no LLM); `(no documentation available)` when no callback is set or it returns NULL/empty
 
 ### Key Files
 

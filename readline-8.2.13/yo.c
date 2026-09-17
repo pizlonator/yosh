@@ -1855,12 +1855,14 @@ rl_yo_accept_line(int count, int key)
     }
 
     /* Handle "yo show documentation" -- dump the shell's documentation for
-       the current provider/model via the docs callback, verbatim (raw text,
-       no markdown rendering, no LLM call).  Needs the provider/model, so it
-       parses ~/.yoconf first; on a config error the message was already
-       printed by yo_load_config.  Same contract as
-       yo_build_messages_with_docs: the callback returns newly allocated
-       memory we must free, and a NULL return means no documentation. */
+       the current provider/model via the docs callback, rendered through the
+       markdown renderer (yo_display_chat: chat_prefix/color styling, heading,
+       emphasis, and code-block treatment, color reset, trailing newline --
+       no LLM call).  Needs the provider/model, so it parses ~/.yoconf first;
+       on a config error the message was already printed by yo_load_config.
+       Same contract as yo_build_messages_with_docs: the callback returns
+       newly allocated memory we must free, and a NULL return means no
+       documentation. */
     if (strcmp(rl_line_buffer, "yo show documentation") == 0)
     {
         rl_crlf();
@@ -1877,27 +1879,15 @@ rl_yo_accept_line(int count, int key)
             char *documentation =
                 (char *)yo_documentation_callback(yo_provider_to_string(yo_provider),
                                                   yo_model);
-            if (documentation)
-            {
-                fprintf(rl_outstream, "%s%s",
-                        yo_get_chat_prefix(), yo_get_color_prefix());
-                fputs(documentation, rl_outstream);  /* verbatim, raw */
-                fprintf(rl_outstream, "%s\n", yo_get_color_reset());
-                fflush(rl_outstream);
-                free(documentation);
-            }
+            if (documentation && *documentation)
+                yo_display_chat(documentation);
             else
-            {
-                fprintf(rl_outstream, "%s%s(no documentation available)%s\n",
-                        yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
-                fflush(rl_outstream);
-            }
+                yo_display_chat("(no documentation available)");
+            free(documentation);
         }
         else
         {
-            fprintf(rl_outstream, "%s%s(no documentation available)%s\n",
-                    yo_get_chat_prefix(), yo_get_color_prefix(), yo_get_color_reset());
-            fflush(rl_outstream);
+            yo_display_chat("(no documentation available)");
         }
         rl_replace_line("", 0);
         rl_on_new_line();

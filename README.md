@@ -283,7 +283,8 @@ Two more commands are parsed directly by the shell (no LLM call, like `yo reset`
   failure), verbatim and un-rendered. Handy for seeing exactly what an API
   error said. Before anything has been received it prints `No response received yet.`
 - `yo show documentation` — prints the shell's documentation for the current
-  provider and model (the same text the LLM's `docs` tool returns), verbatim.
+  provider and model (the same text the LLM's `docs` tool returns), rendered
+  through the markdown renderer (no LLM).
 
 ## Source Code
 

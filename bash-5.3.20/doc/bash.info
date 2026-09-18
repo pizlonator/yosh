@@ -1,4 +1,4 @@
-This is bash.info, produced by makeinfo version 7.2 from bashref.texi.
+This is bash.info, produced by makeinfo version 7.1 from bashref.texi.
 
 This text is a brief description of the features that are present in the
 Bash shell (version 5.3, 18 May 2025).
@@ -13608,6 +13608,7 @@ D.5 Concept Index
 * word splitting:                        Word Splitting.      (line   6)
 * yanking text:                          Readline Killing Commands.
                                                               (line   6)
+
 
 
 Tag Table:

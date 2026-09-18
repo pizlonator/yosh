@@ -4,7 +4,7 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Project Overview
 
-**Yosh** is an LLM-enabled shell - a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, compiled using the Fil-C memory-safe compiler toolchain. The entire stack (bash, readline, libcurl, openssl, zlib, libc) is compiled with Fil-C for memory safety.
+**Yosh** is an LLM-enabled shell - a custom build of GNU Bash 5.3.20 with GNU Readline 8.3.6, compiled using the Fil-C memory-safe compiler toolchain. The entire stack (bash, readline, libcurl, openssl, zlib, libc) is compiled with Fil-C for memory safety.
 
 The key feature is the "yo" command: type `yo <natural language>` and the shell calls an LLM (Anthropic Claude, OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta Muse, or OpenRouter) to either generate a shell command or answer a question.
 
@@ -18,11 +18,11 @@ The key feature is the "yo" command: type `yo <natural language>` and the shell 
 
 ```
 yosh/
-├── readline-8.2.13/    # GNU Readline with "yo" LLM integration
+├── readline-8.3.6/    # GNU Readline with "yo" LLM integration
 │   ├── yo.c            # All LLM code: API, session memory, PTY proxy, scrollback, continuation
 │   ├── yo.h            # Public API for yo feature
 │   └── cJSON.[ch]      # Embedded JSON parser (MIT licensed)
-├── bash-5.2.32/        # Yosh shell (bash fork)
+├── bash-5.3.20/        # Yosh shell (bash fork)
 │   ├── shell.c         # Main init (readline before job control - critical!)
 │   ├── bashline.c      # Calls rl_yo_enable() with system prompt
 │   └── version.c       # "Fil's yosh" branding
@@ -34,7 +34,7 @@ yosh/
 
 ### Architecture
 
-The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)` plus two callbacks: a docs callback (`rl_yo_docs_callback_t`) and a tuned-prompt callback (`rl_yo_prompt_callback_t`) that returns the shell-specific "You are a SHELL assistant..." prompt text (implemented in `bash-5.2.32/bashline.c`; see "Request Prompt Composition" below).
+The yo feature is an **opt-in readline extension** (like history). Readline provides `yo.c` with all LLM logic; bash provides the system prompt via `rl_yo_enable(prompt)` plus two callbacks: a docs callback (`rl_yo_docs_callback_t`) and a tuned-prompt callback (`rl_yo_prompt_callback_t`) that returns the shell-specific "You are a SHELL assistant..." prompt text (implemented in `bash-5.3.20/bashline.c`; see "Request Prompt Composition" below).
 
 **Multi-provider support**: yo supports Anthropic (Claude), OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta (Muse), and OpenRouter APIs. The provider is selected via `~/.yoconf`. Anthropic, OpenAI, and Kimi each have their own API style; DeepSeek, Qwen, and z.ai use the Chat Completions API style; Meta and OpenRouter speak the OpenAI Responses API style (OpenRouter can also use Chat Completions — see `openrouter_api` below). The tuned prompt a request carries is selected MODEL-PREFIX-based, not API-style-based — see "Request Prompt Composition" step 4. The architecture keeps provider-specific code separated:
 - Message building uses provider-aware helpers (`yo_msg_add_tool_use`, `yo_msg_add_tool_result`) that produce native JSON for each provider from C parameters
@@ -192,7 +192,7 @@ All three request builders (`yo_build_anthropic_request_ex`, `yo_build_responses
 1. `You are powered by <model> (provider: <provider>).`
 2. Blank line, then the config-info lines (`yo_build_config_info_lines()`): `Context window: <N> tokens (context is compacted automatically above 50% usage).` / `Max output tokens per response: <N>.` / `Server-side web search: <enabled|disabled>.` / `Thinking level: <level|provider default>.` / `Prompt caching: enabled.` (plus `API base URL: <url>.` when `base_url` is set)
 3. Blank line, then the shell system prompt (`yo_system_prompt` — the four-tools guidance + shell intro + OS info)
-4. Blank line, then the shell's tuned-prompt text (`yo_shell_tuned_prompt()` — the `rl_yo_prompt_callback_t` callback registered by `bash-5.2.32/bashline.c` as `yosh_get_tuned_prompt`; empty for the anthropic provider, the OpenAI-tuned text for openai/meta providers and for gpt/o1/o3/o4/muse-prefixed models (case-insensitive, also tried on the vendor-stripped name after the last `/`), the Kimi-tuned text otherwise). The two tuned texts live in bashline.c, not in yo.c — yo.c only composes. Selection is deliberately MODEL-PREFIX-based, NOT API-style-based. Consequences: OpenRouter chat with the default model `meta/muse-spark-1.3` gets the OPENAI-tuned text (the vendor-stripped name starts with `muse`); `anthropic/claude-*` models through OpenRouter get the KIMI-tuned text in either API style; muse/gpt/o-series models on Chat Completions providers get the OpenAI-tuned text, which therefore LACKS the "EXAMPLES FORMAT" and "SCROLLBACK TEMPORALITY" reminders (those ride only in the Kimi-tuned text). This asymmetry is intentional, per the model-prefix-based selection spec.
+4. Blank line, then the shell's tuned-prompt text (`yo_shell_tuned_prompt()` — the `rl_yo_prompt_callback_t` callback registered by `bash-5.3.20/bashline.c` as `yosh_get_tuned_prompt`; empty for the anthropic provider, the OpenAI-tuned text for openai/meta providers and for gpt/o1/o3/o4/muse-prefixed models (case-insensitive, also tried on the vendor-stripped name after the last `/`), the Kimi-tuned text otherwise). The two tuned texts live in bashline.c, not in yo.c — yo.c only composes. Selection is deliberately MODEL-PREFIX-based, NOT API-style-based. Consequences: OpenRouter chat with the default model `meta/muse-spark-1.3` gets the OPENAI-tuned text (the vendor-stripped name starts with `muse`); `anthropic/claude-*` models through OpenRouter get the KIMI-tuned text in either API style; muse/gpt/o-series models on Chat Completions providers get the OpenAI-tuned text, which therefore LACKS the "EXAMPLES FORMAT" and "SCROLLBACK TEMPORALITY" reminders (those ride only in the Kimi-tuned text). This asymmetry is intentional, per the model-prefix-based selection spec.
 5. The web-search paragraph where it applies today: the Anthropic builder appends its web_search/web_fetch paragraph when `yo_server_web_enabled` and tools are included; the Responses API builder appends the "You have web search available..." paragraph when the provider sends a web_search tool (OpenAI/Meta) and web search is enabled (never for OpenRouter); the Chat Completions builder has none.
 
 The compaction summarizer request is exempt: it passes its own minimal summarizer system prompt via `system_override`, and the builders skip the whole composition in that case (no powered-by line, no config info, no tuned text).
@@ -267,13 +267,13 @@ Self-pipe trick: SIGINT handler writes to a pipe, `curl_multi_poll()` watches bo
 
 | File | Purpose |
 |------|---------|
-| `readline-8.2.13/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi + DeepSeek + Qwen + z.ai + Meta + OpenRouter), model registry, compaction, session memory, PTY proxy, scrollback, continuation |
-| `readline-8.2.13/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_docs_callback_t`, `rl_yo_prompt_callback_t`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
-| `bash-5.2.32/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt, docs callback (`yosh_get_documentation`), and tuned-prompt callback (`yosh_get_tuned_prompt` — the shell-specific "CRITICAL: You are a SHELL assistant..." texts) |
-| `bash-5.2.32/shell.c` | Main shell init; readline must init before job control |
+| `readline-8.3.6/yo.c` | All LLM code: multi-provider API calls (Anthropic + OpenAI + Kimi + DeepSeek + Qwen + z.ai + Meta + OpenRouter), model registry, compaction, session memory, PTY proxy, scrollback, continuation |
+| `readline-8.3.6/yo.h` | Public API: `rl_yo_enable()`, `rl_yo_docs_callback_t`, `rl_yo_prompt_callback_t`, `rl_yo_accept_line()`, `rl_yo_get_scrollback()` |
+| `bash-5.3.20/bashline.c` | Calls `rl_yo_enable()` with yosh's system prompt, docs callback (`yosh_get_documentation`), and tuned-prompt callback (`yosh_get_tuned_prompt` — the shell-specific "CRITICAL: You are a SHELL assistant..." texts) |
+| `bash-5.3.20/shell.c` | Main shell init; readline must init before job control |
 
 ## Development Workflow
 
-1. Make code changes in `bash-5.2.32/` or `readline-8.2.13/`
+1. Make code changes in `bash-5.3.20/` or `readline-8.3.6/`
 2. Run `./build_incremental.sh` to rebuild
 3. Test at `../fil-c-5/pizfix/bin/yosh`

@@ -1,6 +1,6 @@
 # Yosh 0.1.2
 
-Yosh is an LLM-enabled shell. It's a custom build of GNU Bash 5.2.32 with GNU Readline 8.2.13, featuring built-in LLM integration for natural language command generation and assistance. It supports **Anthropic Claude**, **OpenAI**, **Kimi**, **DeepSeek**, **Qwen**, **z.ai**, **Meta Muse**, and **OpenRouter** as providers.
+Yosh is an LLM-enabled shell. It's a custom build of GNU Bash 5.3.20 with GNU Readline 8.3.6, featuring built-in LLM integration for natural language command generation and assistance. It supports **Anthropic Claude**, **OpenAI**, **Kimi**, **DeepSeek**, **Qwen**, **z.ai**, **Meta Muse**, and **OpenRouter** as providers.
 
 The key feature is the **yo** command: type `yo <natural language>` at the prompt and the shell calls an LLM to either generate a shell command or answer a question directly.
 
@@ -253,7 +253,7 @@ compacted automatically above 50% usage), the max output tokens per response,
 whether server-side web search is enabled, the configured thinking level, and
 that prompt caching is enabled (plus the API base URL, when one is set). The
 shell then appends its own tuning text for the provider/model (see the
-`rl_yo_enable` prompt callback in `bash-5.2.32/bashline.c`). The compaction
+`rl_yo_enable` prompt callback in `bash-5.3.20/bashline.c`). The compaction
 summarizer request is exempt: it uses a minimal system prompt only.
 
 ## Usage

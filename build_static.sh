@@ -73,12 +73,12 @@ $MAKE -j $NCPU install
 cd ../../../
 
 FILCSRC=$PWD
-cd ../yosh/readline-8.2.13
+cd ../yosh/readline-8.3.6
 CC=$FILCSRC/build/bin/clang CXX=$FILCSRC/build/bin/clang++ ./configure --prefix=$FILCSRC/pizfix --with-curses --disable-shared
 make -j `nproc`
 make -j `nproc` install
 
-cd ../bash-5.2.32
+cd ../bash-5.3.20
 CC=$FILCSRC/build/bin/clang CXX=$FILCSRC/build/bin/clang++ LDFLAGS="-static" LIBS="-lreadline -lncurses -lcurl -lnghttp2 -lidn2 -lunistring -lssl -lcrypto -lz -lzstd -lm" ./configure --prefix=$FILCSRC/pizfix --without-bash-malloc --with-installed-readline
 make -j `nproc`
 make -j `nproc` install

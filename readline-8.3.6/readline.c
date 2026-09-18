@@ -76,6 +76,8 @@ extern int errno;
 #  include "parse-colors.h"
 #endif
 
+#include <stdfil.h>
+
 #ifndef RL_LIBRARY_VERSION
 #  define RL_LIBRARY_VERSION "8.1"
 #endif

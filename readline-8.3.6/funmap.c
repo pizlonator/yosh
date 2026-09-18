@@ -1,6 +1,7 @@
 /* funmap.c -- attach names to functions. */
 
-/* Copyright (C) 1987-2024 Free Software Foundation, Inc.
+/* Copyright (C) 2026 Epic Games, Inc.
+   Copyright (C) 1987-2024 Free Software Foundation, Inc.
 
    This file is part of the GNU Readline Library (Readline), a library
    for reading lines of text with interactive input and history editing.      
@@ -37,6 +38,7 @@
 
 #include "rlconf.h"
 #include "readline.h"
+#include "yo.h"
 
 #include "xmalloc.h"
 
@@ -149,6 +151,7 @@ static const FUNMAP default_funmap[] = {
   { "yank-last-arg", rl_yank_last_arg },
   { "yank-nth-arg", rl_yank_nth_arg },
   { "yank-pop", rl_yank_pop },
+  { "yo-accept-line", rl_yo_accept_line },
 
 #if defined (VI_MODE)
   { "vi-append-eol", rl_vi_append_eol },

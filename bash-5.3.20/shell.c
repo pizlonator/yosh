@@ -1965,6 +1965,9 @@ shell_initialize (void)
   initialize_shell_variables (shell_environment, privileged_mode||running_setuid);
 #endif
 
+  if (interactive_shell)
+    initialize_readline ();
+
   /* Initialize the data structures for storing and running jobs. */
   initialize_job_control (jobs_m_flag);
 

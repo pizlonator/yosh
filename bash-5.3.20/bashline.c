@@ -1,8 +1,9 @@
 /* bashline.c -- Bash's interface to the readline library. */
 
-/* Copyright (C) 1987-2025 Free Software Foundation, Inc.
+/* Copyright (C) 2026 Epic Games, Inc.
+   Copyright (C) 1987-2025 Free Software Foundation, Inc.
 
-   This file is part of GNU Bash, the Bourne Again SHell.
+   This file is part of Yosh, based on GNU Bash, the Bourne Again SHell.
 
    Bash is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -69,6 +70,7 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <readline/rlmbutil.h>
+#include <readline/yo.h>
 
 #include <glob/glob.h>
 
@@ -446,6 +448,715 @@ enable_hostname_completion (int on_or_off)
   return (old_value);
 }
 
+/* Documentation callback for yosh - returns provider-specific documentation.
+   The returned string is newly allocated and must be freed by the caller. */
+static const char *
+yosh_get_documentation (const char *provider, const char *model)
+{
+  const char *base_documentation =
+    "# Yosh Documentation\n"
+    "\n"
+    "Yosh is an LLM-enabled shell - a custom build of GNU Bash with an integrated AI assistant.\n"
+    "The key feature is the 'yo' command: type `yo <natural language>` and the shell calls an LLM\n"
+    "to either generate a shell command or answer a question.\n"
+    "\n"
+    "## Basic Usage\n"
+    "\n"
+    "- `yo find all python files` - generates a command like `find . -name '*.py'`\n"
+    "- `yo what does the -r flag do for grep` - answers the question directly\n"
+    "- `yo reset` - clears conversation context and scrollback buffer\n"
+    "- `yo show last response` - prints the most recent HTTP response body\n"
+    "  received from the LLM API (useful for debugging API errors)\n"
+    "- `yo show documentation` - prints this documentation through the markdown\n"
+    "  renderer for the current provider and model (no LLM)\n"
+    "\n"
+    "These commands (and `yo reset`) are parsed directly by the shell without\n"
+    "calling the LLM.\n"
+    "\n"
+    "When yo generates a command, it appears pre-filled at the prompt. The user can:\n"
+    "- Press Enter to execute it\n"
+    "- Edit it before executing\n"
+    "- Press Ctrl-C to cancel (clears the line)\n"
+    "- Type a new `yo ` query to ask something else\n"
+    "\n"
+    "## Configuration\n"
+    "\n"
+    "### Config file (~/.yoconf)\n"
+    "\n"
+    "Yosh is configured via `~/.yoconf`, a simple text file with directives.\n"
+    "The file MUST have mode 0600. It is read fresh on each yo command.\n"
+    "All directives are optional.\n"
+    "\n"
+    "#### Directives\n"
+    "\n"
+    "- `provider` - The LLM provider: `anthropic`, `openai`, `kimi`, `deepseek`, `qwen`, `zai`,\n"
+    "  `meta` (or `muse`), or `openrouter`.\n"
+    "- `key` - Your API key.\n"
+    "- `model` - The model to use.\n"
+    "  Defaults: `claude-sonnet-4-5-20250929` for Anthropic, `gpt-5.2` for OpenAI,\n"
+    "  `kimi-k2.5` for Kimi, `deepseek-v4-flash` for DeepSeek, `qwen-plus` for Qwen,\n"
+    "  `glm-5.2` for z.ai, `muse-spark-1.3` for Meta, `meta/muse-spark-1.3` for OpenRouter.\n"
+    "- `openrouter_api` - API style for the OpenRouter provider: `chat` (OpenAI Chat\n"
+    "  Completions API, the default) or `responses` (OpenAI Responses API). Only valid\n"
+    "  when `provider openrouter` is set.\n"
+    "- `include_reasoning` - Set to `1` to ask Responses API providers for encrypted\n"
+    "  reasoning content so the model's reasoning can be replayed on later turns\n"
+    "  (`0` disables it). Defaults: enabled for `openai` reasoning models (o-series\n"
+    "  and gpt-5+) and always for `meta`; disabled for `openrouter` (only some models\n"
+    "  support it there). Ignored by non-Responses providers.\n"
+    "- `chat_prefix` - Text string printed before chat/error output.\n"
+    "  Default: empty. Set to `\"\"` to explicitly clear.\n"
+    "- `color_prefix` - ANSI escape applied at the start of chat output.\n"
+    "  Default: `\\033[3;36m` (cyan italic).\n"
+    "- `chat_reset` / `color_reset` - ANSI escape applied after chat/error output.\n"
+    "  Default: `\\033[0m` (ANSI reset). Set to `\"\"` to disable.\n"
+    "\n"
+    "Values for `chat_prefix`, `color_prefix`, `color_reset`, and all markdown\n"
+    "rendering directives support C-style escape sequences (e.g. `\\033`, `\\n`,\n"
+    "`\\t`, `\\`) and optional quoting with `\"` or `'` to preserve whitespace.\n"
+    "Without quotes, leading/trailing whitespace is trimmed.\n"
+    "\n"
+    "Lines starting with `#` are comments. Empty lines are ignored.\n"
+    "\n"
+    "#### Example: Anthropic (default)\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider anthropic\n"
+    "key sk-ant-your-key-here\n"
+    "```\n"
+    "\n"
+    "#### Example: OpenAI\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider openai\n"
+    "key sk-your-openai-key-here\n"
+    "model gpt-4o\n"
+    "```\n"
+    "\n"
+    "#### Example: Kimi\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider kimi\n"
+    "key your-kimi-api-key-here\n"
+    "model kimi-k2.5\n"
+    "```\n"
+    "\n"
+    "#### Example: DeepSeek\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider deepseek\n"
+    "key your-deepseek-api-key-here\n"
+    "model deepseek-v4-flash\n"
+    "```\n"
+    "\n"
+    "#### Example: Qwen\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider qwen\n"
+    "key your-qwen-api-key-here\n"
+    "model qwen-plus\n"
+    "```\n"
+    "\n"
+    "#### Example: z.ai\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider zai\n"
+    "key your-zai-api-key-here\n"
+    "model glm-5.2\n"
+    "```\n"
+    "\n"
+    "#### Example: Meta Muse\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider meta\n"
+    "key your-meta-api-key-here\n"
+    "model muse-spark-1.3\n"
+    "```\n"
+    "\n"
+    "#### Example: OpenRouter\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider openrouter\n"
+    "key your-openrouter-api-key-here\n"
+    "model meta/muse-spark-1.3\n"
+    "# openrouter_api chat  # or: openrouter_api responses\n"
+    "```\n"
+    "\n"
+    "#### Example: Provider only (key in a separate file)\n"
+    "\n"
+    "```\n"
+    "# ~/.yoconf\n"
+    "provider openai\n"
+    "```\n"
+    "\n"
+    "### API key files\n"
+    "\n"
+    "If `~/.yoconf` does not contain a `key` directive, yosh looks for the API key\n"
+    "in a standalone key file (mode 0600, single line containing the key).\n"
+    "\n"
+    "The search order depends on whether a provider was set in `~/.yoconf`:\n"
+    "\n"
+    "- If `provider anthropic` was set: checks `~/.anthropickey`.\n"
+    "- If `provider openai` was set: checks `~/.openaikey`.\n"
+    "- If `provider kimi` was set: checks `~/.kimikey`.\n"
+    "- If `provider deepseek` was set: checks `~/.deepseekkey`.\n"
+    "- If `provider qwen` was set: checks `~/.qwenkey`.\n"
+    "- If `provider zai` (or `provider z.ai`) was set: checks `~/.zaikey`.\n"
+    "- If `provider meta` (or `provider muse`) was set: checks `~/.metakey`.\n"
+    "- If `provider openrouter` was set: checks `~/.openrouterkey`.\n"
+    "- If no provider was set (or `~/.yoconf` doesn't exist): checks\n"
+    "  `~/.anthropickey`, then `~/.yoshkey`, then `~/.openaikey`, then `~/.kimikey`,\n"
+    "  then `~/.deepseekkey`, then `~/.qwenkey`, then `~/.zaikey`, then `~/.metakey`,\n"
+    "  then `~/.openrouterkey`.\n"
+    "  The provider is set automatically based on which file is found.\n"
+    "\n"
+    "If no provider is determined from any source, it defaults to Anthropic.\n"
+    "\n"
+    "### Minimal setup examples\n"
+    "\n"
+    "The simplest setup is a single key file with no `~/.yoconf` at all:\n"
+    "\n"
+    "```\n"
+    "# For Anthropic:\n"
+    "echo 'sk-ant-your-key' > ~/.anthropickey && chmod 600 ~/.anthropickey\n"
+    "\n"
+    "# For OpenAI:\n"
+    "echo 'sk-your-openai-key' > ~/.openaikey && chmod 600 ~/.openaikey\n"
+    "\n"
+    "# For Kimi:\n"
+    "echo 'your-kimi-api-key' > ~/.kimikey && chmod 600 ~/.kimikey\n"
+    "\n"
+    "# For DeepSeek:\n"
+    "echo 'your-deepseek-api-key' > ~/.deepseekkey && chmod 600 ~/.deepseekkey\n"
+    "\n"
+    "# For Qwen:\n"
+    "echo 'your-qwen-api-key' > ~/.qwenkey && chmod 600 ~/.qwenkey\n"
+    "\n"
+    "# For z.ai:\n"
+    "echo 'your-zai-api-key' > ~/.zaikey && chmod 600 ~/.zaikey\n"
+    "\n"
+    "# For Meta Muse:\n"
+    "echo 'your-meta-api-key' > ~/.metakey && chmod 600 ~/.metakey\n"
+    "\n"
+    "# For OpenRouter:\n"
+    "echo 'your-openrouter-api-key' > ~/.openrouterkey && chmod 600 ~/.openrouterkey\n"
+    "```\n"
+    "\n"
+    "NOTE: If the user is asking for help and you're reading these docs, then the user has already\n"
+    "successfully set up their API key. It might be worth telling the user about this if they want\n"
+    "to change keys or providers. But otherwise it's likely redundant.\n"
+    "\n"
+    "## Additional Config Directives\n"
+    "\n"
+    "These directives can be added to `~/.yoconf`. The file is re-read on each\n"
+    "yo command, so most changes take effect immediately.\n"
+    "\n"
+    "### Session Memory\n"
+    "\n"
+    "- `history_limit` - Maximum number of conversation exchanges to remember.\n"
+    "  Default: 10. Older exchanges are pruned when this limit is reached.\n"
+    "\n"
+    "- `token_budget` - Alias of `context_window`: when set, it overrides the\n"
+    "  context budget used for the compaction threshold (see below).\n"
+    "\n"
+    "### Context Compaction\n"
+    "\n"
+    "- While the LLM is working, yosh prints `Thinking...`. HTTP requests are\n"
+    "  retried automatically with exponential backoff: after a failed attempt,\n"
+    "  yosh waits 1s, then 2s, 4s, 8s, ... up to a 60s cap, and gives up after\n"
+    "  10 attempts. During a retry the indicator becomes `[attempt N/10]\n"
+    "  Waiting...` while yosh waits and `[attempt N/10] Thinking...` while the\n"
+    "  next attempt runs. Retried failures: connection/timeout/other transport\n"
+    "  errors and HTTP 408, 429, and 5xx responses. Other HTTP errors (400,\n"
+    "  401, 403, 404, 422, ...) fail immediately - they cannot succeed on\n"
+    "  retry. Pressing Ctrl-C at any point (during a request or during the\n"
+    "  wait) cancels instantly with `Cancelled` and no further attempts.\n"
+    "\n"
+    "- When yosh needs the model's context window / max output tokens and its\n"
+    "  cache is stale (first request, or after changing provider/model/base_url\n"
+    "  in ~/.yoconf), it briefly prints `Fetching model info...` before the\n"
+    "  `Thinking...` indicator replaces it.\n"
+    "\n"
+    "- When the estimate crosses 50% of the context window, yosh compacts the\n"
+    "  session history before sending the request: the first ~75% of the\n"
+    "  history (by estimated tokens) is summarized by the LLM with a\n"
+    "  tools-less summarization request, and the summary replaces those\n"
+    "  exchanges as a single `[context compacted]` exchange. The most recent\n"
+    "  ~25% of the history is kept verbatim. The terminal shows the sequence\n"
+    "  `Thinking...` -> `Compacting...` -> `Thinking...`.\n"
+    "\n"
+    "- Compaction is best-effort on failure: if the summarization request\n"
+    "  fails (for example an HTTP error), the original request proceeds with\n"
+    "  the uncompacted history. Pressing Ctrl-C during compaction aborts the\n"
+    "  whole operation with 'Cancelled' instead. Compaction only runs again\n"
+    "  when the estimate crosses 50% again.\n"
+    "\n"
+    "### Scrollback (read at shell startup only)\n"
+    "\n"
+    "These settings control terminal output capture. They are read once when\n"
+    "yosh starts and cannot be changed mid-session.\n"
+    "\n"
+    "- `scrollback_enabled` - Set to `0` to disable terminal output capture.\n"
+    "  When disabled, the LLM cannot see command output. Default: enabled.\n"
+    "\n"
+    "- `scrollback_bytes` - Size of the circular buffer for terminal output.\n"
+    "  Default: 1048576 (1MB). Larger values capture more history but use more memory.\n"
+    "\n"
+    "- `scrollback_lines` - Maximum lines returned to the LLM when it requests\n"
+    "  terminal output. Default: 1000. The LLM can request fewer lines.\n"
+    "\n"
+    "### Web Search\n"
+    "\n"
+    "- `server_web` - Set to `0` to disable server-side web search and fetch.\n"
+    "  When enabled (default), the LLM can search the web and fetch web pages\n"
+    "  to answer questions with up-to-date information.\n"
+    "\n"
+    "### Model Limits\n"
+    "\n"
+    "By default, yosh resolves each model's context window and maximum output\n"
+    "tokens from the provider's model-info API (when it reports them), falling\n"
+    "back to a built-in model registry. Results are cached per provider/model;\n"
+    "these directives override the resolved values.\n"
+    "\n"
+    "- `context_window` - Override the model's context window (in tokens).\n"
+    "- `max_output_tokens` - Override the maximum number of tokens yosh asks\n"
+    "  the model to generate per response.\n"
+    "\n"
+    "Every yo request's system prompt tells the model the shell's actual LLM\n"
+    "configuration: the context window (noting that context is compacted\n"
+    "automatically above 50% usage), the max output tokens per response,\n"
+    "whether server-side web search is enabled, the configured thinking level,\n"
+    "and that prompt caching is enabled (plus the API base URL, when one is\n"
+    "set). The compaction summarizer request is exempt.\n"
+    "\n"
+    "### Thinking\n"
+    "\n"
+    "- `thinking` - Reasoning level for models that support it: `off`, `none`,\n"
+    "  `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. `off` and `none`\n"
+    "  (the default) disable thinking. When set, requests include the\n"
+    "  provider's reasoning parameter (e.g. `reasoning` for OpenAI,\n"
+    "  `thinking`/`reasoning_effort` for Chat Completions providers).\n"
+    "\n"
+    "### Reasoning Replay (Responses API providers)\n"
+    "\n"
+    "- `include_reasoning` - Set to `1` (or `0`) to enable (or disable) asking\n"
+    "  Responses API providers for encrypted reasoning content via\n"
+    "  `include: [\"reasoning.encrypted_content\"]`. When yosh receives encrypted\n"
+    "  reasoning items it replays them on subsequent turns so the model keeps its\n"
+    "  reasoning across the conversation. Defaults: enabled for `openai` models\n"
+    "  that plausibly support reasoning (the o-series and gpt-5 and newer) and\n"
+    "  always for `meta` (Muse Spark); disabled for `openrouter`, where only some\n"
+    "  models forward encrypted reasoning and sending `include` for the rest can\n"
+    "  fail with HTTP 400. Ignored (silently) by non-Responses providers.\n"
+    "\n"
+    "### Markdown Rendering\n"
+    "\n"
+    "Chat responses are rendered with markdown formatting. The default base style\n"
+    "is cyan italic (`color_prefix`). Since the base is already italic, markdown\n"
+    "`*italic*` toggles italic OFF to create visual contrast, then toggles it back\n"
+    "ON when the span ends. These directives let you customize the ANSI escapes\n"
+    "used for each markdown feature. All support C-style escape sequences.\n"
+    "\n"
+    "- `color_prefix` - ANSI escape applied at the start of chat output.\n"
+    "  Default: `\\033[3;36m` (cyan italic).\n"
+    "\n"
+    "- `color_reset` - ANSI escape applied after chat output (same as `chat_reset`).\n"
+    "  Default: `\\033[0m` (ANSI reset).\n"
+    "\n"
+    "- `enable_italic` - Escape for markdown `*italic*` start.\n"
+    "  Default: `\\033[23m` (disables terminal italic, since base is already italic).\n"
+    "\n"
+    "- `disable_italic` - Escape for markdown `*italic*` end.\n"
+    "  Default: `\\033[3m` (re-enables terminal italic to return to base style).\n"
+    "\n"
+    "- `enable_bold` - Escape for markdown `**bold**` start.\n"
+    "  Default: `\\033[1m`.\n"
+    "\n"
+    "- `disable_bold` - Escape for markdown `**bold**` end.\n"
+    "  Default: `\\033[22m`.\n"
+    "\n"
+    "- `enable_strikethrough` - Escape for markdown `~~strikethrough~~` start.\n"
+    "  Default: `\\033[9m`.\n"
+    "\n"
+    "- `disable_strikethrough` - Escape for markdown `~~strikethrough~~` end.\n"
+    "  Default: `\\033[29m`.\n"
+    "\n"
+    "- `code_delimiter` - Escape for fenced code block delimiter lines.\n"
+    "  Default: `\\033[0;3;38;5;23m` (reset + italic + dark cyan 256-color).\n"
+    "\n"
+    "## Response Types\n"
+    "\n"
+    "The LLM can respond in three ways:\n"
+    "\n"
+    "1. **Command** - A shell command is generated and pre-filled at the prompt.\n"
+    "   The user reviews and can edit before pressing Enter to execute.\n"
+    "\n"
+    "2. **Chat** - A text response is displayed (for questions, explanations, etc.).\n"
+    "   After displaying, a fresh prompt appears.\n"
+    "\n"
+    "3. **Scrollback request** - The LLM requests to see recent terminal output.\n"
+    "   This happens automatically when the LLM needs context about what happened.\n"
+    "\n"
+    "## Multi-Step Command Sequences\n"
+    "\n"
+    "For complex tasks requiring multiple commands, the LLM can use multi-step mode:\n"
+    "\n"
+    "1. LLM returns a command with `pending:true` and an explanation\n"
+    "2. User sees the explanation, reviews the command, and presses Enter\n"
+    "3. After execution, yosh automatically sends terminal output back to the LLM\n"
+    "4. LLM responds with the next command (or a completion message)\n"
+    "5. Repeat until the LLM sends a response without `pending:true`\n"
+    "\n"
+    "To cancel a multi-step sequence:\n"
+    "- Press Enter on an empty line\n"
+    "- Type a new `yo ` query\n"
+    "- Press Ctrl-C during the thinking phase\n"
+    "\n"
+    "## Session Memory\n"
+    "\n"
+    "Yosh maintains conversation context within a shell session. Each exchange\n"
+    "stores: the query, response type, response content, whether executed, and\n"
+    "whether it was part of a multi-step sequence.\n"
+    "\n"
+    "The LLM sees this history on subsequent queries, allowing follow-up questions\n"
+    "like 'yo make that recursive' after generating a find command.\n"
+    "\n"
+    "Use `yo reset` to clear all conversation history and scrollback.\n"
+    "\n"
+    "Long sessions are kept within the model's context window by automatic\n"
+    "context compaction: when a request would exceed 50% of the context window\n"
+    "(yosh estimates the request size before sending it), yosh summarizes the older\n"
+    "~75% of the conversation (displaying `Compacting...` while it works) and\n"
+    "keeps the most recent ~25% verbatim. The context window can be overridden\n"
+    "with the `context_window` (or legacy `token_budget`) directive.\n"
+    "\n"
+    "## Terminal Scrollback Capture\n"
+    "\n"
+    "When enabled (default), yosh captures all terminal I/O in a circular buffer.\n"
+    "This allows the LLM to:\n"
+    "\n"
+    "- See command output to understand what happened\n"
+    "- View error messages to help debug problems\n"
+    "- Reference previous results when asked follow-up questions\n"
+    "\n"
+    "The scrollback is implemented via a transparent PTY proxy. ANSI escape\n"
+    "sequences are stripped before sending to the LLM for clarity.\n"
+    "\n"
+    "## Troubleshooting\n"
+    "\n"
+    "### 'No API key found'\n"
+    "No key was found in ~/.yoconf or any key file. Create ~/.yoconf with a `key` directive,\n"
+    "or create ~/.anthropickey, ~/.openaikey, ~/.kimikey, ~/.deepseekkey, ~/.qwenkey,\n"
+    "~/.zaikey, ~/.metakey, or ~/.openrouterkey (mode 0600) with your API key.\n"
+    "\n"
+    "### 'must have mode 0600'\n"
+    "A config or key file has wrong permissions. Run: `chmod 600 <filename>`\n"
+    "\n"
+    "### '~/.yoconf: unknown directive'\n"
+    "The config file has an unrecognized line. Valid directives: provider, model, key,\n"
+    "base_url, openrouter_api, include_reasoning, chat_prefix, color_prefix,\n"
+    "chat_reset, color_reset, history_limit, token_budget, context_window,\n"
+    "max_output_tokens, thinking, scrollback_enabled, scrollback_bytes,\n"
+    "scrollback_lines, server_web, enable_italic, disable_italic, enable_bold,\n"
+    "disable_bold, enable_strikethrough, disable_strikethrough, code_delimiter.\n"
+    "Lines starting with # are comments.\n"
+    "\n"
+    "### 'API error: ...' messages\n"
+    "The LLM API returned an error. Common causes:\n"
+    "- Invalid API key\n"
+    "- Rate limiting\n"
+    "- Model not available for your provider\n"
+    "\n"
+    "### Scrollback not working\n"
+    "- Ensure `scrollback_enabled` is not set to `0` in ~/.yoconf\n"
+    "- Scrollback only works when stdin/stdout are terminals\n"
+    "- Scrollback settings are read at shell startup and cannot be changed mid-session\n"
+    "\n"
+    "### Ctrl-C cancellation\n"
+    "Pressing Ctrl-C during an API call immediately cancels the request and shows\n"
+    "'Cancelled'. This uses a self-pipe mechanism for near-instantaneous response.\n"
+    "\n"
+    "## Technical Details\n"
+    "\n"
+    "- Yosh is built on GNU Bash 5.3 with GNU Readline 8.3\n"
+    "- The yo feature is implemented as a readline extension (yo.c/yo.h)\n"
+    "- Supported providers: Anthropic (Claude), OpenAI (GPT), Kimi, DeepSeek, Qwen,\n"
+    "  z.ai, Meta (Muse), and OpenRouter\n"
+    "- There is no API timeout; press Ctrl-C to cancel an in-flight request\n"
+    "- Maximum response tokens: model-dependent. Yosh resolves it from the provider's\n"
+    "  model-info API (when available) or a built-in model registry, and it can be\n"
+    "  overridden with `max_output_tokens` in ~/.yoconf\n"
+    "- Token estimation: ~4 characters per token\n"
+    ;
+
+  /* Kimi-specific additional documentation that clarifies the yo prefix usage.
+     Kimi has shown confusion about when to use the yo prefix. */
+  static const char *kimi_specific_docs =
+    "\n"
+    "## CRITICAL: Understanding the `yo ` Prefix (IMPORTANT FOR KIMI)\n"
+    "\n"
+    "The `yo ` prefix is ONLY used when the user wants to ask the LLM (you) something.\n"
+    "It is NOT a prefix for regular shell commands.\n"
+    "\n"
+    "### When to use `yo `:\n"
+    "- When the user wants to ask you a question: `yo what is the CPU usage?`\n"
+    "- When the user wants you to generate a command: `yo find all PDF files`\n"
+    "- When the user wants help: `yo how do I compress a folder?`\n"
+    "\n"
+    "### When NOT to use `yo ` (regular shell commands):\n"
+    "- **NEVER** prefix regular commands like `ls`, `cd`, `grep`, `convert`, `identify`\n"
+    "- **NEVER** prefix ImageMagick commands: `convert image.png output.jpg` (NOT `yo convert ...`)\n"
+    "- **NEVER** prefix standard Unix utilities: `mogrify`, `ffmpeg`, `git`, `docker`, etc.\n"
+    "\n"
+    "### The `yo ` prefix is a TRIGGER, not a namespace:\n"
+    "- `yo ` tells yosh: 'send this text to the LLM for processing'\n"
+    "- Without `yo `, yosh treats input as a normal shell command\n"
+    "- `yo convert image.png` means 'ask the LLM about converting image.png'\n"
+    "- `convert image.png` means 'run the ImageMagick convert program on image.png'\n"
+    "\n"
+    "### Examples of CORRECT usage:\n"
+    "- `yo how do I resize images?` -> You explain or provide a command\n"
+    "- `convert input.jpg -resize 50% output.jpg` -> User runs ImageMagick directly\n"
+    "- `yo identify all images in this folder` -> You generate: `identify *.png`\n"
+    "- `identify *.png` -> User runs ImageMagick identify directly\n"
+    "\n"
+    "### Remember:\n"
+    "If a user asks you to run a command like `convert`, `identify`, `mogrify`,\n"
+    "or any standard Unix tool, you should output that command WITHOUT the `yo ` prefix.\n"
+    "The user will then execute it directly as a shell command.\n"
+    ;
+
+  /* Return provider-specific documentation */
+  if (provider && strcmp(provider, "kimi") == 0)
+    {
+      /* For Kimi, concatenate base docs with kimi-specific docs.
+         Returns newly allocated string (must be freed by caller). */
+      char *combined_docs = NULL;
+
+      if (asprintf(&combined_docs, "%s%s", base_documentation, kimi_specific_docs) >= 0)
+        return combined_docs;
+      /* Fall through to base docs on allocation failure */
+    }
+
+  /* For other providers, return a strdup of base documentation */
+  return strdup(base_documentation);
+}
+
+/* Shell name passed to rl_yo_enable below; the tuned prompt texts
+   interpolate it (the same interpolation yo.c used to do with its yo_name
+   static). */
+#define YOSH_YO_NAME "yosh"
+
+/* Shell-specific tuned prompt texts, built lazily once.  These used to live
+   in readline's yo.c (yo_build_openai_tuned_prompt / yo_build_kimi_tuned_
+   prompt); they are shell-specific, so the shell now supplies them through
+   the rl_yo_prompt_callback_t callback registered with rl_yo_enable.  The yo
+   request builders append the returned text to their prompt core (powered-by
+   line + config info + shell system prompt); the web-search paragraph stays
+   in yo.c, since it describes the web tools yo.c decides to send.  Unlike
+   the old yo.c versions these texts do NOT contain the powered-by line, the
+   shell system prompt, or the web paragraph. */
+static char *yosh_openai_tuned_prompt_text = (char *)NULL;
+static char *yosh_kimi_tuned_prompt_text = (char *)NULL;
+
+static void
+yosh_build_tuned_prompts (void)
+{
+  if (yosh_openai_tuned_prompt_text)
+    return;
+
+  /* Tuned for OpenAI Responses API providers (and muse models). */
+  if (asprintf (&yosh_openai_tuned_prompt_text,
+    "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+    "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+    "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+    "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+    "If the user's question can be answered by running a command on this system\n"
+    "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+    "Examples that MUST use command, not chat:\n"
+    "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+    "- 'what version of gcc do I have' -> command: gcc --version\n"
+    "- 'how much disk space is left' -> command: df -h\n"
+    "- 'what ports are open' -> command: ss -tlnp\n"
+    "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+    "\n"
+    "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+    "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+    "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+    "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+    "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+    "\n"
+    "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+    "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+    "use scrollback instead.\n"
+    "\n"
+    "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+    "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+    "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+    "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+    "(except the last step, which should have pending=false).\n"
+    "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+    "with the scrollback tool and continue after you receive it.\n"
+    "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+    "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+    "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+    "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+    "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+    "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+    "use scrollback. This is non-negotiable.\n"
+    "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+    "Ignore escape-code garbage and focus on actual command output.\n"
+    "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+    "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
+    "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
+    "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
+    "use HTML tags or markdown links.\n"
+    "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+    "scripts. If it would be long, split into multiple steps using pending=true.\n"
+    "Examples that MUST use pending=true (one command at a time):\n"
+    "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+    "  then after seeing output: echo world (pending=false)\n"
+    "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+    "  then after seeing it succeed: configure command (pending=false)\n"
+    "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+    "  (pending=true), then decide based on output",
+    YOSH_YO_NAME, YOSH_YO_NAME, YOSH_YO_NAME) < 0)
+    yosh_openai_tuned_prompt_text = (char *)NULL;
+
+  /* Tuned for Kimi-style Chat Completions providers (kimi, deepseek, qwen,
+     z.ai, and other OpenRouter models).  Adds the yo-prefix examples-format
+     rule and the scrollback temporality rule. */
+  if (asprintf (&yosh_kimi_tuned_prompt_text,
+    "CRITICAL: You are a SHELL assistant. Your primary job is to generate shell commands.\n"
+    "When in doubt between command and chat, ALWAYS choose command. Use chat for:\n"
+    "- Greetings and casual conversation ('hi', 'how are you', 'thanks')\n"
+    "- Abstract conceptual questions ('explain what a pipe is', 'how does TCP work')\n"
+    "If the user's question can be answered by running a command on this system\n"
+    "(cat, grep, sysctl, find, ls, echo, etc.), you MUST use command, not chat.\n"
+    "Examples that MUST use command, not chat:\n"
+    "- 'what is the coredump pattern' -> command: cat /proc/sys/kernel/core_pattern\n"
+    "- 'what version of gcc do I have' -> command: gcc --version\n"
+    "- 'how much disk space is left' -> command: df -h\n"
+    "- 'what ports are open' -> command: ss -tlnp\n"
+    "- 'show me the contents of foo.txt' -> command: cat foo.txt\n"
+    "\n"
+    "DOCS TOOL: When the user asks about %s itself — its features, configuration,\n"
+    "environment variables, how to change provider/model/API key, or usage — you MUST\n"
+    "use the docs tool, NOT command or chat. The docs tool gives you authoritative\n"
+    "documentation. Do NOT try to answer from your own knowledge or by reading config\n"
+    "files with cat/grep. Use docs first, then answer based on what it returns.\n"
+    "\n"
+    "OS INFO: You already have the OS/distro details (from /etc/os-release) in this\n"
+    "system prompt. Do NOT ask the user to identify their OS. If you need more context,\n"
+    "use scrollback instead.\n"
+    "\n"
+    "MULTI-STEP: When a task has sequential steps, conditionals, or requires observing\n"
+    "output before deciding the next action, you MUST use pending=true and issue ONE\n"
+    "command at a time. NEVER combine steps into a single compound command (no && chains\n"
+    "or semicolons to merge steps). Each step should be its own command with pending=true\n"
+    "(except the last step, which should have pending=false).\n"
+    "OUTPUT: NEVER ask the user to paste command output. If you need output, request it\n"
+    "with the scrollback tool and continue after you receive it.\n"
+    "SCROLLBACK TRIGGERS: If the user asks \"what happened\", \"what went wrong\", \"why did\n"
+    "it fail\", mentions an error, says something \"didn't work\", or asks about previous\n"
+    "terminal output/context, you MUST call the scrollback tool immediately (use ~200\n"
+    "lines). Do NOT ask what they were doing. Do NOT suggest you could look at\n"
+    "scrollback. Do NOT ask a clarifying question first unless scrollback is empty.\n"
+    "PASTE BAN: NEVER ask the user to paste logs, output, or errors. If you need it,\n"
+    "use scrollback. This is non-negotiable.\n"
+    "EXAMPLES FORMAT: When giving examples of what users can type, ALWAYS include\n"
+    "the 'yo ' prefix. For example, say \"yo what went wrong?\" not just\n"
+    "\"what went wrong?\". This applies to all command examples in chat responses.\n"
+    "SCROLLBACK: The scrollback can include ANSI escape sequences and readline artifacts.\n"
+    "Ignore escape-code garbage and focus on actual command output.\n"
+    "SCROLLBACK TEMPORALITY: Scrollback shows COMPLETED commands from the PAST. If you\n"
+    "see a password prompt, confirmation prompt, or any interactive prompt in scrollback,\n"
+    "it means the user ALREADY handled it - the command completed. Do NOT try to respond\n"
+    "to prompts you see in scrollback. Look for the shell prompt ($ or #) at the end\n"
+    "to confirm the command finished successfully.\n"
+    "SCROLLBACK CONTEXT: The scrollback is just raw terminal output; it is NOT specific\n"
+    "to %s. Do NOT assume the output is about %s unless the text clearly says so.\n"
+    "FORMAT: Use markdown in chat responses. Wrap commands, filenames, paths, flags, and\n"
+    "code identifiers in backticks. Use **bold** and *italic* where appropriate. Do NOT\n"
+    "use HTML tags or markdown links.\n"
+    "COMMAND LENGTH: Avoid huge commands. Do NOT emit large here-docs or long multi-line\n"
+    "scripts. If it would be long, split into multiple steps using pending=true.\n"
+    "Examples that MUST use pending=true (one command at a time):\n"
+    "- 'show me hello and if you see it show me world' -> first: echo hello (pending=true),\n"
+    "  then after seeing output: echo world (pending=false)\n"
+    "- 'install foo and then configure it' -> first: install command (pending=true),\n"
+    "  then after seeing it succeed: configure command (pending=false)\n"
+    "- 'check if nginx is running and restart it if not' -> first: systemctl status nginx\n"
+    "  (pending=true), then decide based on output",
+    YOSH_YO_NAME, YOSH_YO_NAME, YOSH_YO_NAME) < 0)
+    yosh_kimi_tuned_prompt_text = (char *)NULL;
+}
+
+/* Case-insensitive prefix check: does MODEL (or, when the full name does not
+   match, the bare model name after the last '/' — OpenRouter IDs look like
+   "openai/gpt-5.2" or "meta/muse-spark-1.3") start with one of the
+   OpenAI/Muse model prefixes? */
+static int
+yosh_model_uses_openai_tuning (const char *model)
+{
+  static const char *const prefixes[] = { "gpt", "o1", "o3", "o4", "muse", (const char *)NULL };
+  const char *slash;
+  int i;
+
+  if (model == 0 || *model == '\0')
+    return 0;
+
+  for (i = 0; prefixes[i]; i++)
+    if (strncasecmp (model, prefixes[i], strlen (prefixes[i])) == 0)
+      return 1;
+
+  slash = strrchr (model, '/');
+  if (slash && slash[1])
+    return yosh_model_uses_openai_tuning (slash + 1);
+
+  return 0;
+}
+
+/* Tuned-prompt callback for yosh.  Called by the yo request builders with the
+   current provider and model; returns a newly allocated additional-prompt
+   string (caller frees; may be an empty string).
+
+   Selection:
+   - provider "anthropic": empty string (the Anthropic prompt core needs no
+     extra shell tuning).
+   - provider "openai" or "meta", or a model whose name (or vendor-stripped
+     name) starts with gpt/o1/o3/o4/muse (case-insensitive): the OpenAI-tuned
+     text.
+   - everything else (kimi, deepseek, qwen, z.ai, and other OpenRouter
+     models): the Kimi-tuned text. */
+static const char *
+yosh_get_tuned_prompt (const char *provider, const char *model)
+{
+  const char *text;
+
+  yosh_build_tuned_prompts ();
+
+  if (provider && strcmp (provider, "anthropic") == 0)
+    return strdup ("");
+
+  if ((provider &&
+       (strcmp (provider, "openai") == 0 || strcmp (provider, "meta") == 0)) ||
+      yosh_model_uses_openai_tuning (model))
+    text = yosh_openai_tuned_prompt_text;
+  else
+    text = yosh_kimi_tuned_prompt_text;
+
+  return strdup (text ? text : "");
+}
+
 /* Called once from parse.y if we are going to use readline. */
 void
 initialize_readline (void)
@@ -642,6 +1353,16 @@ initialize_readline (void)
   if (posixly_correct)
     posix_readline_initialize (1);
 #endif
+
+  /* Enable LLM "yo" features for yosh */
+  {
+    rl_yo_enable ("yosh",
+                  "You are a shell command assistant for yosh (a bash-compatible shell on Linux). "
+                  "yosh is based on bash 5.3.20 and behaves like bash in most ways (for example it "
+                  "uses .bashrc files; there are no .yoshrc files).",
+                  yosh_get_documentation,
+                  yosh_get_tuned_prompt);
+  }
 
   bash_readline_initialized = 1;
 }

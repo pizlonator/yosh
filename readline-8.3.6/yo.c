@@ -1062,30 +1062,78 @@ rl_yo_get_scrollback(int max_lines)
         return strdup("");
     }
 
-    /* Copy while stripping ANSI escape sequences */
+    /* Copy while stripping ANSI escape sequences.  This runs over the window
+       BY LENGTH, not to the first NUL: raw terminal bytes can legitimately
+       contain NULs (binary output), and stopping there would silently
+       truncate the scrollback handed to the model.  Escape sequences are
+       consumed WHOLE, including their terminators - OSC (ESC ] ... BEL/ST),
+       DCS/PM/APC (ESC P/^/_ ... ST), and CSI (ESC [ ... final byte).  The
+       old loop only ate "ESC + one char", which leaked the PAYLOAD of title
+       sequences into the tool result as junk like "0;pizlo@death:~/dir"
+       (bash's PROMPT_COMMAND sets the title via OSC, so every prompt left
+       that debris in the scrollback the model saw).  Control characters
+       other than \n and \t (e.g. \r from ONLCR) are dropped, matching
+       yo_sanitize_scrollback(). */
     out = result;
-    for (p = start; *p; p++)
     {
-        if (*p == '\033')
+        const char *q = start;
+        const char *end = raw_data + raw_size;
+
+        while (q < end)
         {
-            /* Skip ESC [ ... (letter) sequences */
-            if (*(p + 1) == '[')
+            unsigned char ch = (unsigned char)*q;
+
+            if (ch == 0x1b && q + 1 < end)
             {
-                p += 2;
-                while (*p && !(*p >= 'A' && *p <= 'Z') && !(*p >= 'a' && *p <= 'z'))
-                    p++;
-                if (!*p)
-                    break;
-                continue;  /* Skip the final letter */
-            }
-            /* Skip other ESC sequences (ESC followed by one char) */
-            if (*(p + 1))
-            {
-                p++;
+                unsigned char next = (unsigned char)q[1];
+
+                if (next == '[')
+                {
+                    /* CSI: skip through the final byte (0x40-0x7e) */
+                    const char *r = q + 2;
+                    while (r < end && !((unsigned char)*r >= 0x40 &&
+                                        (unsigned char)*r <= 0x7e))
+                        r++;
+                    q = (r < end) ? r + 1 : end;
+                    continue;
+                }
+                if (next == ']' || next == 'P' || next == '^' || next == '_')
+                {
+                    /* OSC/DCS/PM/APC: skip through BEL or ESC-\ (ST) */
+                    const char *r = q + 2;
+                    while (r < end)
+                    {
+                        if (*r == '\007')
+                        {
+                            r++;
+                            break;
+                        }
+                        if (*r == '\033' && r + 1 < end && r[1] == '\\')
+                        {
+                            r += 2;
+                            break;
+                        }
+                        r++;
+                    }
+                    q = r;
+                    continue;
+                }
+                /* Other escape sequences (ESC followed by one char) */
+                q += 2;
                 continue;
             }
+            if (ch == '\0' || (ch < 0x20 && ch != '\n' && ch != '\t'))
+            {
+                /* Drop NULs (binary output noise) and control characters
+                   other than \n and \t - same policy as
+                   yo_sanitize_scrollback(); keeping them would only waste
+                   the model's attention (and \r would corrupt line endings). */
+                q++;
+                continue;
+            }
+            *out++ = (char)ch;
+            q++;
         }
-        *out++ = *p;
     }
     *out = '\0';
 
@@ -7783,6 +7831,43 @@ yo_build_history_tool_input(int idx)
     return input;
 }
 
+/* Collapse the terminal-output snapshot embedded in a synthetic
+   [continuation] query.  Continuation queries carry the scrollback that was
+   current when they were generated ("...Here is the terminal output:\n```\n
+   <lines>\n```").  When such a history entry is REPLAYED on a later request,
+   that snapshot is stale terminal output - the live scrollback has moved on -
+   and models quote it as if it were the current scrollback, which reads
+   exactly like "the scrollback buffer stopped being updated".  (The same
+   staleness is why replayed scrollback tool_results collapse to
+   "Acknowledged" below.)  The snapshot only mattered to the turn that
+   requested it, so a replayed copy keeps the query's framing text verbatim
+   and replaces just the output block with a marker.  Returns a malloc'd
+   string, or NULL on allocation failure / when there is nothing to collapse
+   (callers then use the raw query). */
+static char *
+yo_history_query_for_replay(const char *query)
+{
+    static const char sentinel[] = "Here is the terminal output:\n```\n";
+    const char *p;
+    char *out;
+    size_t prefix;
+
+    if (!query)
+        return NULL;
+
+    p = strstr(query, sentinel);
+    if (!p)
+        return strdup(query);
+
+    prefix = (size_t)(p - query) + sizeof(sentinel) - 1;
+    if (asprintf(&out, "%.*s[terminal output snapshot omitted - captured "
+                 "earlier in this session and now stale; request scrollback "
+                 "for the current output]\n```",
+                 (int)prefix, query) < 0)
+        return strdup(query);
+    return out;
+}
+
 /* Shared helper: add session history entries [from, to) to a messages array.
    Uses yo_msg_add_tool_use / yo_msg_add_tool_result, which produce
    provider-native format based on yo_provider.  (yo_add_history_to_messages
@@ -7802,10 +7887,24 @@ yo_add_history_range_to_messages(cJSON *messages, int from, int to)
         cJSON *msg;
         cJSON *input;
 
-        /* User message with query */
+        /* User message with query.  Replayed [continuation] queries get
+           their embedded terminal-output snapshot collapsed (it is stale by
+           now) - see yo_history_query_for_replay. */
         msg = cJSON_CreateObject();
         cJSON_AddStringToObject(msg, "role", "user");
-        cJSON_AddStringToObject(msg, "content", yo_history[i].query);
+        {
+            char *replayed = yo_history_query_for_replay(yo_history[i].query);
+
+            if (replayed)
+            {
+                cJSON_AddStringToObject(msg, "content", replayed);
+                free(replayed);
+            }
+            else
+            {
+                cJSON_AddStringToObject(msg, "content", yo_history[i].query);
+            }
+        }
         cJSON_AddItemToArray(messages, msg);
 
         /* Assistant message with tool_use (provider-native) */
@@ -7886,7 +7985,9 @@ yo_build_summary_transcript(int from, int to)
 
     for (i = from; i < to; i++)
     {
-        const char *query = yo_history[i].query ? yo_history[i].query : "";
+        char *replayed = yo_history_query_for_replay(yo_history[i].query);
+        const char *query = replayed ? replayed :
+            (yo_history[i].query ? yo_history[i].query : "");
         char *assistant = yo_summary_assistant_text(i);
         char *user_line = NULL;
         char *asst_line = NULL;
@@ -7895,16 +7996,19 @@ yo_build_summary_transcript(int from, int to)
 
         if (!assistant)
         {
+            free(replayed);
             free(transcript);
             return NULL;
         }
 
         if (asprintf(&user_line, "[USER] %s", query) < 0)
         {
+            free(replayed);
             free(assistant);
             free(transcript);
             return NULL;
         }
+        free(replayed);
         if (asprintf(&asst_line, "[ASSISTANT] %s", assistant) < 0)
         {
             free(user_line);

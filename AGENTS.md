@@ -4,15 +4,22 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Project Overview
 
-**Yosh** is an LLM-enabled shell - a custom build of GNU Bash 5.3.20 with GNU Readline 8.3.6, compiled using the Fil-C memory-safe compiler toolchain. The entire stack (bash, readline, libcurl, openssl, zlib, libc) is compiled with Fil-C for memory safety.
+**Yosh** is an LLM-enabled shell - a custom build of GNU Bash 5.3.20 with GNU Readline 8.3.6, compiled using the Fil-C memory-safe compiler toolchain in its **Peregrine (cosmopolitan/APE) flavor**: the entire stack (bash, readline, libcurl, openssl, zlib, zstd, ncurses, libunistring, libidn2, nghttp2, cosmo libc) is compiled with Fil-C and statically linked into one fat APE.
 
 The key feature is the "yo" command: type `yo <natural language>` and the shell calls an LLM (Anthropic Claude, OpenAI, Kimi, DeepSeek, Qwen, z.ai, Meta Muse, or OpenRouter) to either generate a shell command or answer a question.
 
 ## Build System
 
-- **Full build**: `./build.sh` — configures and builds readline + bash from scratch. Requires Fil-C at `/opt/fil`.
-- **Incremental build**: `./build_incremental.sh` — faster rebuilds when making code changes.
-- **Output**: The resulting shell binary ends up at `../fil-c-5/pizfix/bin/yosh`
+yosh is a **Peregrine project**: it builds against the cosmo flavor of Fil-C and produces a fat APE (one static executable that runs on x86_64 and aarch64 Linux/macOS/BSD and on x86_64 Windows). The old musl/glibc build path is gone; there is no dynamic linker and no shared libraries anywhere in the build.
+
+- **Full build**: `cd fil-c-5 && ../yosh/build_static.sh` — the whole pipeline: rebuilds every dependency (zlib, zstd, ncurses, openssl, libunistring, libidn2, nghttp2, curl) from its projeny checkout with Fil-C in cosmo mode, crafts the aarch64 shadow archive of every installed archive, regenerates the yolo-cosmo closure fragments (rebuilding the slim `libyolocosmo.a` via `./build_yolocosmo.sh` only if they changed), then builds readline 8.3.6 and bash 5.3.20 and installs everything into pizfix. Requires a cosmo-flavor pizfix tree: run fil-c's `./build_base_cosmo.sh` first (once per compiler/runtime change; after any later `./build_usercosmo.sh`, re-run this script so the dependency headers are restored — usercosmo's install-headers wipes pizfix/include). The dep recipes encode everything the Peregrine port learned, and the shadow-archive crafting (`craft_shadow`, plus the `craft_readline_shadows`/`craft_bash_shadows` helpers) lives in `craft_shadows.sh`, shared with `build_incremental.sh`; see the header comments of `build_static.sh` and `craft_shadows.sh` for the full map. `./build.sh` (in the yosh root) is a thin wrapper that just runs this pipeline: it cds to the fil-c-5 checkout next to yosh (computed from the script's own location) and execs `../yosh/build_static.sh`.
+- **Incremental build**: after the first full build, `./build_incremental.sh` rebuilds just readline + bash (same compiler flags as `build_static.sh`'s readline/bash sections) for code-only changes, recrafts the shadow archives of everything it re-installs (the Fil-C driver does not staleness-check aarch64 shadow archives for `-l` links, so skipping the re-craft would relink yosh against stale shadows — the aarch64 half would silently run old code), re-links yosh, and pechecks the result so a degraded x86_64-only APE fails the build.
+- **Output**: `../fil-c-5/pizfix/bin/yosh` — the fat APE (MZqFpD magic) — plus the ELF side files `../fil-c-5/pizfix/bin/yosh.com.dbg` (x86_64) and `../fil-c-5/pizfix/bin/yosh.aarch64.elf` (aarch64). Validate the APE with `fil-c-5/pizfix/libexec/pecheck ../fil-c-5/pizfix/bin/yosh`. The aarch64 half comes from the Fil-C driver's shadow-object machinery, which is why every static archive must have its `.aarch64/` shadow (see fil-c's cosmo.txt, "Fat APEs").
+- **Running**:
+  - x86_64: run `pizfix/bin/yosh` from any shell (the APE magic is valid shell syntax, so the shell's ENOEXEC fallback self-boots; a raw `execve()` — e.g. Python `subprocess` without a shell — needs the side file `pizfix/bin/yosh.com.dbg` instead). `--version` prints `Fil's yosh 0.1.2 (bash 5.3.20(1)-release) (x86_64-pc-linux-gnu)`.
+  - aarch64 (or cross-checking on an x86_64 host): `qemu-aarch64 pizfix/bin/yosh.aarch64.elf --version` and the same workloads with `-c`; on real arm64 hardware run the same file directly.
+  - The interactive yo PTY proxy and bash job control only engage for real interactive sessions (`yosh -i` under a pty); `-c` workloads skip the PTY machinery.
+- **yo needs config as before**: without `~/.yoconf` (and/or a `~/.<provider>key` file, mode 0600), the direct-parse commands (`yo reset`, `yo show last response`) still work, and a plain `yo <query>` fails gracefully with an explanatory "No API key found ..." error - no crash, no hang. See the Configuration section below for the full directive reference.
 
 ## Project Structure
 
@@ -26,8 +33,10 @@ yosh/
 │   ├── shell.c         # Main init (readline before job control - critical!)
 │   ├── bashline.c      # Calls rl_yo_enable() with system prompt
 │   └── version.c       # "Fil's yosh" branding
-├── build.sh            # Full build script
-└── build_incremental.sh
+├── build_static.sh     # Full Peregrine build (run from the fil-c-5 root; see Build System)
+├── craft_shadows.sh    # Sourced by both build scripts: aarch64 shadow-archive crafting
+├── build_incremental.sh # Incremental readline+bash rebuild (recrafts shadows, pechecks)
+└── build.sh            # Thin wrapper: cds to the fil-c-5 root and runs build_static.sh
 ```
 
 ## The "yo" Feature

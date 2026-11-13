@@ -637,7 +637,19 @@ yo_write_all(int fd, const char *buf, size_t len)
 static int
 yo_pidfd_open(pid_t pid, unsigned int flags)
 {
-    return (int)syscall(SYS_pidfd_open, pid, flags);
+#if defined (__COSMOPOLITAN__)
+  /* Cosmo (Peregrine): the Fil-C runtime's syscall() shim does not
+     implement SYS_pidfd_open, and instead of returning -1 it panics
+     ("pidfd_open not supported").  The pump loop's no-pidfd fallback
+     (PTY hangup detection) is exactly what an old kernel gets, so don't
+     ask for a pidfd at all here. */
+  (void)pid;
+  (void)flags;
+  errno = ENOSYS;
+  return -1;
+#else
+  return (int)syscall(SYS_pidfd_open, pid, flags);
+#endif
 }
 
 /* The pump loop - runs in the parent process, forwards I/O and waits for child.

@@ -31,6 +31,24 @@
 #  include <unistd.h>
 #endif
 
+#if defined (__COSMOPOLITAN__)
+/* Cosmo (Peregrine): <sys/stat.h> (via libc/calls/calls.h) declares mknod()
+ * but there is no mkfifo() wrapper, so this maps mkfifo() onto mknod() the
+ * way POSIX specifies it: same path and permission bits, file type S_IFIFO,
+ * no device.  NOTE: under cosmo this always FAILS at runtime - cosmo's
+ * mknod() API wrapper (libc/calls/mknod.c) refuses S_IFIFO outright
+ * ("no named pipes!"; it returns ENOSYS).  There is no way around that:
+ * the Fil-C syscall shims sys_mkfifo() and sys_mknodat() are unsupported
+ * stubs that error out at runtime, and sys_mknod() forwards through the
+ * Fil-C runtime's syscall layer (filc_native_zsys_mknod) to cosmo's own
+ * mknod() wrapper, which hits the same S_IFIFO refusal.  Loadables cannot
+ * be dlopen'd in cosmo mode anyway (no shared libraries at all), so this
+ * exists primarily to keep the loadable compiling as part of the bash
+ * build. */
+#define mkfifo(PATH, MODE) \
+  (mknod ((PATH), (((MODE) & ~S_IFMT) | S_IFIFO), 0))
+#endif
+
 #include "builtins.h"
 #include "shell.h"
 #include "bashgetopt.h"

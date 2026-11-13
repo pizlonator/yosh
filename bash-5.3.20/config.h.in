@@ -1253,6 +1253,17 @@
 #define _GL_INLINE_HEADER_END
 #define _GL_EXTERN_INLINE
 
+/* bash's hand-maintained config.h.in carries only the empty _GL_EXTERN_INLINE
+ * and the _GL_INLINE_HEADER_BEGIN/END bookends of gnulib's extern-inline.m4
+ * expansion, but never the _GL_INLINE definition itself, so any translation
+ * unit that includes xsize.h dies with "unknown type name '_GL_INLINE'" the
+ * moment the compiler sees XSIZE_INLINE's expansion (xsize.h:84, reached via
+ * printf.c -> printf-parse.c).  Only xsize.h uses it: define it like
+ * extern-inline.m4's C89 fallback so the header-side definitions become
+ * static (xsize.c overrides XSIZE_INLINE with _GL_EXTERN_INLINE, empty here,
+ * and still provides the external definitions). */
+#define _GL_INLINE _GL_UNUSED static
+
 /* Define if you have the <argz.h> header file. */
 #undef HAVE_ARGZ_H
 
